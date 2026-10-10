@@ -5,18 +5,51 @@
 .env.*
 !.env.example
 
-# ——— 运行生成物 ———
-# data/orders.sqlite 是 seed 造出来的（每次内容一样），没必要进仓库；
-# 进了仓库反而会让人分不清"库里的数据"和"seed.py 里的数据"哪个才算数。
-data/*.sqlite
+# ——— 运行生成物：重跑一遍就有，不值得进仓库 ———
+# 订单库：seed 造出来的（每次内容一样）。进了仓库反而会让人分不清
+# "库里的数据"和"seed.py 里的数据"哪个才算数。
+*.sqlite
+*.sqlite3
+*.db
+
+# SQLite 的 WAL / 共享内存 / 回滚日志。**必须单独列**：上面那条 `*.db`
+# 只匹配 `review_queue.db` 本身，匹配不到 `review_queue.db-wal` 这种伴生文件。
+# 漏了它，跑一次就多一个脏文件，然后你会开始习惯性忽略 git status。
+*.db-wal
+*.db-shm
+*.db-journal
+
+# 向量库：13M，由 ingest.py 从 documents/ 重建。它是**可重建的索引**，
+# 不是数据本身——数据是 documents/。把索引提交进仓库，等于把"可以从语料
+# 重新算出来的东西"当成事实来源。
+data/knowledge/vector_store/
+
+# 数据分析跑出来的图（每次分析都覆盖）
+data/analytics/output/
+
 logs/
+
+# Milvus 的 Docker 数据卷（docker-compose.milvus.yml 会建 volumes/{etcd,minio,milvus}）
+volumes/
+
+# 注意**不要**忽略掉这几类，它们看着像"产物"，其实是资产的来源：
+#   data/knowledge/documents/    语料本体，包括 reviewed/（人工审核通过的知识）
+#   data/knowledge/*.jsonl       评测集 / 金标准 / 答案快照——评测结论的依据，
+#                                改了历史数字就对不上了，所以必须进仓库
+#   data/analytics/raw/sales.csv 数据分析的输入数据
 
 # ——— Python ———
 .venv/
 __pycache__/
 *.py[cod]
+build/
+dist/
+wheels/
+*.egg-info/
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 
 # ——— 编辑器 / 系统 ———
 .idea/

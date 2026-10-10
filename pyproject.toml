@@ -4,51 +4,105 @@ version = "0.1.0"
 description = "多 Agent 电商智能客服：LangGraph Supervisor + Worker（知识库 / 订单物流 / 销售数据分析）"
 readme = "README.md"
 requires-python = ">=3.11"
+
+# ——————————————————————————————————————————————————————————————
+# 一张依赖表。分类的依据是**能力**，不是"从哪个仓库带过来的"。
+#
+# 规则只有一条：
+#     内核 = 让 `uv run python main.py` 能跑通的全部。
+#     api / ui 是两种可选界面；milvus / mysql / search 是可选后端或增强。
+#
+# 这条规则解释了每个包的位置，也解释了为什么 pandas 在内核里：
+# 数据分析是三个核心能力之一，没有它整张图就少一条腿。合并前它属于另一个
+# 仓库的 requirements.txt——那只是历史，不是理由。
+# ——————————————————————————————————————————————————————————————
 dependencies = [
+    # ——编排层——
     "langgraph>=1.2.14",
     "langchain-openai>=1.7.0",
+    # 会话持久化。ask.py 用它把多轮对话存进 SQLite；不用它就只剩单轮。
+    "langgraph-checkpoint-sqlite>=3.1.1",
+    "openai>=3.26.1",
     "python-dotenv>=1.2.4",
-    # ——— 知识库 worker 是**进程内**调用 rag_knowledge_base 的，所以它那几个
-    # 运行时依赖这里也要有。这是"跨仓库如何集成"的代价：为了不把知识库那一路
-    # 塞进子进程（它是热路径，每次提问都走），接受了这份依赖重复。
-    # 注：只要 retriever / generator / vector_store 三个入口，不 import 它的
-    # graph.py，所以不需要 ddgs（联网搜索那一路）。
+
+    # ——知识库——
     "chromadb>=1.5.9",
     "langchain-text-splitters>=1.1.3",
+    # 中文分词，混合检索（BM25 那一路）要用。放内核是因为 HYBRID_SEARCH 默认开；
+    # bm25.py 里是延迟 import，所以关掉混合检索时不会有加载成本。
     "jieba>=0.42.1",
+    "pypdf>=6.19.0",
+    # 联网搜索的默认后端（免 key）。Tavily 是可选增强，见 [search]。
+    "ddgs>=9.16.0",
+    # 把 langgraph 的图渲染成 ASCII / mermaid，给人看用的
+    "grandalf>=0.8",
+    "requests>=2.34.2",
+
+    # ——数据分析——
+    # 这三个是**核心**，不是"某个可选功能带的"。合并前它们在
+    # sales_agent/requirements.txt 里，那个文件现在删了——不是"并进来"，
+    # 是本来就只有一份。
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "matplotlib>=3.7",
 ]
 
 [project.optional-dependencies]
-# HTTP 接口（api.py）是可选增强，**核心功能不依赖它**：命令行 main.py 始终可用。
+# 两种界面。**都不装也完全能用**——命令行 main.py 始终可用。
 # 这么分不是为了省那点安装时间，是为了让"clone 下来能不能立刻跑"这件事
-# 只取决于核心依赖——服务端再多一个装不上的包，也不该拖垮演示。
+# 只取决于内核：多一个装不上的界面依赖，不该拖垮整个演示。
+#
+# streamlit 是被**降级**到这里来的：合并前它是 sales_agent/requirements.txt 里的
+# 硬依赖（那个仓库只有 app.py 一个入口）。现在它的 app.py 被统一 app.py 取代，
+# 而 CLI 才是始终可用的那条路，所以硬依赖跟着变成 extra。依赖表里的每一次
+# 升降都要有这种理由，不然它就是在随机漂移。
+ui = ["streamlit>=1.40"]
 api = ["fastapi>=0.115", "uvicorn>=0.32", "pydantic>=2.9"]
-# 订单库默认走 SQLite（零依赖、clone 下来就能跑）；要接 MySQL 8 才装这个，
-# 和 rag_knowledge_base 的「Chroma 默认 / Milvus 可选」是同一套取舍。
-mysql = ["pymysql>=1.1"]
-# 数据分析 worker 走**子进程**调 sibling 仓库 sales_agent，
-# 它自己那份 requirements 由它自己管，这里不重复声明。
-# 同理，知识库 worker 要用的 jieba/chromadb 是**重复声明**的——因为它是进程内
-# 调用（见依赖表上面的说明），不能靠"对方装了"。
 
+# 可选后端 / 增强。默认路径一律不依赖它们：
+# 向量库默认 Chroma（零外部依赖），订单库默认 SQLite，联网默认 ddgs（免 key）。
+#
+# Milvus 上限 pin 在 3.0 以下：pymilvus 3.0.x 对应 Milvus 3.0.0-beta（官方标注
+# 非生产就绪），2.6.x 是官方推荐的生产线，且要求 client 与 server 版本对齐。
+# 装：uv sync --extra milvus
+milvus = ["pymilvus>=2.6,<3"]
+# 订单库接 MySQL 8：uv sync --extra mysql
+mysql = ["pymysql>=1.1"]
+# Tavily 是联网搜索的可选增强。**装它是有意义的**：.env 里配了 TAVILY_API_KEY
+# 但包没装时，联网那一路会静默退回 ddgs——用户以为在用 Tavily 其实没有。
+# 包名是 tavily-python，import 名才是 tavily。
+search = ["tavily-python>=0.5"]
+
+# 合并时删掉的依赖，理由记在这里（免得下次有人"补"回来）：
+#   langchain-community  —— 全仓库零引用
+#   langchain-core       —— 零引用，且已由 langchain-openai 传递依赖带进来
+# sales_agent/requirements.txt 整个删掉，内容并入上面。
+
+# 开发依赖。放 [dependency-groups] 而不是 [project.optional-dependencies]：
+# 这是 uv 的默认组，uv sync 会连它一起装，所以 uv run pytest / ruff 开箱可用。
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [tool.pytest.ini_options]
+# 三套测试并成一套之后，这里是**唯一**一处管 import 根的地方。
+# 合并前 sales_agent 那 9 个测试文件靠 `sys.path.insert(0, ...)` 自己给自己
+# 找路，那些行现在全删了——不是因为难看，是因为"每个文件各自想办法"
+# 本身就意味着没有一处统一的东西可以改。
 testpaths = ["tests"]
 addopts = "-q"
-# 让 tests/ 能直接 import cs.*，不依赖 pytest 的 rootdir 推断
 pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
-exclude = [".venv", "data", "logs"]
+target-version = "py311"    # 跟 .python-version 保持一致（不是 3.12）
+exclude = [".venv", "data", "logs", "volumes"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
 ignore = [
     # E501：中文注释里常有长 URL 和表格，硬折行反而更难读
     "E501",
+    # B905：要求 zip(strict=)，会命中两个向量库实现里的 zip()。
+    # 那里的长度一致性已由 add_chunks 开头的 ValueError 检查保证。
     "B905",
 ]
