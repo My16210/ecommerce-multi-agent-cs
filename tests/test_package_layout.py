@@ -38,9 +38,16 @@ FORBIDDEN_ROOTS = ("src", "config")
 
 
 def _scan_files():
-    """所有要检查的 .py：包内 + 三个子系统的测试。"""
+    """所有要检查的 .py：包内 + 三个子系统的测试 + 仓库根那几个入口。
+
+    根上的 main.py / api.py / app.py 也 import `ecom.*`，而且它们**没有测试
+    覆盖**（Streamlit 和 FastAPI 本机都没装，import 都进不去）。所以它们必须
+    进这个检查——否则在这三个文件里写错一个模块路径，跑遍全套测试都不会有
+    任何东西报警，直到有人真的去跑那个界面。
+    """
     files = list(PKG_ROOT.rglob("*.py"))
     files += list((REPO_ROOT / "tests").rglob("*.py"))
+    files += [p for p in REPO_ROOT.glob("*.py")]
     return sorted(f for f in files if "__pycache__" not in f.parts)
 
 
