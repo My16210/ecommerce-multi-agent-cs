@@ -1,0 +1,54 @@
+[project]
+name = "ecom-customer-service"
+version = "0.1.0"
+description = "多 Agent 电商智能客服：LangGraph Supervisor + Worker（知识库 / 订单物流 / 销售数据分析）"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.2.14",
+    "langchain-openai>=1.7.0",
+    "python-dotenv>=1.2.4",
+    # ——— 知识库 worker 是**进程内**调用 rag_knowledge_base 的，所以它那几个
+    # 运行时依赖这里也要有。这是"跨仓库如何集成"的代价：为了不把知识库那一路
+    # 塞进子进程（它是热路径，每次提问都走），接受了这份依赖重复。
+    # 注：只要 retriever / generator / vector_store 三个入口，不 import 它的
+    # graph.py，所以不需要 ddgs（联网搜索那一路）。
+    "chromadb>=1.5.9",
+    "langchain-text-splitters>=1.1.3",
+    "jieba>=0.42.1",
+]
+
+[project.optional-dependencies]
+# HTTP 接口（api.py）是可选增强，**核心功能不依赖它**：命令行 main.py 始终可用。
+# 这么分不是为了省那点安装时间，是为了让"clone 下来能不能立刻跑"这件事
+# 只取决于核心依赖——服务端再多一个装不上的包，也不该拖垮演示。
+api = ["fastapi>=0.115", "uvicorn>=0.32", "pydantic>=2.9"]
+# 订单库默认走 SQLite（零依赖、clone 下来就能跑）；要接 MySQL 8 才装这个，
+# 和 rag_knowledge_base 的「Chroma 默认 / Milvus 可选」是同一套取舍。
+mysql = ["pymysql>=1.1"]
+# 数据分析 worker 走**子进程**调 sibling 仓库 sales_agent，
+# 它自己那份 requirements 由它自己管，这里不重复声明。
+# 同理，知识库 worker 要用的 jieba/chromadb 是**重复声明**的——因为它是进程内
+# 调用（见依赖表上面的说明），不能靠"对方装了"。
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# 让 tests/ 能直接 import cs.*，不依赖 pytest 的 rootdir 推断
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [".venv", "data", "logs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    # E501：中文注释里常有长 URL 和表格，硬折行反而更难读
+    "E501",
+    "B905",
+]

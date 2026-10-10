@@ -1,0 +1,25 @@
+# ——— 密钥：绝不入库 ———
+# 先全忽略、再单独放行模板，这两行的顺序不能反：写在放行之后的忽略规则
+# 优先级更高，会把 .env.example 又盖掉。
+.env
+.env.*
+!.env.example
+
+# ——— 运行生成物 ———
+# data/orders.sqlite 是 seed 造出来的（每次内容一样），没必要进仓库；
+# 进了仓库反而会让人分不清"库里的数据"和"seed.py 里的数据"哪个才算数。
+data/*.sqlite
+logs/
+
+# ——— Python ———
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# ——— 编辑器 / 系统 ———
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
