@@ -137,7 +137,30 @@ def _build_globals(df, chart_path: Path, output_dir: Path) -> dict:
     _ensure_agg()
     import matplotlib.pyplot as plt
 
-    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei"]
+    # 中文字体列表，**按可用性逐个往下找**，不是只写一个。
+    #
+    # 原来这里只有 ["Microsoft YaHei"] 一项，在 Windows 上没问题（那台机器上
+    # 有）。但镜像里没有这个字体，matplotlib 的报错方式是**只打一行 warning 然后
+    # 悄悄退回默认字体**：
+    #     findfont: Generic family 'sans-serif' not found because none of the
+    #     following families were found: Microsoft YaHei
+    # 默认的 DejaVu Sans 没有汉字，于是图照样生成、exit code 照样是 0，
+    # 只有**把 PNG 打开看**才会发现每个中文标签都成了豆腐块。这是真在容器里
+    # 跑出来的：华东/华北/华南/西南/西北 五个标签全变方框。
+    #
+    # 所以两件事一起做：这里给出跨平台的候选顺序（Windows 仍然首选雅黑，行为
+    # 不变；Linux 落到 Noto），Dockerfile 里把 fonts-noto-cjk 装上。
+    # 只改一边没用——列表里写着但系统上没有，等于没写。
+    #
+    # 最后一项 DejaVu Sans 是兜底：它没有中文，但能保证"缺字体"不会变成
+    # 抛异常把整条分析链路打断——图画得难看，好过图完全没有。
+    plt.rcParams["font.sans-serif"] = [
+        "Microsoft YaHei",
+        "Noto Sans CJK SC",
+        "WenQuanYi Zen Hei",
+        "SimHei",
+        "DejaVu Sans",
+    ]
     plt.rcParams["axes.unicode_minus"] = False
 
     return {

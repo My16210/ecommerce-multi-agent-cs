@@ -6,9 +6,9 @@
 
 | 问题 | 谁来办 | 为什么是它 |
 |---|---|---|
-| "退货政策是什么""保修怎么算" | **知识库 worker** | 答案在文档里，要检索 |
-| "订单 100002 到哪了""我要退货" | **订单 worker** | 答案在数据库里，要查/要写 |
-| "哪个地区卖得最好""这季度退货率多少" | **数据分析 worker** | 答案要算出来，要跑代码 |
+| "退货政策是什么""保修怎么算" | **知识库子系统** | 答案在文档里，要检索 |
+| "订单 100002 到哪了""我要退货" | **订单子系统** | 答案在数据库里，要查/要写 |
+| "哪个地区卖得最好""这季度退货率多少" | **数据分析子系统** | 答案要算出来，要跑代码 |
 
 而真实用户不会按这个分类说话。「订单 100002 到哪了，顺便问下你们的退货政策」——一句话两个需求，这正是这个项目要解决的事。
 
@@ -16,26 +16,103 @@
 
 ---
 
+## 这个仓库是怎么来的
+
+它原本是**三个独立的仓库**：一个 RAG 知识库（问答 + 人审 + 评测，约 10k 行）、一个销售数据分析 agent（写代码 → 执行 → 纠错，约 1.7k 行）、以及这个编排层。合并的触发点不是"看起来更整齐"，是一次真实事故：
+
+> 编排层的配置一开始放在 `config/settings.py`——和知识库仓库保持一致，听起来是"风格统一"。结果是知识库那 16 个 `from config.settings import ...` **全被劫持到了编排层这份上**，报出来的是 `ImportError: cannot import name 'LOGS_PATH'`。而 `LOGS_PATH` 和故障原因一点关系都没有。
+>
+> 更坏的情况是**它悄悄找到了一个同名但含义不同的常量**：不报错，只是行为不对。
+
+当时的应对是绕开：编排层改用 `cs/` 这个"足够独特、永远撞不上"的顶层名，加一道运行时闸门检查 import 到底来自哪个仓库，知识库走进程内、数据分析走子进程。**整套设计都是被这一件事逼出来的。**
+
+合并要买的正是这个：sibling 变成了自己，"撞名"这个约束**从构造上不存在了**。于是
+
+| 合并前为了绕开它而存在的东西 | 合并后 |
+|---|---|
+| 编排层叫 `cs`（为了独特） | 叫 `ecom.orchestrator`（不再需要独特） |
+| `_assert_imports_came_from()` 运行时闸门 + 它的测试 | 删除 |
+| `sys.path.insert` 挂 sibling 仓库 | 删除 |
+| `WORKSPACE_ROOT` / `RAG_KB_ROOT` / `SALES_AGENT_ROOT` / `SALES_AGENT_PYTHON` | 四个配置项全删 |
+| 依赖表里"因为进程内调用所以重复声明 rag 那几个包" | 一张表，本来就只有一份 |
+| sales_agent 那 9 个测试文件里的 `sys.path.insert` 自举 | 删除，由 `pythonpath=["."]` 统一管 |
+| 三份 `pytest` / `ruff` 配置、两份相似的向量化实现、两个 `app.py` | 各一份 |
+
+**没有一行业务逻辑被重写。**除了那几个接缝文件和新的 `app.py`，其余全部是"搬 + 改 import"——约 270 处，分布在 130 个文件里。
+
+**原两个仓库原地保留、一行未动**（它们各自有独立的 commit 历史和文档），这里合并的是副本。
+
+---
+
+## 目录
+
+```
+ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一入口所在地
+├── pyproject.toml               一张依赖表（合并三家）
+├── .env / .env.example          一份配置
+├── main.py                      CLI —— **第一入口**，排查问题用这个
+├── app.py                       Streamlit 界面 —— 演示用
+├── api.py                       FastAPI    —— 可选
+│
+├── ecom/                        ★ 唯一顶层包，三个平级的子系统
+│   ├── settings.py              共享配置：ROOT / DATA_DIR / LOGS_DIR / 密钥 / 模型名
+│   │                            **全项目唯一一处读 .env、唯一一处算项目根**
+│   ├── orchestrator/            编排：supervisor / router / aggregate / workers / tools / db
+│   ├── knowledge/               知识库：retriever / vector_store / embedding / generator /
+│   │                            document_loader / review / web_search / cli（9 个脚本）
+│   └── analytics/               数据分析：agents / core（graph + sandbox）/ utils / cli
+│
+├── data/                        三个子系统的数据按目录分开
+│   ├── knowledge/               documents/（含「电商客服示例」语料）、评测集、金标准、向量库
+│   ├── analytics/raw/sales.csv
+│   └── orders.sqlite
+├── logs/                        日志 + requests.jsonl（trace）
+└── tests/                       orchestrator/ knowledge/ analytics/ + 两个跨系统的不变量测试
+```
+
+### 为什么是一个 `ecom` 而不是三个平级顶层包
+
+顶层包名就是全局命名空间。**一个 `ecom` 从构造上就不可能撞**——这正是那次事故的结论，用它收尾比再挑三个"足够独特"的名字更干净，也把三个子系统摆成对等的三块，而不是"主项目 + 两个依赖"。
+
+代价是 `cs.` → `ecom.orchestrator.` 这 80 处也要改。这 80 处在自己的代码里、有 78 条测试兜着，是整次改动里最安全的一段。
+
+---
+
 ## 跑起来
 
 ```bash
-git clone <本仓库> ecom_cs
-# 知识库和数据分析这两个 worker 复用另外两个仓库，放在同一层目录即可：
-#   ../rag_knowledge_base   ../sales_agent
-
-cd ecom_cs
-cp .env.example .env       # 填 QWEN_API_KEY
-uv sync                    # 想用 HTTP 接口：uv sync --extra api
+git clone <本仓库> ecom_cs && cd ecom_cs
+cp .env.example .env      # 填 QWEN_API_KEY（路由 + 生成）与 SILICONFLOW_API_KEY（向量化 + rerank）
+uv sync                   # 界面：--extra ui ｜ HTTP：--extra api ｜ Milvus：--extra milvus
+uv run python main.py --init-db                                  # 造 20 笔订单 + 17 条物流
+uv run python -m ecom.knowledge.cli.ingest                       # 建向量库
 uv run python main.py "订单 100002 到哪了"
 ```
 
-第一次跑先看一眼订单库：
+**不再需要另外两个仓库**——`.env` 里那三个 `RAG_KB_ROOT` / `SALES_AGENT_ROOT` / `SALES_AGENT_PYTHON` 已经删掉了，它们的存在本身就是"没合干净"的标记。
+
+不填 `QWEN_API_KEY` 也能跑：路由会退回关键词规则，订单那一路完全不依赖模型。**这是设计的一部分，不是碰巧**（见下面"三层路由"）。
+
+### 用 Docker 跑（可选）
 
 ```bash
-uv run python main.py --init-db      # 造 20 笔订单 + 17 条物流
+cp .env.example .env
+docker compose up -d                                   # 默认：Chroma 嵌入式 + SQLite，零外部依赖
+docker compose run --rm app python main.py --init-db                   # 造 20 笔订单
+docker compose run --rm app python -m ecom.knowledge.cli.ingest        # 建向量库
+# → http://localhost:8501
 ```
 
-不填 `QWEN_API_KEY` 也能跑——路由会退回关键词规则，订单那一路完全不依赖模型。**这是设计的一部分，不是碰巧**（见下面"三层路由"）。
+换 Milvus：`docker compose --profile milvus up -d`（四个服务一起起）。
+
+四个设计点：
+
+- **Milvus 发布在 `19531` 而不是 `19530`**，etcd / minio 干脆不发布端口。因为本机 19530 上常年跑着一个 Milvus，照抄默认端口必然冲突。这条不是重新想的，是从 RAG 那个仓库原样保留的。容器里要连宿主上那个 Milvus，就设 `DOCKER_MILVUS_URI=http://host.docker.internal:19530`——**不能用 `localhost`，那在容器里指向容器自己**。
+- **`data/` 和 `logs/` 挂宿主目录**（bind mount），所以宿主上已经建好的向量库、订单库、图表目录容器里开箱即用。这也正是"数据收到一处"的直接收益：合并前三份数据在三个仓库各自的 `data/` 里，这个卷得挂三次。代价是 Linux 上要 `sudo chown -R 1000:1000 data logs`（容器里是非 root 的 `app` 用户）；Windows 的 Docker Desktop 会把权限放宽，通常不用管。
+- **镜像里装了 `fonts-noto-cjk`**（约 90MB）。不装的话图能生成、退出码是 0，只有把 PNG 打开才知道中文全是豆腐块——见下面"坑 7"。
+- **`--profile milvus` 时 app 没有 `depends_on: milvus`**。compose 对"依赖一个只存在于某个 profile 里的服务"处理得别扭；而 Milvus 起不来时 `MilvusStore` 自己会抛一条能照着做的错误，比编排层的依赖约束更直接。所以顺序交给文档：四个一起起，若 app 先就绪导致第一问失败，重试一次即可（Milvus 的 `start_period` 是 90s）。
+
+⚠️ 两个如实说明：镜像**构建过也跑过**（见「验证到哪一步」），但**界面本身没在浏览器里打开过**；另外 `docker compose config` 会把 `env_file` 解析并**打印出来**，所以别把它重定向进文件再拿去贴。
 
 ---
 
@@ -46,28 +123,35 @@ $ uv run python main.py "订单 100002 到哪了，顺便问下你们的退货�
 
 路由上限 2 轮　worker 超时 {'knowledge': 90, 'order': 20, 'analytics': 180}
 ==================================================================
-订单 100002 的物流：中通，运单号 ZT9988776655，郑州 → 上海，当前「派送中」，最近更新 2025-09-20 09:10。
+订单号100002当前物流状态为「派送中」，承运商是中通，运单号ZT9988776655，路线为郑州→上海，
+最近一次更新时间为2025-09-20 09:10。
 
-知识库这块暂时查不了（服务异常）。
+关于退货政策：
+- 七天无理由退货：自签收次日起7个自然日内，商品完好（含配件、吊牌、标识齐全，无使用
+  痕迹、损坏、污渍）、不影响二次销售，即可申请；……拆开外包装查验商品不视为影响二次
+  销售，但拆封后影响人身安全或健康的商品（如食品、药品）除外。
+- 质量问题退货（三包）：……
 
+注意：「知识库」单元称提供的资料中没有订单号100002的物流状态相关内容，而「订单」单元
+提供了该订单的详细物流信息，二者存在冲突。
 --------------------------------------------------------
-来源：100002
+来源：售后政策.md、退换货流程.md、100002
 --------------------------------------------------------
 问题：订单 100002 到哪了，顺便问下你们的退货政策是什么
-路由：order、knowledge　来源 rule　置信度 0.00
-      理由：LLM 路由输出不可用，退回关键词规则
-  · 第1轮 知识库：失败 16905ms token={'in': 0, 'out': 0}
-      错误：APITimeoutError: Request timed out.
-  · 第1轮 订单：成功 3ms token={'in': 0, 'out': 0}
-      结论：订单 100002 的物流：中通，运单号 ZT9988776655，郑州 → 上海，当前「派送中」…
-决策：answer（1 个单元给出结论，汇总方式 concat）
+路由：order、knowledge　来源 llm　置信度 0.95
+      理由：用户同时询问具体订单物流状态（order）和退货政策（knowledge）
+  · 第1轮 知识库：成功 8318ms token={'in': 0, 'out': 0}
+  · 第1轮 订单：成功 11ms token={'in': 0, 'out': 0}
+决策：answer（2 个单元给出结论，汇总方式 llm）
 --------------------------------------------------------
-耗时 25005 ms　token {'in': 0, 'out': 0}
+耗时 17648 ms　token {'in': 881, 'out': 370}
 ```
 
-这一条输出里藏着这个项目的大部分设计：路由是谁定的（`来源 rule`）、每个 worker 花了多久、哪个坏了、坏的那块怎么**如实**告诉用户、汇总走的是模型还是直接拼接（`汇总方式 concat` = 没调模型）。
+这一条输出里藏着这个项目的大部分设计：路由是谁定的（`来源 llm`）、两个 worker 花了多久（**8.3 秒和 11 毫秒，差三个数量级**）、哪块坏了怎么如实告诉用户、汇总走的是模型还是直接拼接（`汇总方式 llm` / `concat`），以及**最后那句"二者存在冲突"**。
 
-**这是真跑出来的，不是摆拍的**：这次 dashscope 不通，路由走规则兜底（8 秒放弃，不是 180 秒），知识库 worker 超时，订单那半照常答了出来，并且明说哪块没拿到。一次请求把三四条兜底链路全演示了。
+最后那句值得单独看一眼：知识库那一侧如实说了"我的资料里没有这个订单号"，订单那一侧给出了物流。汇总节点**没有拿一方的结论去覆盖另一方**，而是把冲突原样报出来。这是"汇总提示词第 2 条：一个字的新事实都不许加"的直接结果——包括**不许替用户消解矛盾**。
+
+**这是真跑出来的，不是摆拍的**（2026-10-10）。同一天更早的一次运行里 dashscope 不通，那次的结果是：路由走规则兜底（8 秒放弃，不是 180 秒）、知识库 worker 超时、订单那半照常答出来、并且明说哪块没拿到——一次请求把三四条兜底链路全演示了。
 
 ---
 
@@ -90,7 +174,7 @@ $ uv run python main.py "订单 100002 到哪了，顺便问下你们的退货�
 - **订单查询是工具**：输入订单号，输出状态。中间没有"看看结果再改改"。给它套一个 agent 壳子，只会多一层提示词、多一次模型调用，换来一个更不确定的输出。
 - **数据分析是 agent**：它要生成代码、执行、看报错、改代码、再执行。这个循环就是它的全部价值。
 
-这条判据决定了代码长什么样：`cs/tools/order_tools.py` 里是纯函数，`sales_agent` 里是带纠错循环的图。"什么该做成 agent"是这套架构里最容易被滥用的一件事——**把工具包装成 agent 是负收益**。
+这条判据决定了代码长什么样：[ecom/orchestrator/tools/order_tools.py](ecom/orchestrator/tools/order_tools.py) 里是纯函数，[ecom/analytics/](ecom/analytics/) 里是带纠错循环的图。**把工具包装成 agent 是负收益**。
 
 ### 二、Worker 之间不传自然语言，只传结构化结果
 
@@ -132,55 +216,90 @@ $ uv run python main.py "订单 100002 到哪了，顺便问下你们的退货�
 
 ---
 
-## 三个 worker，两种接入方式
+## 三个子系统，三种接入方式
 
-那两个仓库**没有被复制进来**，而是在运行时引用。接入方式按各自的账算：
+合并之后三个子系统在同一个包里，但接入方式**故意不一样**。三种接法各自算的账不同，不是不一致：
 
-### 知识库 → **进程内 import**
+| 子系统 | 接入 | 为什么 |
+|---|---|---|
+| 知识库 | **进程内 import** | 热路径（几乎每次提问都走）、无副作用的纯库 |
+| 订单 | **本进程 + SQLite** | 毫秒级、纯函数、不调模型 |
+| 数据分析 | **子进程** | 唯一执行模型生成代码的，需要一个能被真杀死的边界 |
 
-它是热路径（几乎每次提问都走），子进程要多付一次 Python 启动 + chromadb 初始化的钱。而它是个**纯库**：`retrieve` / `generate_answer` 都是无副作用的函数，给一个进程边界带不来任何隔离收益。
+### 知识库：进程内
 
-只 import 四个入口，**不 import 它的 `graph.py`**：绕开联网搜索那一路依赖，也避开 `answer_node` 里"把问过的题写进待审核队列"的副作用。
+子进程要多付一次 Python 启动 + chromadb 初始化的钱，而它几乎每次提问都走。它是个纯库：`retrieve` / `rerank` / `generate_answer` 都无副作用，给一个进程边界带不来任何隔离收益。
 
-### 数据分析 → **子进程**
+只 import 四个入口，**不 import 它的 `core/graph.py`**：绕开联网搜索那一路依赖，也避开 `answer_node` 里"把问过的题写进待审核队列"的副作用。这个理由和撞名无关，合并前后都成立。
 
-```bash
-python ../sales_agent/analyze_json.py "哪个地区卖得最好"   # stdout 只吐一行 JSON
-```
+### 数据分析：子进程——**理由变了，这一点值得写清楚**
 
-三个理由，第一个是硬约束：
+合并**前**，这里的第一个理由是硬约束：两个仓库都有顶层 `src`，同一进程里必然有一个静默解析错。合并**后**那个理由没了。
 
-1. **同名顶层包**。两个仓库都有顶层 `src/`。同一进程里先 import 谁，另一个的 `from src.x import y` 就静默解析到先来的那个——不报错，只算错。
-2. 它是唯一带纠错循环（可能跑几分钟）、也是唯一**执行模型生成的代码**的 worker。真进程边界意味着超时能真杀。
-3. 依赖各管各的，本仓库不用把 pandas / matplotlib 拖进来。
+**但边界留着，而且是故意的：**
 
-代价是每次多一次进程启动。它本来就是最慢的那个（几十秒量级），这点开销不改变量级——**但知识库那一路不一样，所以那两个用了两种接法**。
+1. **它执行模型生成的代码。** 这是本系统里唯一一处"别人的文本变成我们机器上跑起来的程序"。沙箱在 [ecom/analytics/core/sandbox.py](ecom/analytics/core/sandbox.py)（AST 白名单 + 受限 builtins），但沙箱**不做超时、也不做进程隔离**——`while True: pass` 拦不住。真进程边界是补上这一层的唯一办法：`subprocess.run(timeout=…)` 到点是**真杀**，而进程内那个"超时"只是不再等它。
+2. **它可能跑几分钟。** 生成 → 执行 → 报错 → 改 → 再执行，循环几轮。进程内跑意味着这几分钟里 supervisor 那条线程被占着、还占着内存。
+3. 顺带，崩了炸不到 supervisor。
 
-### 订单 → 原生，SQLite 默认
+命令从 `python ../sales_agent/analyze_json.py` 变成 `python -m ecom.analytics.cli.analyze`，用 `sys.executable` ——**同一个 venv，不再需要"用哪个解释器"这个配置项**。界面（`app.py`）也走这条边界：**界面不该是那条边界的例外**，为了"少起一个进程"改成进程内调用，等于换了一个没有超时、崩了会带走整个页面的执行环境。
 
-`cs/db/` 是一个薄薄的双后端适配，SQL 全部用 `?` 占位符写，MySQL 后端在 `engine._translate` 里统一换成 `%s`。默认 SQLite 的理由不是"SQLite 更好"，而是**默认路径必须零外部依赖**，否则"别人拿到能跑"就是空话；但代码不能被 SQLite 惯坏，所以 DDL 用两边都吃的写法（`VARCHAR` 做主键而不是 `TEXT`，不用 `AUTOINCREMENT`）。
+### 订单：原生，SQLite 默认
+
+[ecom/orchestrator/db/](ecom/orchestrator/db/) 是一个薄薄的双后端适配，SQL 全部用 `?` 占位符写，MySQL 后端在 `engine._translate` 里统一换成 `%s`。默认 SQLite 的理由不是"SQLite 更好"，而是**默认路径必须零外部依赖**，否则"别人拿到能跑"就是空话；但代码不能被 SQLite 惯坏，所以 DDL 用两边都吃的写法（`VARCHAR` 做主键而不是 `TEXT`，不用 `AUTOINCREMENT`）。
 
 ---
 
-## 踩过的四个坑
+## 配置：共享的和各自的，分两层
 
-这一节是这个项目里最值钱的部分。四个都是**真发生过的**，而且每一个的症状和原因都隔得很远。
+```
+ecom/settings.py                ROOT / DATA_DIR / LOGS_DIR / 密钥 / 模型名
+                                ← **唯一一处** load_dotenv，**唯一一处**算项目根
+ecom/knowledge/settings.py      自己的旋钮：chunk 大小、top-k、RRF 权重、评测路径
+ecom/analytics/settings.py      自己的旋钮：LLM 供应商表、MySQL 连接、输出目录
+ecom/orchestrator/settings.py   自己的旋钮：worker 超时、MAX_ROUNDS、路由预算
+```
+
+"一个项目一个 settings"听起来更整齐，但代价是把三套旋钮塞进一个 200 行文件、再改掉所有 import——**整齐是给读者看的，风险是自己的**。
+
+而密钥和模型名**只能有一处**，否则迟早出现"同一个 key 在两处配、改了一处"，症状是"某个 worker 偶尔 403"——那种错查起来最费时间。
+
+### 根路径只算一次——这条是硬约束
+
+三个子系统原来各有一处 `Path(__file__).resolve().parent.parent`（还有一个 `parent.parent.parent`）。搬进子目录之后它们**全都还能算出结果、只是算错**：不抛异常，只是此后 `data/` 找不到、日志写到 `ecom/logs/`。
+
+三条独立的路径算术各自错一次、且都不报错，靠"记得改"是守不住的，**只能靠"只有一处算路径"**。`tests/test_package_layout.py` 里有一条断言把这件事钉死。
+
+### 依赖表：按"能力"分组，不按"来源"分组
+
+规则只有一条：**内核依赖 = 让 `uv run python main.py` 能跑通的全部**。
+
+- **内核**：langgraph / langchain-openai / langgraph-checkpoint-sqlite / openai / python-dotenv / chromadb / langchain-text-splitters / jieba / pypdf / ddgs / grandalf / requests / **pandas / numpy / matplotlib**。
+
+  最后三个是**核心**不是可选：数据分析是三个核心能力之一，没有它整张图少一条腿。合并前它们在另一个仓库的 `requirements.txt` 里——那只是历史，不是理由。
+- **`[ui]` / `[api]`**：两种界面，**都不装也完全能用**。"clone 下来能不能立刻跑"只该取决于内核，多一个装不上的界面依赖不该拖垮整个演示。
+- **`[milvus]` / `[mysql]` / `[search]`**：可选后端与增强。默认路径（Chroma / SQLite / ddgs）一律零外部依赖。
+- **删掉**：`sales_agent/requirements.txt`（并入）、`langchain-community` 与 `langchain-core`（全仓库零引用）。
+- **降级**：`streamlit` 从另一个仓库的硬依赖降成 `[ui]`——它的 `app.py` 已被统一的 `app.py` 取代，而 CLI 才是始终可用的那条路。依赖表里每一次升降都要有这种理由，不然它就是在随机漂移。
+
+**没有 `uv.lock`**：宿主上 PyPI 不通，生成不了。一份**过期的锁**比没有锁更坏——它会让人以为依赖是钉死的，实际不是。这是这个交付里明确留下的缺口，见下面"验证到哪一步"。
+
+（`docker build` 里 PyPI 是通的，所以严格说现在**已经能**在容器里跑一次 `uv lock` 了。没顺手做，是因为那会给 `uv sync` 加一个 `--frozen`，改动面从一个文档缺口变成一个构建契约——要动就单独动，不该混在这次合并里。）
+
+---
+
+## 踩过的坑
+
+这一节是这个项目里最值钱的部分。六个都是**真发生过的**，而且每一个的症状和原因都隔得很远。
 
 ### 1. 顶层包撞名——报的错和真实原因毫无关系
 
-项目刚跑通知识库那一路时直接炸了：
+见上面「这个仓库是怎么来的」。合并前的应对是改名 + 运行时闸门；合并后闸门删了，**接过这件事的是两条测试**：
 
-```
-ImportError: cannot import name 'LOGS_PATH' from 'config.settings'
-```
+- 全仓库没有 `from src.` / `config.` 残留（**包括藏在字符串里的** `importlib.import_module("src.…")`——那种 `from src.` 的 sed 完全看不见，合并时真的踩到过，红了三条测试）；
+- 顶层只有一个 `ecom/` 包。
 
-本项目原先把配置放在 `config/settings.py`，和 rag_knowledge_base 保持一致——听起来是"风格统一"，实际是把 rag 的 **16 个** `from config.settings import ...` 全部劫持到了我们这份上。因为知识库 worker 是进程内 import 的，而我们自己先 import 了自己的 `config`，`sys.modules["config"]` 就被占住了。
-
-`LOGS_PATH` 这件事和故障原因一点关系都没有，这才是最耗时间的地方。更坏的情况是**它悄悄找到了一个同名但含义不同的常量**：不报错，只是行为不对。
-
-- **改法**：本项目的顶层包只留一个 `cs`——一个足够独特、永远撞不上的名字。配置搬到 `cs/settings.py`。
-- **加了一道运行时闸门**：`knowledge._assert_imports_came_from()` 在 import 完之后检查 `src.core.graph` 和 `config.settings` 的 `__file__` 是否真在知识库仓库下，不是就直接报错并说明是撞名。
-- **加了一条测试**：`test_we_do_not_take_over_the_sibling_repos_top_level_names` 守着"本项目永远不拥有 `src/` 和 `config/`"。约定给人看，运行时闸门给机器看，两个都要。
+后者防的不是老问题以老样子回来，而是它以**"再加个 `scripts/` 放几个脚本""再加个 `utils/` 放点公共代码"**的样子回来——那种拆分一旦开始，下一个撞名只是时间问题。
 
 ### 2. 重试放大——两层重试把超时预算吃掉了
 
@@ -189,7 +308,7 @@ ImportError: cannot import name 'LOGS_PATH' from 'config.settings'
 原因是两层重试叠加：openai 客户端默认自带 2 次重试，我们外面又有一层"失败重试 3 次"，**总耗时是乘法**——单次超时 8 秒 × SDK 自己试 3 次 = 24 秒，外面那个"20 秒总预算"直接失效。
 
 - **改法**：`get_llm(..., max_retries=0)`，把重试权收回到我们的代码里。理由是**我们比 SDK 多知道两件事**：这次调用值不值得重试（路由是幂等的分类，值得；写退货绝不能重试），以及整件事的总预算。
-- 同时把路由的单次超时压到 8 秒（它只是个几十 token 的分类任务），并加了**总预算**这道闸。
+- 同时把路由的单次超时压到 8 秒，并加了**总预算**这道闸。
 
 ### 3. 「退货政策」被当成「我要退货」，**真的往库里插了一条申请**
 
@@ -200,7 +319,6 @@ ImportError: cannot import name 'LOGS_PATH' from 'config.settings'
 - **改法**：`create_return` 只在**第一人称诉求**（我要退 / 帮我退 / 申请退货…）时才触发；只要句子里是问规则的口吻（政策 / 能不能退 / 怎么退 / 多久）且没有第一人称诉求，就**不认成要办退货**。
 - **加了两道闸**：规则层一道，`run_order` 里再一道。因为规则层只挡规则路径，**模型也有可能把"你们的退货政策是什么"听成"要退货"**——写操作要两层都守。
 - 挡下来的代价是多问一句"您是要办还是问规则"；放过去的代价是替用户办了他没要求的事。**代价不对称，所以宁可多问。**
-- 反过来也留了口子：「我要退货，顺便问下政策」是两条需求，用户点名的那个照办。
 
 ### 4. `results` 是跨轮累加的，`= []` 清不掉
 
@@ -208,8 +326,57 @@ ImportError: cannot import name 'LOGS_PATH' from 'config.settings'
 
 结果就是第二轮的汇总把第一轮的结论又汇总了一遍，症状是"同一段话说两遍"，而且**只在第二轮出现**，最难查。
 
-- **改法**：每条 worker 结果盖上 `round` 标记，汇总前用 `base.round_results` 挑出本轮的。顺带的好处是 trace 里每条记录都带轮次，正好是排查回环时要看的东西。
+- **改法**：每条 worker 结果盖上 `round` 标记，汇总前用 `base.round_results` 挑出本轮的。
 - 这件事没有任何办法靠"赋值清空"绕开，只能理解 reducer 在做什么。
+
+### 5. 合并之后才发现的：三处"数上层目录"（见上面「根路径只算一次」）
+
+搬完 import 全绿、测试全绿，但 `data/` 找不到、日志要写到 `ecom/logs/` 去——**三处都还能算出结果，只是算错**。这类错误不会被任何业务测试撞见，只能显式钉住。
+
+### 6. 合并之后才发现的：`.env` 本身没合并
+
+依赖表合了、数据合了、配置项删了，但**没人去合 `.env` 的内容**。合并后的 `.env` 里只有 `QWEN_*` 三个变量，而新进来的两个子系统要的 `DEEPSEEK_*`（数据分析）和 `SILICONFLOW_API_KEY`（向量化 + rerank）都不在——也就是说**界面能开，一问就报"未配置 API Key"，三分之二的功能跑不起来**。
+
+发现它的方式很直接：跑一次数据分析，返回 `未配置 deepseek 的 API Key`。**这类缺口只有"真的跑一遍"才会露出来**，静态检查再多也看不见。修法是把两个 key 从原仓库的 `.env` 原样搬过来（值未改动、未入库）。
+
+### 7. 容器里的中文图表：全绿，但图是豆腐块
+
+数据分析的图里全是中文（标题、轴标签、地区名），而 `python:3.11-slim` 里**一个 CJK 字体都没有**。原来 `sandbox.py` 里写死了：
+
+```python
+plt.rcParams["font.sans-serif"] = ["Microsoft YaHei"]
+```
+
+宿主上有这个字体，所以一直没暴露。容器里没有，matplotlib 的处理方式是**往 stderr 打一行 warning，然后悄悄退回默认的 DejaVu Sans**：
+
+```
+findfont: Generic family 'sans-serif' not found because none of the
+following families were found: Microsoft YaHei
+```
+
+于是那次运行的结果是：子进程 exit 0、`chart_generated: true`、报告文字完全正常、日志里两行信息都在——**每一项检查都是绿的，只有把 PNG 打开看才知道五个地区名全是方框**。这一条是"跑起来了"和"跑对了"之间的距离，靠日志和退出码都发现不了。
+
+修法必须**两边一起改**，只改一边等于没改：
+
+- `ecom/analytics/core/sandbox.py` 给出跨平台的候选顺序（Windows 仍然首选雅黑，行为不变；Linux 落到 Noto）；
+- `Dockerfile` 里装上 `fonts-noto-cjk`（约 90MB）——列表里写着但系统上没有，等于没写。
+
+验证方式也只能是**把图画出来看**：容器内五个地区名、标题、两个轴标签全部正常渲染，stderr 里那行 `findfont` warning 也消失了。
+
+---
+
+## 界面
+
+```bash
+uv sync --extra ui
+uv run streamlit run app.py
+```
+
+四个 Tab 共用一份进程：**智能客服**（答复 + 决策链，就是 `main.py -v` 那份内容的可视化）、**订单**（订单详情 + 物流 + 退货申请）、**数据看板**（报告 + 生成的图）、**知识库**（答复 + 引用到的段落，逐 token 流出来）。
+
+四个 Tab 是**一件事的四个面**，不是三个 App 加一个新 Tab：点开订单 Tab 看到的就是提示词里那个 `query_order`，不是另一个项目。
+
+**但 CLI 才是第一入口，这个顺序不能反**：界面会把"哪一层慢、哪一层挂了"藏起来——超时变成一个转圈动画、异常变成一个红色弹框。调试期用 `main.py -v`，演示时才上界面。
 
 ---
 
@@ -226,19 +393,46 @@ ImportError: cannot import name 'LOGS_PATH' from 'config.settings'
 ## 测试
 
 ```bash
-uv run pytest        # 85 条，全离线
+uv run pytest        # 408 条：404 passed / 3 failed / 1 skipped
 uv run ruff check .
 ```
 
 **一条测试都不联网。** 不是图快——真调模型意味着测试结果随模型版本、网络、当天负载浮动，那样的测试没法规格回归，它昨天红今天绿，你只会学会忽略它。所有模型调用都用 `FakeLLM` / `ExplodingLLM` 顶掉。
+
+那 3 条失败**合并前就在红**（同一份代码在未改动的原目录里跑出来是同样的 3 条）：2 条是本机缺 matplotlib，1 条是 `review_parser` 的一个真实 bug。合并**没有改变行为**，所以这一轮也没去修它们——修不修是另一件事。
 
 几条值得单独说的：
 
 - `test_falls_back_to_rules_when_the_model_itself_is_broken` —— 三层路由里"规则兜底"存在的全部意义。
 - `test_the_whole_graph_still_works_with_the_model_layer_dead` —— 路由和汇总两个模型角色全挂，整条链路依然跑通。
 - `test_asking_about_the_policy_does_not_file_a_return` —— 坑 3 的回归测试。
-- `test_we_do_not_take_over_the_sibling_repos_top_level_names` —— 坑 1 的回归测试。
 - `test_results_do_not_leak_from_one_round_into_the_next` —— 坑 4 的回归测试。
+- `test_every_ecom_import_points_at_a_real_module` —— **不用 import 业务代码**，只用 AST + 文件系统比对，把每条 `from ecom.x.y import z` 解析回真实文件。合并改了 270 处 import，其中约 55 处在**本机跑不起来**的子系统里，这条是它们唯一的保护。
+- `test_the_analytics_worker_still_goes_through_a_process_boundary` —— 守着那条边界的替代物：命令行里必须出现 `subprocess`，且不许直接 `import ecom.analytics`。
+- `test_the_three_settings_modules_agree_on_the_root` —— 坑 5 的回归测试。
+- `tests/test_app_smoke.py` —— 往 `sys.modules` 塞一个**假的 streamlit**，把 `app.py` 真跑一遍。理由同上：`app.py` 是唯一连 import 都进不去的文件（没装 `--extra ui`），写错一个函数名跑遍全套测试都不会有人报警。
+
+---
+
+## 验证到哪一步（如实写）
+
+这台机器 **PyPI 不通**——但 `docker build` 里通。所以最后是用**容器**把宿主上装不上的那几个包补上，把原来最大的一块未验证面关掉了。分清楚哪些是真跑过的：
+
+| 验过？ | 是什么 | 怎么验的 |
+|---|---|---|
+| ✅ | 知识库那一路**端到端** | 真跑：向量 20 + BM25 20 → RRF 融合取 5 → rerank 取 3 → 带 `[1]` 引用的答复 |
+| ✅ | 编排层**端到端** | 真跑：LLM 路由（置信度 0.95）→ 两个 worker 并行 → 汇总，17.6s / 881+370 token |
+| ✅ | 订单子系统 | 真跑：20 笔订单的本地 SQLite，毫秒级 |
+| ✅ | 分析子进程的**边界** | 真跑：子进程起得来、失败信息能回到父进程、界面能接住（不带走页面） |
+| ✅ | `app.py` 的渲染代码 | 假 streamlit 下四个 Tab 全部渲染通过（见 `tests/test_app_smoke.py`） |
+| ✅ | 408 条测试、ruff、`compileall` | 3 failed / 404 passed / 1 skipped。那 3 条**合并前就在红**：2 条是"本机没装 matplotlib"（报的正是 `ModuleNotFoundError`），1 条是 `review_parser` 的真实 bug |
+| ✅ | **`uv sync` 能否装成** | 真构建：镜像里 `uv sync` 解析出 **150 个包**并装成，五个 extra 全在（matplotlib / streamlit / pymilvus / pymysql / tavily-python / fastapi 逐个确认过） |
+| ✅ | **数据分析跑出一张图** | 真跑（容器内）：DeepSeek 生成代码 → sandbox 执行 → `chart_generated: true`，7.8s，图落在磁盘上。中文标签正常——这一条第一次跑出来是**豆腐块**，见"坑 7" |
+| ✅ | 镜像能构建、容器能跑 | 真构建 + 真跑：`docker compose run --rm app python -m ecom.analytics.cli.analyze "…"` 走完全程 |
+| ❌ | **真实 Streamlit 渲染** | 界面进程没在浏览器里打开过。假模块不校验参数名是否真是 streamlit 的、也不校验布局 |
+| ❌ | 合并后的 `API`（FastAPI） | 镜像里**装了** fastapi，但没起过服务、没发过一个请求 |
+| ❌ | `--profile milvus` 那一支 | 只验到 `docker compose config` 能解析（4 个服务、milvus 发布 19531→19530）。**本机 19530 上已经有一个 Milvus 在跑，这一支没有真起过** |
+| ❌ | 镜像的**依赖可复现性** | 没有 `uv.lock`，每次构建重新解析版本，**两次构建不保证依赖完全一致** |
 
 ---
 
@@ -249,12 +443,13 @@ uv run ruff check .
 - **不做多智能体自由对话**（一群 agent 互相聊天、投票、辩论）。那种结构里，一次错误会被下游放大，而且**没法定位是哪一环错了**。这里用结构化契约 + 单向数据流，代价是"不如自由对话灵活"，换来的是每一步都能查。
 - **不做长期记忆 / 用户画像**。会话历史只在汇总时用一次，进程内字典存，重启即丢、多副本不共享。要真做，得先想清楚存哪、怎么删、合规怎么办——不是加个 Redis 就完事。
 - **不给模型"直接通过退货"的权力**。退货申请只登记不通过，最终决定权在人工审核队列——和这个项目一路的原则一致：模型能判定，但不能拍板。
-- **不做前端**（Streamlit 等）。界面会掩盖问题：超时变成一个转圈动画、异常变成一个红色弹窗，"哪一层慢、哪一层挂了"全看不见。CLI 把决策链摊在眼前，调试期用它、要展示时才上界面。
-- **不追平所有 worker 的能力**。数据分析 worker 依赖 sibling 仓库自己那份环境，本机跑不跑得起来取决于它——这一点如实写在下面。
+- **不做 monorepo 多包**（每个子系统单独一个 `pyproject` + 单独发布）。这个规模下多包只增加 `uv sync` 的复杂度和心智负担，换不来任何东西。
+- **不为"合并"新增功能**。除了 `app.py` 和几个接缝文件，其余是搬 + 改名，不确定的行为一律不动。**唯一的例外是"坑 7"那处中文字体列表**：它不是新功能，是部署验证时真跑出来的缺陷（图能生成、退出码是 0、中文全是豆腐块），改法是把手写的单个字体名换成跨平台候选；Windows 上仍是雅黑优先，行为不变。
+- **不动 `data/` 里的评测集内容**。金标准、评测集、答案快照是评测结论的依据，改了历史数字就对不上了。
 
 ## 已知限制
 
-- **进程内 worker 的"超时"只是不再等它**。Python 杀不掉正在跑的线程，被放弃的线程会自己跑完再被回收。它保护的是响应时间，**不是资源占用**。真要让进程内 worker 也能强杀，得把它们也挪进子进程或进程池——当前规模下不值得，但别把这件事说成"所有 worker 都能超时中断"。
-- **`KB_MIN_SCORE = 0.5` 是启发式，不是判据**。依据是知识库项目自己的评测（真·不可答的问题余弦在 0.53~0.64，可答的在 0.66 以上），但两段有重叠、已知存在误报。取 0.5 是**宁可漏报**：漏报只是少触发一次重路由，误报会把本该由知识库回答的问题踢去别的 worker，后者更糟。
+- **进程内 worker 的"超时"只是不再等它**。Python 杀不掉正在跑的线程，被放弃的线程会自己跑完再被回收。它保护的是响应时间，**不是资源占用**。真要让进程内 worker 也能强杀，得把它们也挪进子进程——当前规模下不值得，但别把这件事说成"所有 worker 都能超时中断"。
+- **`KB_MIN_SCORE = 0.5` 是启发式，不是判据**。依据是知识库自己的评测（真·不可答的问题余弦在 0.53~0.64，可答的在 0.66 以上），但两段有重叠、已知存在误报。取 0.5 是**宁可漏报**：漏报只是少触发一次重路由，误报会把本该由知识库回答的问题踢去别的 worker，后者更糟。
 - **`_guess_customer` 是从自然语言里猜客户号的 demo 将就**。真系统里客户身份来自登录态，绝不从话里猜——那等于让任何人问出别人的订单。这一点在代码里也标了警告。
-- **数据分析 worker 的接入在本机未做端到端验证**：它依赖 `sales_agent` 那一侧的环境（pandas / matplotlib / deepseek key）。子进程的失败路径（超时、非零返回、没有 JSON）都写了并有单测，但"真跑出一张图"这件事取决于那个仓库的环境是否就绪。
+- **一条依赖装不上就少一条腿**。数据分析是核心能力，但它依赖 matplotlib 出图——缺了它整个 worker 会走"自动重试 3 次后放弃"的路径，报告里说"分析未能完成"，而不是崩掉。这是设计里的降级，但它意味着**环境不全时这个项目看起来是"三分之二可用"的**。

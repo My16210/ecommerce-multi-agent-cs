@@ -1,0 +1,175 @@
+# ============================================================================
+# 多 Agent 电商智能客服 —— 部署编排
+#
+# 默认（不带 profile）只起一个 app 服务，向量库用 Chroma 嵌入式、订单库用
+# SQLite，**零外部依赖**：
+#     docker compose up -d
+#     → http://localhost:8501
+#
+# 要换成 Milvus：加上 `milvus` profile，四个服务一起起
+#     docker compose --profile milvus up -d
+#
+# 首次跑要点一次库和一次入库（都复用同一个镜像，跑完即弃）：
+#     docker compose run --rm app python main.py --init-db                  # 20 笔订单
+#     docker compose run --rm app python -m ecom.knowledge.cli.ingest       # 建向量库
+#
+# 其它常用的一次性命令：
+#     docker compose run --rm app python main.py "订单 100002 到哪了" -v    # 命令行问答
+#     docker compose run --rm app python -m ecom.knowledge.cli.review list  # 人审队列
+#     docker compose run --rm app python -m ecom.analytics.cli.main         # 数据分析单跑
+#
+# 验证状态：**镜像构建过、容器真跑过**（本机 PyPI 不通，但 docker build 里通）。
+# 已验：`docker compose config` 能解析、`docker build` 装成 150 个包、
+#       `docker compose run --rm app python -m ecom.analytics.cli.analyze "…"`
+#       在容器里走完整条链路并出图。
+# 未验：界面**没在浏览器里打开过**，`--profile milvus` 那一支也没真起过
+#       （本机 19530 上已经有一个 Milvus 在跑，不该去动它）。
+# 如实记在 README 的「验证到哪一步」。
+# ============================================================================
+
+name: ecom-cs
+
+services:
+  # --------------------------------------------------------------------------
+  # 应用（统一 Streamlit 界面 + 三个子系统）
+  # --------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+    image: ecom-cs:local
+
+    # 密钥从**运行时**注入，不烤进镜像。
+    # required: false 让"还没建 .env"时 docker compose config/up 不会直接报错
+    # （真正的报错推迟到应用启动、给出"缺少 QWEN_API_KEY，请在 .env 中配置"）。
+    #
+    # ⚠️ 一个容易踩的坑：`docker compose config` 会把 env_file 的内容**解析并
+    #    打印出来**——也就是说 `docker compose config > x.yaml` 会把真密钥写进
+    #    那个文件。要贴日志、要发到群里之前，先确认手里那份不是 config 的输出。
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      # 这两个放这里而不是 .env，是因为它们在"容器里"和"宿主上"该取不同的值。
+      #
+      # MILVUS_URI 尤其要注意：.env 里写的是 http://localhost:19530，
+      # 在容器里那个 localhost 指向**容器自己**，连不到任何东西。
+      # 而 compose 的 ${VAR} 插值会读项目根的 .env，所以这里不能复用同名变量，
+      # 换个前缀 DOCKER_MILVUS_URI，默认指向 profile 里的服务名。
+      # 想用宿主上已经跑着的那个 Milvus（本机 19530 就有），改成：
+      #     DOCKER_MILVUS_URI=http://host.docker.internal:19530
+      VECTOR_BACKEND: ${VECTOR_BACKEND:-chroma}
+      MILVUS_URI: ${DOCKER_MILVUS_URI:-http://milvus:19530}
+
+      # 想接宿主上那个 MySQL（本机 docker 里的 mysql8 发布在 3308）就加这几行：
+      #     ORDER_DB_DSN: mysql://root:<password>@host.docker.internal:3308/ecom_cs
+      # 容器里不能用 127.0.0.1 指宿主——那是容器自己。
+
+    ports:
+      # 8501 是本机空闲端口；被占了就 APP_PORT=8600 docker compose up -d
+      - "${APP_PORT:-8501}:8501"
+
+    volumes:
+      # 为什么是 bind mount 而不是 named volume：
+      #   三个子系统的数据都锚在 ROOT/data 下（容器里 = /app/data），卷必须正好
+      #   挂在那里。**这正是"数据收到一处"的直接收益**——合并前三份数据在三个
+      #   仓库各自的 data/ 里，这个卷得挂三次。
+      #
+      #   挂宿主目录带来两个好处：
+      #   ① 宿主上已经建好的向量库、订单库、图表目录**开箱即用**，容器起来
+      #      不用重跑 ingest；
+      #   ② 语料仍然在磁盘上，维持"磁盘上的文本是唯一真源"那条约定。
+      #   代价：Ubuntu 上卷里文件的属主不是容器内的 app 用户，要做一次
+      #     sudo chown -R 1000:1000 data logs
+      #   （或构建时用 --build-arg APP_UID=$(id -u) 对齐）。Windows 的 Docker
+      #   Desktop 会把权限放宽，通常不用管。
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+    # extra_hosts 是为了让 host.docker.internal 在 Linux 上也解析得到
+    # （Docker Desktop 自带，Linux 原生需要显式声明）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    restart: unless-stopped
+
+    # 健康检查继承镜像里那份（Streamlit 的 /_stcore/health），不在这里重复一遍。
+
+  # --------------------------------------------------------------------------
+  # 以下三个只在 `--profile milvus` 时启动
+  # --------------------------------------------------------------------------
+  etcd:
+    profiles: ["milvus"]
+    image: quay.io/coreos/etcd:v3.5.18
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - ./volumes/etcd:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio:
+    profiles: ["milvus"]
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - ./volumes/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  milvus:
+    profiles: ["milvus"]
+    # 版本要和 pyproject 里 pymilvus 的 pin 对上：pymilvus>=2.6,<3 ↔ Milvus server 2.6.x。
+    # 两边版本不对齐时 MilvusStore 会在连接阶段报错，措辞和"服务没起来"很像，
+    # 不容易往版本上想，所以这条对应关系写在这里。
+    image: milvusdb/milvus:v2.6.24
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - ./volumes/milvus:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      # 只发布 gRPC 这一个口，且**故意避开 19530**：
+      # 本机 19530 上已经有一个 milvus-standalone 在跑，照抄常规端口必然冲突。
+      # etcd / minio 干脆不发布——应用走 compose 内网就够了，
+      # 发布端口只是为了调试。要调试就临时加 ports。
+      #
+      # 这条设计是从 RAG 那个仓库原样保留的，不是重新想的：它当初就是为了
+      # "让容器里的 Milvus 和宿主上那个常年跑着的互不干扰"。
+      - "${MILVUS_HOST_PORT:-19531}:19530"
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  # 说明：app 没有写 depends_on: milvus。
+  # 原因是 compose 对"依赖一个只存在于某个 profile 里的服务"处理得别扭——
+  # 不带 profile 启动时容易报 undefined dependency。而 Milvus 这条路，
+  # 起不来的时候 MilvusStore 自己会抛一条能照着做的错误（连不上会提示先起服务），
+  # 比编排层的依赖约束更直接。所以顺序交给文档：
+  #   docker compose --profile milvus up -d   # 四个一起起
+  # 若 app 比 milvus 先就绪导致第一问失败，重试一次即可（Milvus 的
+  # start_period 是 90s）。
