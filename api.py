@@ -22,12 +22,12 @@ from collections import OrderedDict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from cs.core.supervisor import answer
-from cs.db.engine import get_db
-from cs.settings import MAX_QUESTION_CHARS, MAX_ROUNDS
-from cs.utils import trace
-from cs.utils.logger import setup_logger
-from cs.workers.base import worker_names
+from ecom.orchestrator.core.supervisor import answer
+from ecom.orchestrator.db.engine import get_db
+from ecom.orchestrator.settings import MAX_QUESTION_CHARS, MAX_ROUNDS
+from ecom.orchestrator.utils import trace
+from ecom.orchestrator.utils.logger import setup_logger
+from ecom.orchestrator.workers.base import worker_names
 
 logger = setup_logger(__name__)
 

@@ -7,7 +7,7 @@ import logging
 import sys
 from datetime import datetime
 
-from cs.settings import LOGS_DIR
+from ecom.orchestrator.settings import LOGS_DIR
 
 _configured = False
 

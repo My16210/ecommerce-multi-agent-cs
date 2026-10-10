@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from cs.db.engine import Database
-from cs.db.seed import seed
+from ecom.orchestrator.db.engine import Database
+from ecom.orchestrator.db.seed import seed
 
 
 class FakeMessage:
@@ -71,4 +71,4 @@ def _no_trace_file(tmp_path, monkeypatch):
     把 trace 的输出目录换到 tmp：测试绝不该往仓库的 logs/ 里写东西
     （那会让 git status 永远脏，也会把测试的假问题混进真实的请求日志里）。
     """
-    monkeypatch.setattr("cs.utils.trace.LOGS_DIR", Path(tmp_path) / "logs")
+    monkeypatch.setattr("ecom.orchestrator.utils.trace.LOGS_DIR", Path(tmp_path) / "logs")

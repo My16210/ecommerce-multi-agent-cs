@@ -3,8 +3,8 @@ import json
 
 import pytest
 
-from cs.utils.json_utils import loads_or_none, strip_to_json
-from cs.utils.tokens import EMPTY, add, usage_of
+from ecom.orchestrator.utils.json_utils import loads_or_none, strip_to_json
+from ecom.orchestrator.utils.tokens import EMPTY, add, usage_of
 
 
 # ---------------------------------------------------------------------------

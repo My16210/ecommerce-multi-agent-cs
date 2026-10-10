@@ -1,8 +1,8 @@
 """整张图：并行分派 / 结果合并 / 回环有界 / 全链路不联网也能跑通。"""
-from cs.core.supervisor import answer
-from cs.settings import MAX_ROUNDS
-from cs.utils.trace import summarize_workers
-from tests.conftest import ExplodingLLM, FakeLLM
+from ecom.orchestrator.core.supervisor import answer
+from ecom.orchestrator.settings import MAX_ROUNDS
+from ecom.orchestrator.utils.trace import summarize_workers
+from tests.orchestrator.conftest import ExplodingLLM, FakeLLM
 
 
 def workers(order=None, knowledge=None, analytics=None):
@@ -110,7 +110,7 @@ def test_results_do_not_leak_from_one_round_into_the_next():
     所以汇总前必须按 round 过滤，否则第一轮的结论会在第二轮被再汇总一次——
     症状是"同一段话说两遍"，而且只在第二轮出现，最难查。
     """
-    from cs.workers.base import round_results
+    from ecom.orchestrator.workers.base import round_results
 
     def order_fn(q, h):
         return {"answer": "订单结论", "insufficient": True, "sources": []}
@@ -170,9 +170,10 @@ def test_tokens_cover_router_workers_and_synthesis():
 def test_one_request_writes_exactly_one_trace_line():
     import json
 
-    # 必须从 cs.utils.trace 取，不能从 config.settings 取：conftest 把前者的
-    # LOGS_DIR 换到 tmp 了，后者仍指着仓库里真实的 logs/。
-    from cs.utils import trace
+    # 必须从 ecom.orchestrator.utils.trace 取**它自己那个** LOGS_DIR：
+    # conftest 把它换到了 tmp_path，而 ecom.settings.LOGS_DIR 还指着仓库里真实的
+    # logs/。两个模块各有一份名字相同的绑定，取错了就会去读线上那份。
+    from ecom.orchestrator.utils import trace
 
     final = answer(
         "订单 100002 到哪了",
@@ -190,7 +191,7 @@ def test_one_request_writes_exactly_one_trace_line():
 
 
 def test_summarize_workers_aggregates_per_worker():
-    from cs.workers.base import error_result, ok_result
+    from ecom.orchestrator.workers.base import error_result, ok_result
 
     summary = summarize_workers(
         [

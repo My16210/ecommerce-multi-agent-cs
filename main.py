@@ -18,12 +18,12 @@ import json
 import sys
 import time
 
-from cs.core.aggregate import WORKER_LABELS
-from cs.core.supervisor import answer
-from cs.db.engine import get_db
-from cs.db.seed import seed
-from cs.settings import MAX_ROUNDS, WORKER_TIMEOUT
-from cs.utils.logger import setup_logger
+from ecom.orchestrator.core.aggregate import WORKER_LABELS
+from ecom.orchestrator.core.supervisor import answer
+from ecom.orchestrator.db.engine import get_db
+from ecom.orchestrator.db.seed import seed
+from ecom.orchestrator.settings import MAX_ROUNDS, WORKER_TIMEOUT
+from ecom.orchestrator.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 

@@ -20,8 +20,8 @@
 """
 import re
 
-from cs.db.seed import seed
-from cs.tools.order_tools import (
+from ecom.orchestrator.db.seed import seed
+from ecom.orchestrator.tools.order_tools import (
     OrderNotFound,
     ReturnNotAllowed,
     create_return,
@@ -29,10 +29,10 @@ from cs.tools.order_tools import (
     list_customer_orders,
     query_order,
 )
-from cs.utils.json_utils import loads_or_none
-from cs.utils.llm import get_llm
-from cs.utils.logger import setup_logger
-from cs.utils.tokens import EMPTY, usage_of
+from ecom.orchestrator.utils.json_utils import loads_or_none
+from ecom.orchestrator.utils.llm import get_llm
+from ecom.orchestrator.utils.logger import setup_logger
+from ecom.orchestrator.utils.tokens import EMPTY, usage_of
 
 logger = setup_logger(__name__)
 

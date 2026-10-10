@@ -1,8 +1,8 @@
 """路由：解析守卫 / 规则兜底 / 置信度补位 / 排除已试 / token 记账。"""
 import pytest
 
-from cs.core.router import CONFIDENCE_FLOOR, _rule_route, parse_route, route
-from tests.conftest import ExplodingLLM, FakeLLM
+from ecom.orchestrator.core.router import CONFIDENCE_FLOOR, _rule_route, parse_route, route
+from tests.orchestrator.conftest import ExplodingLLM, FakeLLM
 
 
 # ---------------------------------------------------------------------------

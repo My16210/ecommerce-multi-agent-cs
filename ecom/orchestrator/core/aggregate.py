@@ -28,11 +28,11 @@ insufficient=True 才是**有信息量的失败**：它看过了，这个单元�
 早先版本要求汇总也返回 {"answer": ...}，结果模型经常把整段正文塞进 JSON 字符串里，
 换行和引号全被转义，反而更容易崩、更难读。**人要读的正文就让它直接是正文。**
 """
-from cs.settings import MAX_ROUNDS, SYNTH_TEMPERATURE, SYNTH_TIMEOUT
-from cs.utils.llm import get_llm
-from cs.utils.logger import setup_logger
-from cs.utils.tokens import EMPTY, usage_of
-from cs.workers.base import round_results, worker_names
+from ecom.orchestrator.settings import MAX_ROUNDS, SYNTH_TEMPERATURE, SYNTH_TIMEOUT
+from ecom.orchestrator.utils.llm import get_llm
+from ecom.orchestrator.utils.logger import setup_logger
+from ecom.orchestrator.utils.tokens import EMPTY, usage_of
+from ecom.orchestrator.workers.base import round_results, worker_names
 
 logger = setup_logger(__name__)
 

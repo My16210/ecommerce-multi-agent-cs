@@ -182,8 +182,8 @@ def test_the_three_settings_modules_agree_on_the_root():
 
     它们各自保留自己那份 settings（旋钮不同），但"根在哪"只能有一个答案。
     """
-    from ecom.knowledge.settings import KNOWLEDGE_DATA_DIR as kb_data
     from ecom.analytics.settings import settings as analytics_settings
+    from ecom.knowledge.settings import KNOWLEDGE_DATA_DIR as kb_data
 
     assert kb_data == REPO_ROOT / "data" / "knowledge"
     assert analytics_settings.DATA_DIR == REPO_ROOT / "data" / "analytics"
@@ -206,18 +206,16 @@ def test_the_repo_has_exactly_one_top_level_package():
     # 这份豁免名单写死在这里：往上面加名字的人得先解释为什么。
     not_library = {"tests"}
 
-    # 迁移中的宽容：`cs/` 是编排层，合并的第三步才搬进 ecom/orchestrator/。
-    # 搬到那一步，这个集合收成 {TOP_LEVEL}，断言从"只许更少"改成等号。
-    # 注意它宽容的**只有 cs**：多出任何别的名字（比如有人加了个 utils/）照样红。
-    allowed = {TOP_LEVEL, "cs"}
-
+    # 迁移期这里曾写成 `{TOP_LEVEL, "cs"}`（编排层当时还没搬完），第三步收成
+    # 只有一个。改成等号不是洁癖：`<=` 允许"少一个"，而少一个指的是少 ecom——
+    # 那是最该拦住的情况。
     top_level_packages = sorted(
         p.name
         for p in REPO_ROOT.iterdir()
         if p.is_dir() and (p / "__init__.py").is_file() and p.name not in not_library
     )
-    assert set(top_level_packages) <= allowed, (
-        f"仓库根有这些顶层包：{top_level_packages}；只该有 {sorted(allowed)}。"
+    assert top_level_packages == [TOP_LEVEL], (
+        f"仓库根有这些顶层包：{top_level_packages}；应当只有 {TOP_LEVEL}/。"
         "要放新代码就放进 ecom/ 下的某个子系统，别在根上再开一个命名空间。"
     )
 

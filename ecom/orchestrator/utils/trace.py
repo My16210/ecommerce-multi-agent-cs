@@ -14,7 +14,7 @@ import threading
 import uuid
 from datetime import datetime
 
-from cs.settings import LOGS_DIR
+from ecom.orchestrator.settings import LOGS_DIR
 
 _lock = threading.Lock()
 

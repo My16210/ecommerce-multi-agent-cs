@@ -1,9 +1,9 @@
 """汇总节点：三桶分类 / 单结论不调模型 / 汇总失败降级 / 决策的优先级。"""
 import pytest
 
-from cs.core import aggregate as agg
-from cs.workers.base import error_result, ok_result
-from tests.conftest import ExplodingLLM, FakeLLM
+from ecom.orchestrator.core import aggregate as agg
+from ecom.orchestrator.workers.base import error_result, ok_result
+from tests.orchestrator.conftest import ExplodingLLM, FakeLLM
 
 
 def state(**kwargs):

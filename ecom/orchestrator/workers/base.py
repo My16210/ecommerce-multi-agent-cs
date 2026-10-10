@@ -24,9 +24,9 @@ import threading
 import time
 from collections.abc import Callable
 
-from cs.settings import WORKER_TIMEOUT, WORKER_TIMEOUT_DEFAULT
-from cs.utils.logger import setup_logger
-from cs.utils.tokens import EMPTY
+from ecom.orchestrator.settings import WORKER_TIMEOUT, WORKER_TIMEOUT_DEFAULT
+from ecom.orchestrator.utils.logger import setup_logger
+from ecom.orchestrator.utils.tokens import EMPTY
 
 logger = setup_logger(__name__)
 
@@ -101,9 +101,9 @@ def _registry() -> dict:
     rag_knowledge_base，如果放在模块顶层，那么"这台机器上没有那个仓库"就会在
     import 本模块时直接炸掉，连不带知识库的部署都起不来。放这里是故意的。
     """
-    from cs.workers.analytics import run_analytics
-    from cs.workers.knowledge import run_knowledge
-    from cs.workers.order import run_order
+    from ecom.orchestrator.workers.analytics import run_analytics
+    from ecom.orchestrator.workers.knowledge import run_knowledge
+    from ecom.orchestrator.workers.order import run_order
 
     return {
         "knowledge": run_knowledge,

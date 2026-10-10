@@ -1,49 +1,57 @@
 """
 数据分析 worker：自然语言问销售数据（销量排名 / 趋势 / 退货率 …）。
 
-**走子进程调 sibling 仓库 sales_agent，不进程内 import。** 三个理由，主次分明：
+**仍然走子进程——但理由变了，这个变化值得写清楚。**
 
-1. **非这样不可**：两个仓库都有顶层 `src` 包。同一进程里先 import 谁，
-   另一个的 `from src.x import y` 就静默解析到先来的那个——不会报错，
-   只会算错。这是硬约束，不是偏好。
-2. **顺带赚到的隔离**：这是唯一带"生成代码 → 执行 → 报错改代码 → 再执行"
-   纠错循环的 worker（最坏情况跑几分钟），也是唯一会执行**模型生成的代码**的。
-   给它一个真进程边界，超时能真杀、崩了也炸不到 supervisor。
-3. **依赖各管各的**：本仓库不需要把 pandas / matplotlib / deepseek 那套拖进来。
+合并**之前**，这里的第一个理由是硬约束：两个仓库都有顶层 `src` 包，同一进程里
+先 import 谁，另一个的 `from src.x import y` 就静默解析到先来的那个。不报错，
+只算错。所以不得不隔一个进程。
 
-代价是每次调用多付一次 Python 启动 + 建图的钱（秒级）。它是最慢的 worker
-（本来就要几十秒），这点开销不改变量级——**但知识库那一路就不一样了，
-所以知识库走进程内**。两个 worker 用两种接法，是各自的账算下来不一样，不是不一致。
+合并**之后**那个理由没了——`ecom.analytics` 就在同一个包里，进程内 import
+毫无问题。（这正是知识库 worker 现在的样子。）但边界**留着，而且是故意的**：
+
+1. **它执行模型生成的代码。** 这是本系统里唯一一处"别人的文本变成我们机器上
+   跑起来的程序"。沙箱在 `ecom/analytics/core/sandbox.py`（AST 白名单 + 受限
+   builtins），但沙箱**不做超时、也不做子进程隔离**——`while True: pass` 拦不住。
+   真进程边界是补上这一层的唯一办法：`subprocess.run(timeout=…)` 到点是**真杀**，
+   而进程内那个"超时"只是不再等它（见 README「已知限制」）。
+2. **它可能跑几分钟。** 生成 → 执行 → 报错 → 改 → 再执行，循环几轮。进程内跑
+   意味着这几分钟里 supervisor 那条线程被占着、还占着内存。
+3. 顺带，崩了炸不到 supervisor。
+
+代价是每次调用多付一次 Python 启动 + 建图的钱（秒级）。它本来就要几十秒，
+这点开销不改变量级——**知识库那一路不一样**（热路径、秒级），所以那个走进程内。
+两种接法不是不一致，是各自的账算下来不一样。
+
+（合并前还有第 4 条"依赖各管各的，本仓库不用把 pandas 拖进来"。那条现在不成立了
+——pandas 已经是核心依赖，见 pyproject。文件里留这句话是因为它曾经是个理由，
+删掉会让人以为当时没想过。）
 """
 import json
 import os
-import shlex
 import subprocess
+import sys
 from pathlib import Path
 
-from cs.settings import SALES_AGENT_PYTHON, SALES_AGENT_ROOT, WORKER_TIMEOUT
-from cs.utils.logger import setup_logger
+from ecom.orchestrator.settings import WORKER_TIMEOUT
+from ecom.orchestrator.utils.logger import setup_logger
+from ecom.settings import ROOT
 
 logger = setup_logger(__name__)
 
-ENTRY = "analyze_json.py"
+# 子进程的入口。合并前它是个文件路径（`../sales_agent/analyze_json.py`），
+# 现在是个模块名——顺带解决了"哪个 python 起它"的问题：用 `sys.executable`，
+# 也就是**跑了 supervisor 的那个解释器**。合并前这是个配置项
+# （SALES_AGENT_PYTHON，因为两个仓库各管各的环境），现在同一个 venv，不需要了。
+ENTRY_MODULE = "ecom.analytics.cli.analyze"
 
 
 def _command(question: str) -> list:
-    root = Path(SALES_AGENT_ROOT)
-    script = root / ENTRY
-    if not script.exists():
-        raise RuntimeError(
-            f"找不到数据分析仓库的入口：{script}。请把 sales_agent 和本项目放在同一层目录，"
-            "或在 .env 里设 SALES_AGENT_ROOT=/绝对路径/sales_agent"
-        )
-    # SALES_AGENT_PYTHON 允许是 "uv run --project xxx python" 这种带参数的形式，
-    # 所以按 shell 规则切词而不是当成单个可执行文件路径。
-    return [*shlex.split(SALES_AGENT_PYTHON), str(script), question]
+    return [sys.executable, "-m", ENTRY_MODULE, question]
 
 
 def run_analytics(question: str, chat_history: list = None) -> dict:
-    root = Path(SALES_AGENT_ROOT)
+    root = ROOT
     # 子进程自己的超时设得比 supervisor 那层**略短**：让它先触发，
     # 这样我们拿到的是一条"数据分析跑超时了"的明确信息，
     # 而不是 supervisor 那边一句笼统的"worker 没返回"。

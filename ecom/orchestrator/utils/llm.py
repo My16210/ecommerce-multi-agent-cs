@@ -13,7 +13,7 @@ openai 客户端默认自带 2 次重试。而外面（router）也有一套重�
 """
 from langchain_openai import ChatOpenAI
 
-from cs.settings import QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL
+from ecom.orchestrator.settings import QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL
 
 _clients: dict = {}
 

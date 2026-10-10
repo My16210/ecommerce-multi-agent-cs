@@ -16,8 +16,8 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
-from cs.settings import ORDER_DB_DSN, ORDER_DB_PATH
-from cs.utils.logger import setup_logger
+from ecom.orchestrator.settings import ORDER_DB_DSN, ORDER_DB_PATH
+from ecom.orchestrator.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 

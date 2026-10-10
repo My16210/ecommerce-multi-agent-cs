@@ -1,7 +1,7 @@
 """订单：业务规则的边界 / 规则优先的意图抽取 / "办不了"不是"坏了"。"""
 import pytest
 
-from cs.tools.order_tools import (
+from ecom.orchestrator.tools.order_tools import (
     OrderNotFound,
     ReturnNotAllowed,
     create_return,
@@ -9,8 +9,8 @@ from cs.tools.order_tools import (
     list_customer_orders,
     query_order,
 )
-from cs.workers.order import _rule_extract, extract_intent, run_order
-from tests.conftest import ExplodingLLM
+from ecom.orchestrator.workers.order import _rule_extract, extract_intent, run_order
+from tests.orchestrator.conftest import ExplodingLLM
 
 
 @pytest.fixture
@@ -18,16 +18,16 @@ def wired(db, monkeypatch):
     """
     把三个模块里的 get_db 都指到临时库，seed 变成空操作，模型句柄换成"调用即抛"。
 
-    换掉 `cs.workers.order.get_llm` 是**必须的**：本机 .env 里有真 key 的话，
+    换掉 `ecom.orchestrator.workers.order.get_llm` 是**必须的**：.env 里有真 key 的话，
     run_order 在规则认不全时会真的发一次 API 请求——测试就变成了联网测试，
     而且会在别人机器上因为没 key 而红。
     """
     # 两处取库的地方都要换：工具层自己取一次，run_order 开头的幂等 seed 取一次。
     # （order.py 自己不再 import get_db，所以没有第三处。）
-    monkeypatch.setattr("cs.tools.order_tools.get_db", lambda: db)
-    monkeypatch.setattr("cs.db.seed.get_db", lambda: db)
-    monkeypatch.setattr("cs.workers.order.seed", lambda *a, **k: 0)
-    monkeypatch.setattr("cs.workers.order.get_llm", lambda *a, **k: ExplodingLLM())
+    monkeypatch.setattr("ecom.orchestrator.tools.order_tools.get_db", lambda: db)
+    monkeypatch.setattr("ecom.orchestrator.db.seed.get_db", lambda: db)
+    monkeypatch.setattr("ecom.orchestrator.workers.order.seed", lambda *a, **k: 0)
+    monkeypatch.setattr("ecom.orchestrator.workers.order.get_llm", lambda *a, **k: ExplodingLLM())
     return db
 
 
