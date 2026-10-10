@@ -61,6 +61,13 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
+# 数据分析那边有一张"供应商 → 参数"的表，里面还留着 OpenAI 这一档（没人用，
+# 但它是那张表"加一行就多一个供应商"这个设计的演示）。密钥放在这里而不是
+# 那张表里，是为了守住"密钥只有一处"——表只负责挑，不负责存。
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
 # ——————————————————————————————————————————————————————————————
 # 检索那一路（BGE-M3 embedding / rerank），走硅基流动
 # ——————————————————————————————————————————————————————————————
