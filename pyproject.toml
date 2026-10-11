@@ -80,8 +80,13 @@ search = ["tavily-python>=0.5"]
 
 # 开发依赖。放 [dependency-groups] 而不是 [project.optional-dependencies]：
 # 这是 uv 的默认组，uv sync 会连它一起装，所以 uv run pytest / ruff 开箱可用。
+#
+# httpx 是给 fastapi.testclient.TestClient 用的。它**本来就在**（openai 会
+# 传递依赖把它装进来），所以测试一直能跑——而那正是问题：哪天 openai 换了
+# HTTP 客户端，tests/test_api.py 会以一种和"接口改坏了"完全不同的方式挂掉。
+# **测试真要用一个包，就该自己声明它**，不能靠传递依赖。
 [dependency-groups]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+dev = ["pytest>=8.0", "ruff>=0.6", "httpx>=0.27"]
 
 [tool.pytest.ini_options]
 # 三套测试并成一套之后，这里是**唯一**一处管 import 根的地方。
