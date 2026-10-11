@@ -128,7 +128,7 @@ aggregate(state)
 
 ## 五、一次请求的完整时序
 
-以 `订单 100002 到哪了，顺便问下你们的退货政策是什么` 为例，这是 **2026-10-10 真跑出来的一次**（模型和知识库都可用）：
+以 `订单 52644 到哪了，顺便问下你们的退货政策是什么` 为例，这是 **2026-10-11 真跑出来的一次**（模型和知识库都可用）：
 
 ```mermaid
 sequenceDiagram
@@ -142,18 +142,18 @@ sequenceDiagram
     Note over R: ① LLM 分类成功，置信度 0.95<br>plan=[order, knowledge], source=llm<br>round=1, tried=[order,knowledge]
     par 同一超步，并行
         R->>K: question
-        K-->>A: ok=True, answer="七天无理由…"（8.3s）
+        K-->>A: ok=True, answer="资料里没有这笔订单的物流…"（8.1s）
     and
         R->>O: question
-        O-->>A: ok=True, answer="订单 100002 的物流…"（11ms）
+        O-->>A: ok=True, answer="订单 52644 的物流：目的地 San Salvador…"（12ms）
     end
-    Note over A: ① usable 有 2 个 → decision=answer<br>汇总方式 llm；sources=[售后政策.md, 退换货流程.md, 100002]
-    A-->>U: 物流 + 退货政策，并**如实报出两者对同一笔订单的说法冲突**
+    Note over A: ① usable 有 2 个 → decision=answer<br>汇总方式 llm；sources=[售后政策.md, 促销活动规则.md, 退换货流程.md, 52644]
+    A-->>U: 物流 + 退货政策，两个单元**各说各的范畴**，不替它们判谁对
 ```
 
-整个过程：**第一次 invoke 就结束，没有回环**。两个 worker 的耗时差三个数量级（8.3 秒 vs 11 毫秒）——这就是为什么它们的超时是分开配的（90 / 20 / 180）。
+整个过程：**第一次 invoke 就结束，没有回环**。两个 worker 的耗时差三个数量级（8.1 秒 vs 12 毫秒）——这就是为什么它们的超时是分开配的（90 / 20 / 180）。订单那一路走的是本地 SQLite + 纯规则，一次模型调用都没有；知识库那一路要向量化 + BM25 + rerank + 生成，四步都是网络往返。
 
-同一天更早的一次运行里 dashscope 不通，那次走的是另一条完整路径：**LLM 路由超时 8 秒 → 规则命中 → 知识库 worker 超时（ok=False）→ 订单那半照常答出来 → 明说"知识库这块暂时查不了"**，总耗时 17.6 秒而不是 180 秒。两条路径都不是摆拍，一次请求把三四条兜底链路全演示了。
+此前一次 dashscope 不通的运行走的是另一条完整路径：**LLM 路由超时 8 秒 → 规则命中 → 知识库 worker 超时（ok=False）→ 订单那半照常答出来 → 明说"知识库这块暂时查不了"**，总耗时 17.6 秒而不是 180 秒。两条路径都不是摆拍，一次请求把三四条兜底链路全演示了。
 
 ---
 
@@ -193,7 +193,8 @@ worker_analytics ──► subprocess        python -m ecom.analytics.cli.analyz
 | worker 公共契约 | [ecom/orchestrator/workers/base.py](ecom/orchestrator/workers/base.py) | `run` / `ok_result` / `error_result` / `stamp_round` |
 | 三个 worker | [ecom/orchestrator/workers/](ecom/orchestrator/workers/) | `knowledge.py` / `order.py` / `analytics.py` |
 | 订单工具层 | [ecom/orchestrator/tools/order_tools.py](ecom/orchestrator/tools/order_tools.py) | 纯函数，`OrderNotFound` / `ReturnNotAllowed` |
-| 订单库 | [ecom/orchestrator/db/](ecom/orchestrator/db/) | `engine.py`（双后端）/ `schema.sql` / `seed.py` |
+| 订单库 | [ecom/orchestrator/db/](ecom/orchestrator/db/) | `engine.py`（双后端）/ `schema.sql` / `seed.py`（读种子）|
+| 订单种子从哪来 | [ecom/orchestrator/db/derive_seed.py](ecom/orchestrator/db/derive_seed.py) | 一次性 ETL：公开数据集 → `data/orchestrator/seed/*.csv` |
 | 知识库子系统 | [ecom/knowledge/](ecom/knowledge/) | `retriever` / `vector_store` / `embedding` / `generator` / `cli` |
 | 数据分析子系统 | [ecom/analytics/](ecom/analytics/) | `core/graph.py` / `core/sandbox.py` / `agents/` / `cli/analyze.py` |
 
