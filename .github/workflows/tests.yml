@@ -7,10 +7,14 @@
 # job，只会让第一次红的时候不知道该信哪个。
 #
 # 【版本号】
-# `actions/checkout@v4` 和 `astral-sh/setup-uv@v6` 是大版本 tag（不是 commit SHA）。
+# `actions/checkout@v7` 和 `astral-sh/setup-uv@v10` 是大版本 tag（不是 commit SHA）。
 # 好处是能自动拿到安全补丁，代价是可复现性弱一档——对一个面试作品这是划算的。
-# 如果 GitHub 报 "Unable to resolve action"，就是这一个大版本号过时了，按报错
-# 里的提示改成当前大版本即可，**这是全文件唯一需要维护的一行**。
+#
+# 这两个大版本号**核过了**（2026-10-11，读各自仓库的 latest release）：
+#   actions/checkout   最新 v7.0.1
+#   astral-sh/setup-uv 最新 v10.3.0
+# 以后若 GitHub 报 "Unable to resolve action"，就是它过时了，用同样方式重查一次、
+# 改这一行即可。**这是全文件唯一需要维护的地方。**
 name: tests
 
 on:
@@ -35,15 +39,22 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      # python-version-file 让它直接读仓库里的 .python-version（3.11），
-      # 和本机、和 Dockerfile 用的是同一个来源，不要在这里另写一个版本号。
+      # 【这里**故意没有** python-version 之类的输入】
+      # 一开始写的是 `python-version-file: .python-version`——**那个输入名不存在**。
+      # 官方 action.yml 里只有 `python-version`（一个版本号字符串）和 `version-file`
+      # （管 uv 自己的版本，不是 Python 的）。名字写错的后果特别隐蔽：action 只打一条
+      # "Unexpected input(s) ... valid inputs are [...]" 的 warning 就**忽略它**，
+      # 而 workflow 照样绿——看着像钉住了版本，其实什么都没做。
+      #
+      # 但 Python 版本仍然只有一处来源：uv 自己会读仓库根的 .python-version。
+      # CI 日志里是 "Using CPython 3.11.17"，和本机、和 Dockerfile 同一个版本。
+      # 所以这里**什么都不写才是对的**——写了就等于在第二个地方再维护一个版本号。
       - name: 装 uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v10
         with:
           enable-cache: true
-          python-version-file: .python-version
 
       # --frozen：uv.lock 和 pyproject.toml 一旦不一致就**在装依赖这一步红**，
       # 而不是等到运行时才发现锁文件没跟上。锁文件漂移是那种"本机永远是好的"
@@ -67,9 +78,13 @@ jobs:
           # headless runner 上因为缺 DISPLAY 而崩，是那种和被测代码无关的红。
           MPLBACKEND: Agg
 
-      # 【预期结果（已在干净 checkout 上实测）】
-      # 517 passed / 3 skipped / 0 failed，共 520 条。
+      # 【预期结果 —— 这是**实测值**，不是推算】
+      # 517 passed / 3 skipped / 0 failed / 520 条，用时 14.27s
+      # （2026-10-11 这次 run 的输出，和本机干净 checkout 预演的数字一致）。
       # 跳过的 3 条 = Milvus 那 2 条（要真服务）+ 界面真渲染那 1 条（要灌过数据）。
+      #
+      # 这个数**和本机的 518/2 差一条**，差值就是上面那条界面测试：本机 data/ 里
+      # 灌过数据所以它跑，干净 checkout 上没数据所以它 skip。**不是环境坏了。**
       #
       # 【runner 上没有中文字体】出图那条测试会打几行 findfont warning，
       # 但它只断言"文件存在"、不校验像素，**不会红**（图确实是豆腐块）。

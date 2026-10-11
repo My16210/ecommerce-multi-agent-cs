@@ -409,7 +409,7 @@ ecom/orchestrator/settings.py   自己的旋钮：worker 超时、MAX_ROUNDS、�
 两个细节：
 
 - **`--frozen` 不是可选的**。只提交锁文件、构建时仍走 `uv sync`（不带 `--frozen`），锁就只是个装饰：`uv` 照样会按 `pyproject.toml` 重新解析。**"有锁"和"用锁"是两件事**，验证的时候两条都验过（见「验证到哪一步」）。
-- **锁只在构建里起作用，没有接进 CI**。这个仓库没有 CI，凭空加一个 workflow 就是给自己造一个不会有人看的东西。
+- **锁现在有两道闸了**。原来只有构建里那道，注释里写的还是"这个仓库没有 CI"——那句曾经是对的，但加 CI 之后就变成了错的：CI 里跑的也是 `uv sync --all-extras --frozen`，所以锁文件一漂移，**构建和 CI 会同时在装依赖那一步红**。
 
 ---
 
@@ -715,7 +715,7 @@ uv run ruff check .
 | ✅ | **合并后的 `API`（FastAPI）真起服务** | 容器内真起 uvicorn：`/health` 200（含 workers + order_db）、`/openapi.json` 元数据齐、空问题 422、`/trace/不存在` 404、真提问 200（257+29 token / 1.2s）。**这一条走了网络、花了 token**，不属于"测试不联网"那一栏 |
 | ✅ | **Milvus 那条代码路径** | 真跑：连宿主常驻的 v2.5.5，`ecom_verify_<随机>` 临时集合走完 add / count / search / delete / drop，**零残留**（另有一条专门查残留）。⚠️ 见下面的版本错位 |
 | ✅ | 520 条测试、ruff | 容器里 **518 passed / 0 failed / 2 skipped**。原来那 2 条红灯都是真缺陷，已修（见「测试」一节）。CI 上是 517 passed / 3 skipped |
-| ❌ | **CI 本身能不能真跑绿** | 工作流已写好，里面的每条命令都在本地容器里验过（`uv sync --all-extras --frozen` → `ruff` → `pytest` 全过），也拿 `git archive` 出的干净 checkout 预演了一遍。**但仓库还没推到 GitHub，所以 Actions 一次都没真跑过**——不把没跑的写成跑过的 |
+| ✅ | **CI 本身真跑绿了** | 真跑：[run #38132031300](https://github.com/My16210/ecommerce-multi-agent-cs/actions/runs/38132031300)（2026-10-11）。日志里的实测值是 **517 passed / 3 skipped / 0 failed，14.27s**，和本机干净 checkout 预演的数字一致。**这一栏原来是 ❌**——工作流写过、命令本地验过，但没推上去就一次都没真跑过。<br>真跑还多抓到一个本地看不出来的东西：`python-version-file` 这个输入名**不存在**，setup-uv 只打一条 warning 就忽略它。现在那两个 action 也升到了核过的当前大版本（checkout v7 / setup-uv v10） |
 | ✅ | **许可证** | 有了 `LICENSE`（MIT），`pyproject.toml` 里声明了同一个。之前**一个都没有**——公开仓库没有 LICENSE 等于"保留所有权利"，别人不能合法复用 |
 | ✅ | **`uv sync` 能否装成** | 真构建：镜像里解析出 **150 个包**并装成，五个 extra 全在（matplotlib / streamlit / pymilvus / pymysql / tavily-python / fastapi 逐个确认过） |
 | ✅ | **数据分析跑出一张图** | 真跑（容器内）：DeepSeek 生成代码 → sandbox 执行 → `chart_generated: true`，7.8s，图落在磁盘上。中文标签正常——这一条第一次跑出来是**豆腐块**，见"坑 7" |
