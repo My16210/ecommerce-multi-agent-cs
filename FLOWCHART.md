@@ -1,6 +1,6 @@
 # 流程图
 
-配着 [README.md](README.md) 看。这里只画**代码里真实存在的东西**：图的形状、状态怎么流、每个节点在哪一行。
+配着 [README.md](README.md) 看（要改代码的话再配 [docs/技术文档.md](docs/技术文档.md)）。这里只画**代码里真实存在的东西**：图的形状、状态怎么流、每个节点在哪一行。
 
 ---
 
@@ -198,11 +198,74 @@ worker_analytics ──► subprocess        python -m ecom.analytics.cli.analyz
 | 知识库子系统 | [ecom/knowledge/](ecom/knowledge/) | `retriever` / `vector_store` / `embedding` / `generator` / `cli` |
 | 数据分析子系统 | [ecom/analytics/](ecom/analytics/) | `core/graph.py` / `core/sandbox.py` / `agents/` / `cli/analyze.py` |
 
-四个入口，各管一件事：
+入口，各管一件事：
 
 | 入口 | 给谁用 | 为什么是它 |
 |---|---|---|
 | [main.py](main.py) | **排查问题** | 决策链摊在眼前；界面会把它藏起来 |
 | [app.py](app.py) | 演示 | 四个 Tab = 四个面，共用一份进程 |
+| [admin.py](admin.py) | **下结论** | 三个页面里只有一个能写；口令不配就拒绝启动 |
 | [api.py](api.py) | 被别的程序调 | `def` 不是 `async def`——图里全是阻塞调用 |
 | `python -m ecom.analytics.cli.analyze` | **给编排层当子进程** | stdout 只吐一行 JSON；契约写在名字里 |
+| `python -m ecom.orchestrator.cli.returns` | 容器里排障 / 写脚本 | 和 `admin.py` 调**同一份** `admin.returns`，不是两套逻辑 |
+| `python -m ecom.orchestrator.cli.session` | 会话的 list / show / delete / purge | 长驻进程不自清，清理由这条命令承担 |
+
+`admin.py` 和 `app.py` **并列而不是合成一个**：`app.py` 是"面向客户、clone 下来点开就能用"，加一个密码框会毁掉这个定位。
+
+---
+
+## 八、会话是怎么进出的
+
+`chat_history` 在 supervisor 里是**节点输入**，不是图状态——这一条决定了它**不能**交给 `SqliteSaver`（理由见 README「会话持久化」）。
+
+```mermaid
+sequenceDiagram
+    participant C as 客户端 / 界面
+    participant S as session.py
+    participant A as supervisor.answer
+    participant G as 图
+
+    C->>S: load_history(session_id, max_turns=6)
+    Note over S: 取**最近** 6 轮：ORDER BY id DESC LIMIT n，再 reversed<br>（截错方向不会报错，只会让模型拿到很旧的上文）
+    S-->>C: [{"role","content"}, ...]
+    C->>A: answer(question, chat_history=历史)
+    Note over A: make_initial_state 把它塞进去<br>只在 aggregate 那一步读一次
+    A->>G: invoke
+    G-->>A: answer
+    A-->>C: answer + sources
+    C->>S: save_turn(session_id, question, answer)
+```
+
+两个旋钮分开：`HISTORY_TURNS=6` 管**成本**（喂多少），`SESSION_TTL_DAYS=30` 管**合规**（留多久）。合并成一个开关，会在有人想省钱的时候顺手把合规期限也改掉。
+
+**`session_id` 是凭证不是账号**（客户身份是 `_guess_customer` 从话里猜的、未认证的），所以界面不把它放进 URL、只显示前 12 位。这条"没做的能力"由测试钉着。
+
+---
+
+## 九、退货审核这一环
+
+模型那条路**只能登记，不能拍板**；结论由人在 `admin.py` 或 CLI 下。两条路调的是同一个 `review_return`。
+
+```mermaid
+graph TD
+    U["用户：我要退货"] --> W["worker_order"]
+    W -->|"create_return（幂等：已有待审核/已通过就拦）"| T[("return_requests<br>status = 待审核")]
+    T --> CL{人在哪儿下结论？}
+    CL -->|admin.py 退货审核页| RV["admin.returns.review_return"]
+    CL -->|python -m ecom.orchestrator.cli.returns approve| RV
+    RV --> TX["一个事务，两道闸"]
+    TX --> G1["① 幂等：status != 待审核 → already=True，一个字段都不动"]
+    TX --> G2["② 竞态：UPDATE ... WHERE status = 待审核<br>counts[0] == 0 → raise _LostRace（必须抛，不能 return）"]
+    G2 --> R[("return_reviews<br>一行审核痕迹")]
+```
+
+两个方向相反的拦截条件，**必须各写一条测试**，只写一条的话另一种写法照样全绿：
+
+- **`已通过` 必须拦**重复申请——漏了它，同一笔订单能再申请一次，**结果是两笔退款**，而且看起来一切正常。
+- **`已拒绝` 必须放**——拦了它，用户会撞上"你被拒绝过所以永远不能再申请"，而界面上没有任何一句话说明这件事。
+
+**幂等**的语义和知识库队列那边「人工定了就不再回退」是同一个：人的结论是**证据**，不是可以被后一次点击改写的草稿。
+
+**"批准"的边界写死**：改 `status` + 插痕迹（一个事务）；**不执行退款**（没有支付网关，假装退款比不做更坏）；**不改 `orders.status`**（那是数据源原值，改它就是编造数据）。
+
+**目录即边界**：`ecom/orchestrator/tools/` 是**模型能调到的**，`ecom/orchestrator/admin/` 是**只有人能下的结论**。把 `review_return` 放进 `order_tools.py`，等于把"模型可以拍板"写进架构里——哪怕现在没有任何工具去调它。
