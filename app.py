@@ -72,7 +72,7 @@ from ecom.orchestrator import session
 from ecom.orchestrator.core.aggregate import WORKER_LABELS
 from ecom.orchestrator.core.supervisor import answer
 from ecom.orchestrator.db.engine import get_db
-from ecom.orchestrator.settings import MAX_ROUNDS, HISTORY_TURNS, WORKER_TIMEOUT
+from ecom.orchestrator.settings import HISTORY_TURNS, MAX_ROUNDS, WORKER_TIMEOUT
 from ecom.orchestrator.tools.order_tools import (
     OrderNotFound,
     describe_status,
