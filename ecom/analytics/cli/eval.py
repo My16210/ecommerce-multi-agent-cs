@@ -11,17 +11,20 @@ import time
 
 from ecom.analytics.core.graph import build_graph
 from ecom.analytics.core.state import make_initial_state
+from ecom.analytics.eval.truth import get_eval_set
+from ecom.analytics.settings import settings
 
-# 测试问题 + 真值（真值来自 data/raw/sales.csv，口径：销售额含退货订单）
+# 测试问题 + 真值
 #   text   -> exec_result 里出现该字符串即算对
 #   number -> exec_result 里抽出的数字与该值相对误差在 tol 内即算对
-EXPECTED = {
-    "哪个地区卖得最好？": {"kind": "text", "value": "华东"},
-    "销量最高的商品是什么？": {"kind": "text", "value": "iPhone15"},
-    "哪个地区的退货率最高？": {"kind": "text", "value": "华中"},
-    "总销售额是多少？": {"kind": "number", "value": 1846604, "tol": 0.001},
-    "iPhone15在哪个地区卖得最多？": {"kind": "text", "value": "华东"},
-}
+#
+# 真值**不写在这里**：由 ecom/analytics/eval/truth.py 从当前数据集的 CSV 算出来，
+# 而且用的是标准库 csv 而不是 pandas。写死常数的两个毛病：改数据之后它就过期了，
+# 而评测会继续拿旧数字判——它会把错的判成对的，还看不出来。为什么不能用 pandas 算，
+# 见那个模块开头的说明（一句话：不能拿被测工具的输出去验证被测工具）。
+#
+# 题目跟着数据集走：换 ANALYTICS_DATASET，考的就是那份数据的题。
+EXPECTED = get_eval_set(settings.DATASET_NAME, settings.RAW_CSV_PATH)
 TEST_QUESTIONS = list(EXPECTED.keys())
 
 # 单价（美元/百万 token），请按实际账单核对
