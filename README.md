@@ -149,12 +149,19 @@ uv run python -m ecom.orchestrator.cli.returns stats   # 命令行版的退货�
 
 ```bash
 cp .env.example .env
+docker compose build app                               # ← 必须先建，理由见下
 docker compose up -d                                   # 默认：Chroma 嵌入式 + SQLite，零外部依赖
-docker compose run --rm app python main.py --init-db                   # 灌订单库（65752 笔）
-docker compose run --rm app python -m ecom.knowledge.cli.ingest        # 建向量库
-# → http://localhost:8501     客户界面
+docker compose run --rm app python main.py --init-db                   # 灌订单库（65752 笔）—— 干净 clone 才需要
+docker compose run --rm app python -m ecom.knowledge.cli.ingest        # 建向量库 —— 同上
+# → http://localhost:8501     客户界面（端口被占就 APP_PORT=8600 docker compose up -d）
 # → http://127.0.0.1:8502     后台（要 .env 里的 ADMIN_PASSWORD）
 ```
+
+**`build` 为什么必须单独一步**：`up -d` 只在镜像**不存在**时才构建，镜像一旦在就直接用旧的。
+镜像是 `COPY . /app`，所以**改任何源码之后都要重新 `build`**（`admin` 共用同一个
+`ecom-cs:local` 镜像，一起更新）。实测踩到过 —— 镜像是 15:41 建的，代码 16:54 才修完，
+`up -d` 会静悄悄起一份旧代码，界面上、日志里都看不出来。逐步的检查和"怎么算成了"写在
+[技术文档第十一节](docs/技术文档.md#十一怎么跑)。
 
 **两条都只发布到 `127.0.0.1`，不绑 `0.0.0.0`。** 用 `localhost` 访问完全不受影响；
 但同局域网的另一台机器打不开它们——这是故意的（app 那条**没有任何鉴权**，
@@ -162,9 +169,6 @@ docker compose run --rm app python -m ecom.knowledge.cli.ingest        # 建向�
 真要跨机器演示：`APP_BIND=0.0.0.0 docker compose up -d`。
 
 换 Milvus：`docker compose --profile milvus up -d`（四个服务一起起）。
-
-**改任何源码之后都要 `docker compose build app`** —— 镜像是 `COPY . /app`，
-不重建的话跑的还是旧代码（`admin` 服务共用同一个镜像 `ecom-cs:local`，一起更新）。
 
 五个设计点：
 
