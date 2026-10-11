@@ -107,13 +107,103 @@ def sales_eval_set(csv_path: Path) -> dict:
     }
 
 
+# 第 4 题指定问这个商品。**商品名写死在题目里是对的**——它是"题目"，不是"答案"；
+# 答案（在哪个大区卖得最多）照样从数据里算出来。
+#
+# 为什么不问销量第一的那个商品：117 个商品里有 100 个左右的冠军市场都是 LATAM，
+# 而那恰好也是第 1 题的答案。那样的题不管模型有没有真的"按商品过滤"，只要它输出
+# LATAM 就算对——测不出这一步。选 ENO 是因为它在五个大区都有销量、冠军是 USCA。
+TARGET_PRODUCT = "ENO Atlas Hammock Straps"
+
+
+def dataco_eval_set(csv_path: Path) -> dict:
+    """DataCo 抽样的评测题与真值。
+
+    口径以 datasets/dataco/NOTES.md 为准。有两条和 sales 那份**不一样**，
+    是这份数据最容易错的地方：
+
+      - **一行 = 一个订单项，不是一笔订单。** DataCo 一笔订单平均 2.7 行。
+        所以「销售额/销量」直接按行汇总，而凡是问到"订单"的，必须先按 Order Id
+        去重——把行数当订单数会多算 2.7 倍，而且表里每一行看着都是完整数据，
+        错得毫无提示。
+
+      - **比率类一律以"行"为分母**，不是按件数加权。Late_delivery_risk 这个标记
+        本来就打在行上，按 Order Item Quantity 加权会让"买得多"的行更重，
+        那不是这份数据在说的事。
+
+    商品名/大区名**比较前先 strip**：源数据里 Product Name 是定宽右填空格的，
+    'Smart watch ' 和 'Smart watch' 不 strip 就是两个商品。
+    """
+    rows = load_rows(csv_path)
+
+    amount = Counter()          # Market -> Sales 合计
+    quantity = Counter()        # Product Name -> Order Item Quantity 合计
+    target_by_market = Counter()  # TARGET_PRODUCT 在各大区的件数
+    risky = Counter()           # Shipping Mode -> Late_delivery_risk = 1 的行数
+    mode_rows = Counter()       # Shipping Mode -> 行数（比率的分母）
+
+    market_order = []           # 首次出现顺序，给并列一个确定的解
+    mode_order = []
+    seen_products = set()
+
+    for r in rows:
+        market = r["Market"].strip()
+        product = r["Product Name"].strip()
+        mode = r["Shipping Mode"].strip()
+        qty = int(r["Order Item Quantity"])
+
+        if market not in market_order:
+            market_order.append(market)
+        if mode not in mode_order:
+            mode_order.append(mode)
+        seen_products.add(product)
+
+        amount[market] += float(r["Sales"])
+        quantity[product] += qty
+        if product == TARGET_PRODUCT:
+            target_by_market[market] += qty
+        mode_rows[mode] += 1
+        if r["Late_delivery_risk"].strip() == "1":
+            risky[mode] += 1
+
+    # 指定的商品不在表里就**直接报错**。换一份抽样、换一个数据集都可能让它消失，
+    # 那时静默返回一个空 Counter，_argmax 会给出 None，题目照样"跑完"了，
+    # 只是真值是一句废话。
+    if TARGET_PRODUCT not in seen_products:
+        raise KeyError(
+            f"评测题指定的商品 {TARGET_PRODUCT!r} 不在 {csv_path} 里。"
+            f"换数据集或改了抽样规则时，这条题和 TARGET_PRODUCT 要一起改。"
+        )
+
+    top_market = _argmax(amount, market_order)
+    top_product = _argmax(quantity, sorted(seen_products))
+    target_market = _argmax(target_by_market, market_order)
+    riskiest_mode = _argmax(
+        Counter({m: risky[m] / mode_rows[m] for m in mode_order}), mode_order
+    )
+
+    return {
+        "哪个大区的销售额最高？": {"kind": "text", "value": top_market},
+        "销量最高的商品是什么？": {"kind": "text", "value": top_product},
+        "总销售额是多少？": {
+            "kind": "number",
+            "value": sum(amount.values()),
+            # 容差比 sales 那份松一点：这是 2 万行的浮点求和，模型用的 pandas
+            # 和这里的标准库循环会因求和顺序不同差出尾数。0.1% 足够盖住它，
+            # 又远小于"漏算一个大区"（最小的 Africa 占总销售额 6.3%）。
+            "tol": 0.001,
+        },
+        f"{TARGET_PRODUCT}在哪个大区卖得最多？": {"kind": "text", "value": target_market},
+        "延迟交付风险最高的发货方式是哪个？": {"kind": "text", "value": riskiest_mode},
+    }
+
+
 # 数据集名 -> 真值构造器。每个构造器自己读那个数据集的 CSV、自己算。
 # 加一个数据集 = 加一个函数 + 加一行注册；**没有**一个"通用真值引擎"，
 # 因为五个问题各算各的，抽象成 DSL 只会让人看不懂这道题到底在比什么。
 EVAL_SETS = {
     "sales": sales_eval_set,
-    # "dataco": dataco_eval_set,  ← 等真实数据落地、看过实际取值域之后再写。
-    #    提前照着记忆写一份"大概是这样"的真值，就等于把猜测写进了评测基准。
+    "dataco": dataco_eval_set,
 }
 
 

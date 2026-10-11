@@ -11,6 +11,8 @@
 """
 from pathlib import Path
 
+import pytest
+
 from ecom.analytics.eval.truth import EVAL_SETS, get_eval_set, load_rows
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -91,6 +93,78 @@ def test_unknown_dataset_raises_instead_of_returning_empty():
         assert "no_such_dataset" in str(e)
     else:
         raise AssertionError("未注册的数据集应该抛 KeyError")
+
+
+# ---------------------------------------------------------------------------
+# dataco：口径和 sales 那份不一样，错的地方也不一样
+# ---------------------------------------------------------------------------
+DATACO_CSV = REPO_ROOT / "data" / "analytics" / "datasets" / "dataco" / "data.csv"
+
+
+def test_every_registered_dataset_has_its_table():
+    """注册了数据集就得有对应的表。
+
+    缺表的症状很隐蔽：评测会拿着一个不存在的路径去算真值，抛的是一个和
+    "数据集"毫无关系的 FileNotFoundError；而换个入口（比如界面上手动选数据集）
+    可能连抛都不抛。约定写在这里：datasets/<名字>/data.csv。
+    """
+    for name in EVAL_SETS:
+        path = REPO_ROOT / "data" / "analytics" / "datasets" / name / "data.csv"
+        assert path.exists(), f"数据集 {name} 注册了但没有 {path}"
+
+
+def test_dataco_truth_uses_the_gross_column_not_the_discounted_one():
+    """口径锁：销售额必须用 `Sales`（未打折），不是 `Order Item Total`（折后）。
+
+    两列差约 10%，选错了答案就系统性偏低——而表还在、题还答得出，看不出错。
+    """
+    rows = load_rows(DATACO_CSV)
+    gross = sum(float(r["Sales"]) for r in rows)
+    net = sum(float(r["Order Item Total"]) for r in rows)
+
+    # 用近似而不是相等：真值先按大区各自求和再相加，这里的 gross 是按行顺序相加，
+    # 浮点加法不满足结合律，两条路会差在 1e-7 这个量级。这**不是** bug，
+    # 而是评测题里必须给 tol 的原因——顺带在这里把它钉住，免得有人把它当回归问题查。
+    assert get_eval_set("dataco", DATACO_CSV)["总销售额是多少？"]["value"] == pytest.approx(gross, rel=1e-9)
+    assert abs(gross - net) > 0.05 * gross, "这份数据里两列必须真的差得出来，否则这条锁等于没锁"
+
+
+def test_dataco_truth_is_computed_instead_of_written_down(tmp_path):
+    """真值必须跟着数据走。
+
+    喂一份自己造的小表进去，五个答案全都得跟着这张表变。这是"真值是算出来的"
+    最强的证明——比断言"当前等于 LATAM"强，后者只说明这一刻是对的，
+    而写死一个常数同样能通过那种断言（这正是这个模块要修的病）。
+    """
+    from ecom.analytics.eval.truth import TARGET_PRODUCT
+
+    # 这张小表是**照着每条口径反着设计**的：换一种算法就会得到另一个答案。
+    #   销售额   Alpha 20 < Beta 103            → Beta
+    #   销量     TARGET 3 < Other Thing 8       → Other Thing
+    #   合计     123.0
+    #   TARGET 的行只在 Alpha                    → Alpha
+    #   延迟率   按行 = Slow 1/2 > Fast 1/4 → Slow
+    #            若错按件数加权 = Fast 5/8 > Slow 1/3 → Fast
+    # 最后一条是关键：它把"以行为分母"这条口径锁死了，而不是顺带对上。
+    csv_text = (
+        "Order Id,Market,Product Name,Order Item Quantity,Sales,Shipping Mode,Late_delivery_risk\n"
+        f"1,Alpha,{TARGET_PRODUCT},2,10.0,Slow,0\n"
+        f"1,Alpha,{TARGET_PRODUCT},1,10.0,Slow,1\n"
+        "2,Beta,Other Thing,5,100.0,Fast,1\n"
+        "2,Beta,Other Thing,1,1.0,Fast,0\n"
+        "2,Beta,Other Thing,1,1.0,Fast,0\n"
+        "2,Beta,Other Thing,1,1.0,Fast,0\n"
+    )
+    path = tmp_path / "tiny.csv"
+    path.write_text(csv_text, encoding="utf-8")
+
+    truth = get_eval_set("dataco", path)
+
+    assert truth["哪个大区的销售额最高？"]["value"] == "Beta"
+    assert truth["销量最高的商品是什么？"]["value"] == "Other Thing"
+    assert truth["总销售额是多少？"]["value"] == 123.0
+    assert truth[f"{TARGET_PRODUCT}在哪个大区卖得最多？"]["value"] == "Alpha"
+    assert truth["延迟交付风险最高的发货方式是哪个？"]["value"] == "Slow"
 
 
 def test_registered_datasets_are_real_callables():
