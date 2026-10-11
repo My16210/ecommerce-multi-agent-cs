@@ -6,15 +6,25 @@
 # 上报、构建镜像、发布）都是在此之上加东西，可以后加。反过来先铺一堆用不上的
 # job，只会让第一次红的时候不知道该信哪个。
 #
-# 【版本号】
-# `actions/checkout@v7` 和 `astral-sh/setup-uv@v10` 是大版本 tag（不是 commit SHA）。
-# 好处是能自动拿到安全补丁，代价是可复现性弱一档——对一个面试作品这是划算的。
+# 【版本号：两个 action 钉的方式**故意不一样**，因为它们的 tag 策略不一样】
 #
-# 这两个大版本号**核过了**（2026-10-11，读各自仓库的 latest release）：
-#   actions/checkout   最新 v7.0.1
-#   astral-sh/setup-uv 最新 v10.3.0
-# 以后若 GitHub 报 "Unable to resolve action"，就是它过时了，用同样方式重查一次、
-# 改这一行即可。**这是全文件唯一需要维护的地方。**
+#   actions/checkout@v7       —— 大版本 tag（可移动）。它确实发 `v7`，且 v7 就是当前
+#                                大版本（最新 release v7.0.1），所以钉大版本能自动拿补丁。
+#   astral-sh/setup-uv@v10.3.0 —— **精确版本**，不是 v10。
+#
+# 为什么 setup-uv 不钉 v10：**它根本没有 `v10` 这个 tag**。实测（2026-10-11）——
+# 它的大版本 tag 只发到 `v7` 就停了，之后只发 `v10.0.1`/`v10.3.0` 这种精确版本。
+# 所以"钉大版本"这条路在它身上是走不通的：`@v10` 会让整个 job 在
+# **"Set up job" 阶段就失败**，报 `unable to find version v10`，连 checkout 都跑不到。
+# （第一次推上去就是这么红的。这种红很好认：它发生在任何 step 之前。）
+#
+# 代价如实说：精确版本不会自动吃安全补丁，得手动升。这是它自己的 tag 策略逼出来的，
+# 不是更稳妥的选择——想要自动补丁就得退到 `@v7`，但那已经落后三个大版本了。
+#
+# 查法（以后要升的时候照做）：读 latest release，再确认那个大版本号有没有对应的 tag。
+#   curl -x http://127.0.0.1:7897 -H "Authorization: Bearer $TOKEN" \
+#        https://api.github.com/repos/OWNER/REPO/releases/latest
+#   git ls-remote --tags https://github.com/OWNER/REPO | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+$'
 name: tests
 
 on:
@@ -52,7 +62,7 @@ jobs:
       # CI 日志里是 "Using CPython 3.11.17"，和本机、和 Dockerfile 同一个版本。
       # 所以这里**什么都不写才是对的**——写了就等于在第二个地方再维护一个版本号。
       - name: 装 uv
-        uses: astral-sh/setup-uv@v10
+        uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
 
