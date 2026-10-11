@@ -11,7 +11,7 @@
 #   runtime —— 只搬 .venv + 源码，不带 uv、不带编译工具、不带 dev 依赖
 #
 # 三个必须说清的决定，都写在对应位置旁边：
-#   1. 为什么这次**不用** --frozen（没有 uv.lock）
+#   1. 为什么这次**用** --frozen（uv.lock 是怎么来的）
 #   2. 为什么四个 extra 全装
 #   3. 为什么密钥在这个文件里一次都不出现
 # ============================================================================
@@ -37,17 +37,29 @@ ENV UV_COMPILE_BYTECODE=1 \
 # 在这个文件里 = /app。所以 /app 同时是 venv 的家、源码的家、和"根"。
 WORKDIR /app
 
-# 先只拷依赖清单，让"装依赖"这一层能独立命中缓存：
-# 之后改代码不会重装依赖，改依赖才会。
+# 先只拷依赖清单和锁，让"装依赖"这一层能独立命中缓存：
+# 之后改代码不会重装依赖，改依赖（或改锁）才会。
 #
-# ⚠️ 这里**没有 uv.lock，所以下面不能写 --frozen**。
-# 别把它当成"忘了"：本机 PyPI 不通，生成不了锁文件；而一份手写或从别的项目
-# 抄来的锁**比没有锁更坏**——它会让人以为依赖是钉死的，实际不是。
-# 代价写清楚：这个镜像每次构建都会重新解析依赖版本，**两次构建的镜像不保证
-# 依赖完全一致**。要消除它，在有网的环境里跑一次 `uv lock` 再把 uv.lock
-# 拷进来、把下面的 `uv sync` 改成 `uv sync --frozen`。
-COPY pyproject.toml .python-version* ./
+# ⚠️ uv.lock **必须一起 COPY**。只拷 pyproject.toml 而漏掉锁，配上下面的
+# `--locked` 会直接构建失败（"lockfile 不存在"）——这是好事，它不会静默降级。
+#
+# 【uv.lock 是怎么来的，以及为什么这件事一直被想复杂了】
+# 原来这里写着"本机 PyPI 不通所以生成不了锁"。那个判断**早就不成立了**：
+# 宿主 PyPI 不通，但 docker build 里通——而 `uv sync` 不带 `--frozen` 时
+# **本来就会顺手在 /app 写一个 uv.lock**。也就是说这个镜像每次构建都在生成锁，
+# 只是没人把它拷出来、没人提交它。真正缺的从来不是"能不能生成"，是"把它拿走"。
+# 实际做法就是在 builder 阶段 `uv lock` 一次再 `docker cp` 出来（见 README）。
+#
+# 锁的作用：**两次构建的依赖完全一致**。以前每次构建都重新解析版本，
+# 今天装到的 openai 和下周装到的可能不是同一个版本，而这种事不会有任何提示。
+COPY pyproject.toml uv.lock .python-version* ./
 
+# --locked      锁和 pyproject.toml **必须对得上**，对不上就构建失败。
+#                这里刻意不用含义更松的 --frozen：--frozen 是"别动锁，照着装"，
+#                它不检查锁是否过期；--locked 是"断言锁是最新的"，改了依赖却忘了
+#                重新 `uv lock` 时它会直接报错。**要的就是这个报错**——它把
+#                "锁过期了"从一个没人会发现的状态变成一次构建失败。
+#
 # --no-dev      排除 [dependency-groups] 的 dev（pytest/ruff），运行时用不到
 # --no-install-… 本项目故意没有 [build-system]（是应用不是库），装不了自己
 #
@@ -59,7 +71,7 @@ COPY pyproject.toml .python-version* ./
 # 注意 pandas / numpy / matplotlib 不在这里——它们是**内核依赖**，不是 extra。
 # 数据分析是三个核心能力之一，镜像装的是内核，所以它一定在。
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --no-install-project --no-dev \
+    uv sync --locked --no-install-project --no-dev \
             --extra ui --extra api --extra milvus --extra mysql --extra search
 
 # ---------------------------------------------------------------------------
