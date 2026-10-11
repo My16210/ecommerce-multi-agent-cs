@@ -1,0 +1,76 @@
+# 最小 CI：装依赖 → ruff → pytest。
+#
+# 【为什么是"最小"而不是一套完整的流水线】
+# 这个仓库此前**一条 CI 都没有**。加 CI 的价值在于"测试绿"从**本机的一次性
+# 观察**变成**每次提交都要满足的条件**——这一条做到了，剩下的（矩阵、覆盖率
+# 上报、构建镜像、发布）都是在此之上加东西，可以后加。反过来先铺一堆用不上的
+# job，只会让第一次红的时候不知道该信哪个。
+#
+# 【版本号】
+# `actions/checkout@v4` 和 `astral-sh/setup-uv@v6` 是大版本 tag（不是 commit SHA）。
+# 好处是能自动拿到安全补丁，代价是可复现性弱一档——对一个面试作品这是划算的。
+# 如果 GitHub 报 "Unable to resolve action"，就是这一个大版本号过时了，按报错
+# 里的提示改成当前大版本即可，**这是全文件唯一需要维护的一行**。
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 默认 token 权限是读写全部，测试只需要读。显式收窄。
+permissions:
+  contents: read
+
+# 同一分支连推时取消上一次，省 runner，也让"最新一次的结果"就是当前的结果。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    # 正常跑完约 3~5 分钟（装 144 个包是大头）。给足余量，但别设成无限——
+    # 卡住时应该失败得响亮，而不是耗满 GitHub 的 6 小时上限。
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # python-version-file 让它直接读仓库里的 .python-version（3.11），
+      # 和本机、和 Dockerfile 用的是同一个来源，不要在这里另写一个版本号。
+      - name: 装 uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version-file: .python-version
+
+      # --frozen：uv.lock 和 pyproject.toml 一旦不一致就**在装依赖这一步红**，
+      # 而不是等到运行时才发现锁文件没跟上。锁文件漂移是那种"本机永远是好的"
+      # 的问题，正好交给 CI。
+      #
+      # --all-extras 而不是只挑几个：`ui`（streamlit）和 `api`（fastapi）的测试
+      # 靠 importorskip 决定跳不跳，少装一个 extra 不会报错，只会**静悄悄少跑一批**。
+      - name: 装依赖
+        run: uv sync --all-extras --frozen
+
+      - name: ruff
+        run: uv run ruff check .
+
+      - name: pytest
+        run: uv run pytest
+        env:
+          # 仓库里有一批中文输出和编码相关的坑（README「踩过的坑」里那条 CLI 字符集）。
+          # runner 默认不是 UTF-8，这里钉死。
+          PYTHONUTF8: "1"
+          # 沙箱在 import pyplot 之前已经强制 Agg 了，这里是双保险：
+          # headless runner 上因为缺 DISPLAY 而崩，是那种和被测代码无关的红。
+          MPLBACKEND: Agg
+
+      # 【预期结果（已在干净 checkout 上实测）】
+      # 517 passed / 3 skipped / 0 failed，共 520 条。
+      # 跳过的 3 条 = Milvus 那 2 条（要真服务）+ 界面真渲染那 1 条（要灌过数据）。
+      #
+      # 【runner 上没有中文字体】出图那条测试会打几行 findfont warning，
+      # 但它只断言"文件存在"、不校验像素，**不会红**（图确实是豆腐块）。
+      # 不为此装 fonts-noto-cjk：会让 CI 变重，而它修的是一个没人看的差异。

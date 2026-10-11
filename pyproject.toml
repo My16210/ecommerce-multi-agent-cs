@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "多 Agent 电商智能客服：LangGraph Supervisor + Worker（知识库 / 订单物流 / 销售数据分析）"
 readme = "README.md"
 requires-python = ">=3.11"
+# 许可证同时以 LICENSE 文件和这个字段声明（两边要一致，别只改一处）。
+license = "MIT"
 
 # ——————————————————————————————————————————————————————————————
 # 一张依赖表。分类的依据是**能力**，不是"从哪个仓库带过来的"。

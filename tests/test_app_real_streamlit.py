@@ -30,6 +30,19 @@
 `app.py` 会真的去开 `data/orders.sqlite` 和 Chroma 向量库。没灌过数据的环境
 不该因此变成"跑不了测试"，所以这里 skip——这个文件验的是**界面接线**，
 不是"数据灌没灌"。
+
+【但这道 skip 只加在 6 条中的 1 条上，这是量过的、不是漏的】
+干净 checkout（`git archive` 出来的，没有 `orders.sqlite`、没有向量库）上实测过：
+
+  · `test_app_renders_in_a_real_streamlit_runtime` 要真数据，缺了就 skip。
+  · **其余 5 条照常跑，而且全绿。** 它们不需要灌过数据：`app.py` 遇到空库时
+    是"warning 一句然后 return"（不是抛异常），而 Chroma 和订单库的构造函数
+    会**自己把空库建出来**（所以跑完会在 `data/` 下留下一套空的
+    `orders.sqlite` / `vector_store/` / `review_queue.db`——三个都在 .gitignore 里）。
+    那 4 条后台的测试更是只要有 `ADMIN_PASSWORD` 就行，跟订单数据无关。
+
+**所以不要把 `skipif` 提到模块级。** 那样会让那 5 条在 CI 上一起被跳过——
+其中 4 条本来跟数据毫无关系，白白丢掉覆盖。
 """
 import importlib
 import sys
