@@ -37,6 +37,28 @@ import time
 REAL_STDOUT = sys.stdout  # 重定向之前先抓在手里
 
 
+def review_outcome(result: dict):
+    """审查结果是**三态**，不是布尔：通过 / 没通过 / 根本没审查。
+
+    简单问题由 question_classifier 判定不需要审查（need_review=False），
+    图直接跳到 report，于是 review_passed 一直是初始值 False。照直传出去，
+    上层会把它当成"审查未通过"——worker 打一条"结果可能不可靠"的告警，
+    界面上弹一条黄条。**一次完全正确的回答被报成可疑的**，只因为这两个
+    意思不同的状态共用一个布尔。
+
+    但这里也不能改成"没审查就当通过"：那是把"没查"说成"查过了没问题"，
+    错在另一边。所以返回三态：
+
+        True  —— 审查了，通过
+        False —— 审查了，没通过（报告里已经标了风险）
+        None  —— 本次按设计跳过了审查
+
+    判据用 review_round 而不是 need_review：只有 reviewer 节点会改
+    review_round，所以"它大于 0"直接就是"审查真的跑过"，不依赖分类器的结论。
+    """
+    return bool(result.get("review_passed")) if result.get("review_round") else None
+
+
 def main() -> int:
     question = " ".join(sys.argv[1:]).strip()
     if not question:
@@ -60,8 +82,9 @@ def main() -> int:
             "report": result.get("final_report") or "",
             "chart_path": result.get("chart_path") or "",
             "chart_generated": bool(result.get("chart_generated")),
-            # 审查有没有真的通过，要如实带出去——报告里可能已标注了风险
-            "review_passed": bool(result.get("review_passed")),
+            # 审查有没有真的通过，要如实带出去——报告里可能已标注了风险。
+            # 三态，见 review_outcome：None 表示本次按设计没审查。
+            "review_passed": review_outcome(result),
             # 数据来源标签也要带出去：上层 worker 把它写进回答的 sources。
             # 原先 worker 那边写死的是「sales.csv（模拟销售数据）」，换数据集之后
             # 那句话就成了假的，而且不报错——回答底下挂着一个不对的来源。
