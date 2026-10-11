@@ -31,13 +31,33 @@
 排查时该用的仍然是 `uv run python main.py -v`。界面是演示用的，CLI 是查问题
 用的，这个顺序不能反。
 
+【会话持久化——以前这里写的是"不做"】
+这段以前写的是：「多轮历史放 `st.session_state`，关掉页面就没了。真要持久化，
+正确的落点是 ecom/orchestrator 那层的会话存储，不是在界面里塞一个 sqlite。」
+
+后半句就是现在做的事——落点在 `ecom/orchestrator/session.py`，界面只是它的
+一个使用者（和 `api.py`、`python -m ecom.orchestrator.cli.session` 平级）。
+这条没有变：**界面里没有自己的 sqlite**。所以下面这段代码里一个 `sqlite3`
+都找不到，只有 `session.xxx()` 的调用。
+
+顺带修掉一个真问题：以前那份 `agent_history` 是**只增不减**的——界面上聊到
+第 50 轮，就会把 50 轮全塞给模型。现在每次提问都从存储里现读
+`session.history()`，截断由 `HISTORY_TURNS` 统一管。**喂给模型多少**和
+**留在盘上多久**是两个参数，这条边界以前在界面上是失控的。
+
+**边界要说清，别把它说大**：界面这边落盘买到的是"上下文有上限、且这段对话
+在 CLI 里看得见也删得掉"，**不是"换个标签页还能接着聊"**。会话号只活在
+`st.session_state` 里，开一个新标签页就是一段新对话。想跨标签页续上，得把
+会话号放进 URL——**而那是错的**：它是凭证，进了 URL 就会被浏览器历史、代理
+日志、Referer 头带走（所以侧边栏里也只显示前 12 位）。这个代价值得付，
+因为它换来的是"凭证不出现在它不该出现的地方"。
+
 【不做的事，写清楚比留白好】
   · 不做登录 / 权限：这是离线演示，加一套假登录只会让演示多几步点击。
-  · 不做会话持久化：多轮历史放 `st.session_state`，关掉页面就没了。
-    真要持久化，正确的落点是 ecom/orchestrator 那层的 trace + 会话存储，
-    不是在界面里塞一个 sqlite。
-  · 不做多副本：session_state 是进程内的，两个副本之间不共享——和 api.py
-    里那个进程内会话字典是同一个已声明的边界。
+    （**后台管理端不在这份文件里**——它要能批准退货，所以有密码门禁，
+      见仓库根的 `admin.py`。两个入口分开，正是为了让这条"不做"继续成立。）
+  · 不做多副本：会话落在本地 sqlite，**多副本各写各的文件，上下文会岔**。
+    和 api.py 那边是同一个已声明的边界（要真解决得换 Redis 之类的共享存储）。
 """
 from datetime import datetime
 
@@ -48,10 +68,11 @@ from ecom.knowledge.retriever.reranker import rerank
 from ecom.knowledge.retriever.retriever import retrieve
 from ecom.knowledge.utils import streaming
 from ecom.knowledge.vector_store import get_vector_store
+from ecom.orchestrator import session
 from ecom.orchestrator.core.aggregate import WORKER_LABELS
 from ecom.orchestrator.core.supervisor import answer
 from ecom.orchestrator.db.engine import get_db
-from ecom.orchestrator.settings import MAX_ROUNDS, WORKER_TIMEOUT
+from ecom.orchestrator.settings import MAX_ROUNDS, HISTORY_TURNS, WORKER_TIMEOUT
 from ecom.orchestrator.tools.order_tools import (
     OrderNotFound,
     describe_status,
@@ -96,20 +117,48 @@ def _clip(text, limit: int = 160) -> str:
 # ═══════════════════════════════════════════════════════════════
 # Tab 1：智能客服——四路合一的那条路
 # ═══════════════════════════════════════════════════════════════
+def _init_agent_session() -> None:
+    """这个浏览器会话还没会话号时，开一个。
+
+    **刻意不做"从 URL 里恢复会话"**（`st.query_params["session"] = ...`）。
+    会话号是凭证：拿到它就能读到这个会话的全部历史。塞进 URL 之后它会进
+    浏览器历史、代理访问日志、跨站请求的 Referer 头——凭证最不该待的三个地方。
+
+    代价是**新开标签页 = 新的一段对话**，上一次的接不上。要接上，会话号必须
+    由调用方自己保管在安全的地方——这是 `api.py` 那种客户端能做、浏览器里
+    没地方做的事。所以这个能力给 API 和 CLI，不给界面。
+
+    屏幕上那份 `agent_turns`（带决策链）只属于当前这段浏览器会话，不落盘：
+    决策链是"这一次请求怎么想的"，属于 trace，不属于对话内容。
+    """
+    if "agent_session_id" not in st.session_state:
+        st.session_state["agent_session_id"] = session.ensure_session("")
+    st.session_state.setdefault("agent_turns", [])
+
+
+def _start_new_session() -> None:
+    """换一个会话号重新开始。
+
+    **不清空旧会话**——它还在盘上，由 `SESSION_TTL_DAYS` 那套过期和 CLI 的
+    `delete` 管。在这里顺手删掉是错的：用户点的是"我想重新开始说"，不是
+    "我想销毁记录"，两件事在界面上长得像，在语义上差很远。
+    """
+    st.session_state["agent_session_id"] = session.ensure_session("")
+    st.session_state["agent_turns"] = []
+
+
 def render_agent_tab() -> None:
     st.caption(
         f"一次提问由 Supervisor 决定交给谁：知识库 / 订单 / 数据分析，"
         f"最多回环 {MAX_ROUNDS} 轮。"
     )
-
-    history = st.session_state.setdefault("agent_history", [])
-    turns = st.session_state.setdefault("agent_turns", [])
+    _init_agent_session()
+    turns = st.session_state["agent_turns"]
 
     col_a, col_b, _ = st.columns([1, 1, 4])
     with col_a:
-        if st.button("清空对话", key="agent_clear"):
-            st.session_state["agent_history"] = []
-            st.session_state["agent_turns"] = []
+        if st.button("新建会话", key="agent_clear"):
+            _start_new_session()
             st.rerun()
     with col_b:
         verbose = st.toggle("显示决策链", value=True, key="agent_verbose")
@@ -129,12 +178,18 @@ def render_agent_tab() -> None:
     if not question:
         return
 
+    sid = st.session_state["agent_session_id"]
+
     with st.chat_message("user"):
         st.markdown(question)
 
     with st.chat_message("assistant"):
         with st.spinner("路由中…"):
             started = datetime.now()
+            # **每次现读，不缓存一份在 session_state 里。** 两个地方各存一份
+            # 同一个历史，迟早会分叉（清空时忘了清另一份），而且会让
+            # HISTORY_TURNS 这个上限在界面上失效。
+            history = session.history(sid)
             final = answer(question, history)
             elapsed_ms = int((datetime.now() - started).total_seconds() * 1000)
         st.markdown(final.get("answer") or "（没有生成答复）")
@@ -144,10 +199,8 @@ def render_agent_tab() -> None:
         if verbose:
             _render_decision_chain(final, elapsed_ms)
 
-    history += [
-        {"role": "user", "content": question},
-        {"role": "assistant", "content": final.get("answer") or ""},
-    ]
+    # 先答完再落盘：模型调用失败时不会留下一条"问了没答"的记录。
+    session.append_turn(sid, question, final.get("answer") or "")
     turns.append({"question": question, "final": final, "elapsed_ms": elapsed_ms})
 
 
@@ -439,6 +492,22 @@ def main() -> None:
             st.markdown(f"- 订单库：打不开（{_clip(exc, 60)}）")
         st.markdown(f"- 路由上限：{MAX_ROUNDS} 轮")
         st.markdown(f"- worker 超时：{WORKER_TIMEOUT}")
+        st.markdown(f"- 每轮回读历史：{HISTORY_TURNS} 轮")
+
+        st.divider()
+        st.header("会话")
+        _init_agent_session()
+        st.caption(
+            "多轮历史落在 `data/orchestrator/sessions.db`；"
+            "新标签页会是新的一段对话（凭证不进 URL，见 app.py 里的说明）。"
+        )
+        # 只显示前 12 位。它是**凭证**（拿到它就能读到这个会话的全部历史），
+        # 侧边栏会被人截图发出去，所以不整条摆在这里——要看全的用
+        # `python -m ecom.orchestrator.cli.session list`。
+        st.code(st.session_state["agent_session_id"][:12] + "…", language=None)
+        if st.button("新建会话", key="sidebar_new_session"):
+            _start_new_session()
+            st.rerun()
 
         st.divider()
         st.caption(

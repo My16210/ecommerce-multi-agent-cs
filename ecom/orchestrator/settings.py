@@ -98,3 +98,24 @@ ORDER_SEED_DIR = DATA_DIR / "orchestrator" / "seed"
 # 对外请求体上限，防止一句 10 万字把路由 prompt 撑爆
 # ---------------------------------------------------------------------------
 MAX_QUESTION_CHARS = int(os.getenv("MAX_QUESTION_CHARS", "2000"))
+
+# ---------------------------------------------------------------------------
+# 会话存储（多轮记忆）
+# ---------------------------------------------------------------------------
+# **和订单库分开一个文件**：两者的生命周期不一样。orders.sqlite 是"灌一次就
+# 不动"的派生数据，删了能重灌；sessions.db 是"每天都在长"的运行数据，而且
+# 里面是用户说过的话。它们不该共用一份备份/清理策略，也不该共用一条
+# "删库重灌"的操作。
+#
+# 它同时**不是** knowledge 那边那个 chat_history.db：那个存的是知识库图的
+# LangGraph checkpoint，只有 `ask.py` 用。为什么 supervisor 这边不复用它，
+# 理由写在 ecom/orchestrator/session.py 的模块 docstring 里。
+SESSION_DB_PATH = Path(os.getenv("SESSION_DB_PATH", str(DATA_DIR / "orchestrator" / "sessions.db")))
+
+# 会话保留天数。**按时间清，不按条数清**——条数上限解决的是"上下文太长"
+# （那是 HISTORY_TURNS 的事），时间上限解决的是"数据留太久"，两个问题别混。
+SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
+
+# 每次提问**回读几轮**历史喂给汇总。这是成本参数：轮数越多 prompt 越大、
+# token 越贵。它和上面的保留期是两件事，所以是两个独立配置。
+HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "6"))

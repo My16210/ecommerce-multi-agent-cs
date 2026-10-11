@@ -1,0 +1,304 @@
+"""
+会话存储（SQLite）：让多轮对话活过进程重启。
+
+【为什么不复用 knowledge 那边已经跑通的 SqliteSaver】
+`ecom/knowledge/cli/ask.py` 用 `SqliteSaver` + `thread_id` 把知识库图的**状态**
+存进 `data/knowledge/chat_history.db`。看着应该直接搬过来统一，**但不该搬**，
+四条理由，从硬到软：
+
+1. **`chat_history` 在 supervisor 里是"节点输入"，不是"图状态"。**
+   `supervisor.answer()` 把它塞进 `make_initial_state`，图只在 aggregate 节点
+   读一次。要让 checkpointer "接管"历史，得先往图里加一个累积节点或给这个
+   通道配 reducer——那是在改图的语义，不是在加一个存储。
+2. **`state.py` 已经警告过那条路有坑**：`results` 是 `Annotated[list, operator.add]`，
+   注释写着「往 add-型通道写 `[]` 等于没写、跨轮累加、清不掉」。给 `chat_history`
+   配同样的 reducer，会得到一条**只增不减、没法在开头裁剪**的通道——而多轮历史
+   的正确行为恰恰是"留最近 N 轮、丢掉更早的"，与 add-型语义相反。
+3. **checkpointer 持久化的是整份 state**，`results` / `round` / `tried` 也会跟着
+   跨请求累积。这三个都是**每请求**语义（`tried` 是"本轮试过谁"，跨请求累积会让
+   第二问直接没得可试）。持久化整份 state 从语义上就是错的。
+4. **两个图不是同一个图。** 同一个 `thread_id` 命名空间里塞两张不同图的
+   checkpoint，排查时只会互相误导。
+
+**这件事的反面也要说清，否则上面的理由没有分量**：统一成一套的好处是
+"会话"在整个项目里只有一个答案，新人只学一次。**什么条件下该反过来选**——
+如果哪天 supervisor 需要在**图内部**做带记忆的决策（比如记住"这个用户上一轮
+已经在等人工了"），那就不是"历史作为输入"而是"历史作为状态"，那时候
+checkpointer 才是对的工具。现在没有这个需求。
+
+所以这里存的是**扁平的消息行**：一问一答两条，读回来拼成 `chat_history`
+喂给 `answer()`。图本身一行都不用改。
+
+【session_id 是凭证，不是账号——这条必须写在最显眼的地方】
+`workers/order.py` 的 `_guess_customer()` 是**从用户的话里猜客户号**的
+（代码里标了警告）。也就是说这个系统里的"客户"是**未认证**的：没有登录态，
+没有可核验的身份。因此：
+
+    **拿到 session_id 就能读到这个会话的全部历史。**
+
+它等价于一个 bearer token。具体影响三条：
+  · 别把它当账号系统用。要谈"这个会话属于谁"，前提是先有登录态。
+  · **没有身份，就没法按"账号"响应删除请求**，只能按 session_id 删。
+  · 所以保留期必须**按时间**清（`purge`），不能指望"用户走了就可以删"。
+
+【三个问题的答案（README 里说"要真做，得先想清楚"的就是这三条）】
+  存哪     data/orchestrator/sessions.db，单文件、单节点、不跨副本。
+           不引 Redis——那是"多副本怎么共享会话"的另一个问题。
+  怎么删   `python -m ecom.orchestrator.cli.session purge`（按时间）
+           / `delete <id>`（按会话）。CLI 和界面共用下面这些函数。
+  合规     明文落盘，**不做**静态加密和字段级脱敏——那是另一个量级的事，
+           这里能做的缓解只有两条：短保留 + 能删。别把它说成"合规了"。
+
+【和 knowledge 那个库的另一个区别：这里只有 SQLite，没有 MySQL 分支】
+会话是纯演示特性，接 MySQL 是过度设计；更重要的是**会话数据必须有自己的
+文件和自己的保留策略**——如果走 `ORDER_DB_DSN`，接了 MySQL 就会把用户说过的话
+写进共享的订单库，那是把两类数据混在一处。所以这个模块自己开 sqlite，
+不走 `orchestrator.db.engine.Database`。
+"""
+import secrets
+import sqlite3
+import threading
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from ecom.orchestrator.settings import HISTORY_TURNS, SESSION_DB_PATH, SESSION_TTL_DAYS
+from ecom.orchestrator.utils.logger import setup_logger
+
+logger = setup_logger(__name__)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
+"""
+
+_conn = None
+# **这把锁是补上一个真缺陷，不是预防性加的。** api.py 原来那个进程内字典
+# `_SESSIONS` 没有任何保护——`/chat` 是 `def`，FastAPI 把它丢进线程池，
+# 两个请求同时写同一个 dict 是可能的。原来侥幸没炸是因为 dict 操作快且
+# GIL 挡了一部分；换成 sqlite 之后没有这层侥幸了（跨线程用同一个连接
+# 会直接抛 ProgrammingError）。
+#
+# 读也一起锁：这里进程内**共用同一个连接**，而 sqlite3 的连接对象本身
+# 不是为并发设计的。WAL 解决的是**跨进程**（purge 的 CLI 和服务同时开着）
+# 的读写并发，不是同一个连接内部的并发——两件事，别互相顶替。
+_lock = threading.Lock()
+
+
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def connect() -> sqlite3.Connection:
+    """
+    打开会话库，**进程内复用同一个连接**，建表脚本只在首次打开时跑一次。
+
+    所以下面那些函数里不能再有 `finally: conn.close()`——那会把缓存连接
+    关掉，下次调用拿到一个已关闭的连接。
+    """
+    global _conn
+    if _conn is None:
+        Path(SESSION_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(SESSION_DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        # WAL：让"purge 命令在跑"和"服务在写"不互相阻塞。默认的 journal 模式下
+        # 一个写者会挡住所有读者，而 purge 是一次全表扫描。
+        conn.execute("PRAGMA journal_mode=WAL")
+        # 万一还是撞上锁（比如宿主上另一个进程正持着），等 5 秒再报错，
+        # 而不是立刻抛 "database is locked"。
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.executescript(SCHEMA)
+        conn.commit()
+        _conn = conn
+    return _conn
+
+
+def reset_connection() -> None:
+    """
+    丢掉缓存的连接，下次 connect() 重新按 SESSION_DB_PATH 打开。
+
+    给测试用：每个用例都要把会话库指到自己的临时文件，不清缓存就会串库。
+    """
+    global _conn
+    if _conn is not None:
+        _conn.close()
+        _conn = None
+
+
+def new_session_id() -> str:
+    """
+    生成会话号。
+
+    用 `secrets.token_urlsafe(24)` 而不是 `uuid4().hex[:12]`（trace.request_id
+    那种形状）：**因为 session_id 是凭证**（见模块 docstring）。uuid4 截 12 位
+    只剩 48 bit，可枚举；token_urlsafe(24) 是 192 bit，而且 URL 安全、能直接
+    贴进浏览器或 curl。
+    """
+    return secrets.token_urlsafe(24)
+
+
+def ensure_session(session_id: str) -> str:
+    """会话不存在就建一个。返回 session_id 本身，方便链式写。"""
+    sid = (session_id or "").strip()
+    if not sid:
+        sid = new_session_id()
+    now = _now()
+    with _lock:
+        conn = connect()
+        conn.execute(
+            "INSERT INTO sessions (session_id, created_at, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(session_id) DO NOTHING",
+            (sid, now, now),
+        )
+        conn.commit()
+    return sid
+
+
+def append_turn(session_id: str, question: str, answer: str) -> None:
+    """
+    记一轮问答。一问一答两行，**同一时刻写入**——分成两次调用的话，
+    中途挂掉就会留下一个只有提问没有回答的会话，读回来喂给模型时
+    它看到的是一个悬空的问题。
+    """
+    sid = ensure_session(session_id)
+    now = _now()
+    with _lock:
+        conn = connect()
+        conn.executemany(
+            "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            [(sid, "user", question, now), (sid, "assistant", answer or "", now)],
+        )
+        conn.execute("UPDATE sessions SET updated_at = ? WHERE session_id = ?", (now, sid))
+        conn.commit()
+
+
+def history(session_id: str, max_turns: int = None) -> list:
+    """
+    取回最近 `max_turns` 轮历史，**按时间正序**，形状就是 `answer()` 要的
+    `[{"role": "user"/"assistant", "content": ...}]`。
+
+    截断方向是这里最容易写错的地方：要留**最近**的几轮，不是最早的几轮。
+    所以 SQL 里是 `ORDER BY id DESC LIMIT n`（先拿到最新的），拿到之后再
+    反转成正序——反过来写（ASC + LIMIT）不会报错，只会让模型拿到一段
+    很旧的上文，而且完全看不出来。
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return []
+    turns = HISTORY_TURNS if max_turns is None else max_turns
+    if turns <= 0:
+        return []
+
+    with _lock:
+        rows = connect().execute(
+            "SELECT role, content FROM messages WHERE session_id = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (sid, turns * 2),
+        ).fetchall()
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+def list_sessions(limit: int = 50) -> list:
+    """会话列表，最近更新的在前。带轮数，供 CLI / 界面概览用。"""
+    with _lock:
+        rows = connect().execute(
+            """
+            SELECT s.session_id, s.created_at, s.updated_at,
+                   COUNT(m.id) AS messages
+            FROM sessions s
+            LEFT JOIN messages m ON m.session_id = s.session_id
+            GROUP BY s.session_id
+            ORDER BY s.updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_session(session_id: str) -> dict:
+    """单个会话的元信息（不含消息正文）。查不到返回 None。"""
+    with _lock:
+        row = connect().execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_session(session_id: str) -> int:
+    """
+    删一个会话连同它的消息。返回删掉的**消息**条数（0 表示这个会话本来就不存在）。
+
+    两条 DELETE 在同一个连接、同一次提交里——不靠外键级联，因为 SQLite
+    默认不开 `PRAGMA foreign_keys`，写了 `ON DELETE CASCADE` 也不生效。
+    依赖一个默认关闭的开关，是那种"今天对、换个环境就静默留垃圾"的写法。
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return 0
+    with _lock:
+        conn = connect()
+        cursor = conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+        removed = cursor.rowcount
+        conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+        conn.commit()
+    return removed
+
+
+def purge(older_than_days: int = None) -> dict:
+    """
+    删掉太久没动静的会话。返回 `{"sessions": n, "messages": m}`。
+
+    按 `updated_at`（最后一次说话的时间）算，不是 `created_at`——一个持续
+    聊了 40 天的会话不该在第 31 天被删掉。
+
+    **什么时候调它**：`api.py` / `app.py` 启动时一次，以及 CLI 显式调。
+    刻意**不做**"读的时候顺手删"那种懒清理：那会让一个只读操作产生写副作用，
+    出问题时（"我的会话怎么没了"）极难定位。代价是长驻进程不会自我清理，
+    得外挂一行 cron——这条写进 README 的已知限制。
+    """
+    days = SESSION_TTL_DAYS if older_than_days is None else older_than_days
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with _lock:
+        conn = connect()
+        removed = conn.execute(
+            "DELETE FROM messages WHERE session_id IN "
+            "(SELECT session_id FROM sessions WHERE updated_at < ?)",
+            (cutoff,),
+        ).rowcount
+        sessions = conn.execute(
+            "DELETE FROM sessions WHERE updated_at < ?", (cutoff,)
+        ).rowcount
+        conn.commit()
+    if sessions:
+        logger.info("会话清理：删掉 %s 个会话 / %s 条消息（早于 %s）", sessions, removed, cutoff)
+    return {"sessions": sessions, "messages": removed}
+
+
+def stats() -> dict:
+    """会话总数、消息总数、以及最老/最新的会话时间。CLI 概览用。"""
+    with _lock:
+        conn = connect()
+        sessions = conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"]
+        messages = conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()["n"]
+        oldest = conn.execute("SELECT MIN(created_at) AS t FROM sessions").fetchone()["t"]
+        newest = conn.execute("SELECT MAX(updated_at) AS t FROM sessions").fetchone()["t"]
+    return {
+        "sessions": sessions,
+        "messages": messages,
+        "oldest": oldest,
+        "newest": newest,
+        "ttl_days": SESSION_TTL_DAYS,
+        "db_path": str(SESSION_DB_PATH),
+    }

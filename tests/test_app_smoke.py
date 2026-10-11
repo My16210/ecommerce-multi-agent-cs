@@ -118,7 +118,7 @@ def _import_app(st):
 
 
 @pytest.fixture
-def app(monkeypatch):
+def app(monkeypatch, tmp_path):
     st = _install_fake_streamlit()
     CALLS.clear()
     module = _import_app(st)
@@ -131,7 +131,14 @@ def app(monkeypatch):
             return 3
 
     monkeypatch.setattr(module, "_store", lambda: _FakeStore())
-    return module
+
+    # 会话库也换到临时目录。**这是落盘之后新增的必要一步**：智能客服 Tab
+    # 现在会真的去开会话库（`_restore_agent_session`），不换的话这个测试
+    # 会往仓库的 data/orchestrator/ 里写东西，"测试不依赖本机状态"就破了。
+    monkeypatch.setattr(module.session, "SESSION_DB_PATH", str(tmp_path / "sessions.db"))
+    module.session.reset_connection()
+    yield module
+    module.session.reset_connection()
 
 
 def _render_all_tabs(module):
@@ -165,7 +172,9 @@ def test_the_decision_chain_renders_a_failed_worker(app):
     main.py -v 有测试钉着，界面这份是它的第二个视图——**两边必须显示同一件事**。
     这里用一个失败的 knowledge worker 把 `错误：...` 那条支路逼出来。
     """
-    app.st.session_state["agent_history"] = [{"role": "user", "content": "订单 52644 到哪了"}]
+    # 置上会话号，`_restore_agent_session` 才会走"已经有了，不重建"那条路
+    # ——否则它会把下面这份手工搭的 turns 覆盖掉。
+    app.st.session_state["agent_session_id"] = "test-session"
     app.st.session_state["agent_turns"] = [
         {
             "question": "订单 52644 到哪了",
@@ -234,3 +243,79 @@ def test_the_knowledge_tab_says_so_when_there_is_nothing_indexed(app, monkeypatc
     app.render_knowledge_tab()
 
     assert _calls_named("warning"), "空向量库时应当给出提示"
+
+
+def test_a_new_browser_session_starts_a_new_conversation(app):
+    """**这条钉的是一个边界，不是一个功能。**
+
+    界面这边**刻意不把会话号放进 URL**（它是凭证，进了 URL 就会进浏览器历史、
+    代理日志、Referer 头）。所以新开一个标签页 = session_state 空 = 新会话，
+    上一次的上下文接不上——这是设计的一部分，不是漏做。
+
+    写成测试是因为"没做的能力"最容易被下一个人当成 bug 顺手补上，而补法
+    （`st.query_params["session"] = sid`）正好是那个不该做的。
+    """
+    old = app.session.ensure_session("")
+    app.session.append_turn(old, "上次聊过的", "上次答过的")
+    app.st.session_state["agent_turns"] = [
+        {"question": "上次聊过的", "final": {"answer": "上次答过的"}, "elapsed_ms": 1}
+    ]
+
+    # 新标签页：session_state 是空的（假 streamlit 里就是个 dict，直接清掉）
+    app.st.session_state.clear()
+    CALLS.clear()
+    app.render_agent_tab()
+
+    assert app.st.session_state["agent_session_id"] != old
+    assert app.st.session_state["agent_turns"] == []
+    shown = " ".join(str(c[1]) for c in CALLS)
+    assert "上次答过的" not in shown, "旧会话的内容不该出现在新会话里"
+
+
+def test_the_model_gets_history_from_the_store_not_from_the_screen(app):
+    """喂给模型的历史来自存储，**不是**屏幕上那个 `agent_turns`。
+
+    这两份东西必须只是"同一件事的两个视图"，不能各存各的——否则清空时忘了
+    清另一份，模型就会收到一段界面上已经看不见的上文。
+    这里用屏幕上的 turns 是空的、但存储里有数据的错位状态把它逼出来。
+    """
+    sid = app.session.ensure_session("")
+    app.session.append_turn(sid, "上一轮的问题", "上一轮的回答")
+
+    app.st.session_state["agent_session_id"] = sid
+    app.st.session_state["agent_turns"] = []     # 屏幕上什么都没有
+
+    seen = {}
+
+    def _fake_answer(question, history):  # noqa: ANN001
+        seen["history"] = history
+        return {"answer": "（假答复）"}
+
+    app.answer = _fake_answer
+    app.st.chat_input = lambda *a, **k: "这一轮的问题"
+
+    app.render_agent_tab()
+
+    assert [m["content"] for m in seen["history"]] == ["上一轮的问题", "上一轮的回答"]
+    # 这一轮也要落盘（否则下一轮就接不上了）
+    assert len(app.session.history(sid)) == 4
+
+
+def test_a_new_session_starts_blank_but_does_not_delete_the_old_one(app):
+    """「新建会话」是"换一个"，不是"销毁上一个"。
+
+    反过来的话，用户点了这个按钮就等于把记录删了——而按钮上写的是"新建"。
+    旧会话留给保留期和 `cli.session delete` 管。
+    """
+    old = app.session.ensure_session("")
+    app.session.append_turn(old, "老问题", "老回答")
+    app.st.session_state["agent_session_id"] = old
+    app.st.session_state["agent_turns"] = [{"question": "老问题", "final": {"answer": "老回答"},
+                                            "elapsed_ms": 1}]
+
+    app._start_new_session()
+
+    assert app.st.session_state["agent_session_id"] != old
+    assert app.st.session_state["agent_turns"] == []
+    assert app.session.get_session(old) is not None, "旧会话被顺手删掉了"
+    assert len(app.session.history(old)) == 2
