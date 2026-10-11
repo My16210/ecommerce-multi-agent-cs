@@ -1,6 +1,6 @@
 from langchain_openai import ChatOpenAI
 
-from ecom.analytics.agents.prompts import CODE_RULES
+from ecom.analytics.agents.prompts import build_code_rules
 from ecom.analytics.core.state import SalesState
 from ecom.analytics.settings import settings
 from ecom.analytics.utils.logger import setup_logger
@@ -37,6 +37,9 @@ def self_corrector_node(state: SalesState) -> dict:
     llm = ChatOpenAI(**settings.get_llm_kwargs("deepseek"))
 
     # 2. 共用头 + 分支尾，两处规则保持一致
+    #    口径走和 analyst 同一个 build_code_rules：改代码的模型和写代码的模型
+    #    拿到的是**同一份**口径，不会出现"按 A 套写、按 B 套改"。
+    code_rules = build_code_rules(state.get("dataset_rules", ""))
     prompt = f"""你之前写的 pandas 代码有问题。
 用户问题：{state['question']}
 数据列名：{state['columns']}
@@ -47,7 +50,7 @@ def self_corrector_node(state: SalesState) -> dict:
 
 {tail}
 
-{CODE_RULES}"""
+{code_rules}"""
 
     # 3. 调模型
     response = llm.invoke(prompt)

@@ -27,6 +27,11 @@ data/knowledge/vector_store/
 # 数据分析跑出来的图（每次分析都覆盖）
 data/analytics/output/
 
+# 数据集的**原始下载**（DataCo 主表 96MB，未清洗）。两条理由：
+# 一是体积，二是它只是中间物——该进仓库的是 datasets/ 下清洗好的表 + 派生脚本，
+# 别人 clone 之后照着脚本重跑得出来，没必要为此背一个 96MB 的二进制。
+data/analytics/source/
+
 logs/
 
 # Milvus 的 Docker 数据卷（docker-compose.milvus.yml 会建 volumes/{etcd,minio,milvus}）
@@ -36,7 +41,8 @@ volumes/
 #   data/knowledge/documents/    语料本体，包括 reviewed/（人工审核通过的知识）
 #   data/knowledge/*.jsonl       评测集 / 金标准 / 答案快照——评测结论的依据，
 #                                改了历史数字就对不上了，所以必须进仓库
-#   data/analytics/raw/sales.csv 数据分析的输入数据
+#   data/analytics/datasets/     数据分析的输入数据，一个子目录一个数据集
+#                                （data.csv + NOTES.md，口径就写在 NOTES.md 里）
 
 # ——— Python ———
 .venv/

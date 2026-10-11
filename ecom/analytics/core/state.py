@@ -5,6 +5,15 @@ class SalesState(TypedDict):
     question: str
     columns: list[str]
     data_sample: str
+    # 数据集三件套，由 data_loader 节点从数据集目录的 NOTES.md 读出后写进来。
+    #
+    # 口径为什么要在 state 里传、而不是让每个 agent 自己读文件：
+    # 一次运行里 analyst / self_corrector / reviewer 必须看到**同一个字符串**。
+    # 各自读文件在单次运行里结果也一样，但传 state 让"口径只有一份"这件事
+    # 在类型上就成立——reviewer 拿不到别的东西可写。也顺手省掉三次磁盘读。
+    dataset_name: str
+    dataset_label: str
+    dataset_rules: str
 
     generated_code: str
     exec_result: str
@@ -43,6 +52,9 @@ def make_initial_state(question: str) -> SalesState:
         "question": question,
         "columns": [],
         "data_sample": "",
+        "dataset_name": "",
+        "dataset_label": "",
+        "dataset_rules": "",
         "generated_code": "",
         "exec_result": "",
         "exec_error": None,

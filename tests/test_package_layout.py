@@ -194,7 +194,17 @@ def test_the_three_settings_modules_agree_on_the_root():
 
     assert kb_data == REPO_ROOT / "data" / "knowledge"
     assert analytics_settings.DATA_DIR == REPO_ROOT / "data" / "analytics"
-    assert analytics_settings.RAW_CSV_PATH == REPO_ROOT / "data" / "analytics" / "raw" / "sales.csv"
+
+    # 分析数据现在按数据集分目录：datasets/<名字>/{data.csv,NOTES.md}。
+    # 这里**故意不写死数据集名字**——默认值是 dataco，但 ANALYTICS_DATASET 一改它就变，
+    # 写死会让这条测试在切换数据集时假红一次。要守的是位置关系：
+    # 表和它的数据说明必须同目录（口径跟着数据走），整棵子树必须在仓库根的
+    # data/analytics 下、不在包目录里。
+    assert analytics_settings.RAW_CSV_PATH.parent == analytics_settings.DATASET_DIR
+    assert analytics_settings.DATASET_DOC_PATH.parent == analytics_settings.DATASET_DIR
+    assert analytics_settings.RAW_CSV_PATH.name == "data.csv"
+    assert analytics_settings.DATASET_DIR.parent.parent == REPO_ROOT / "data" / "analytics"
+    assert PKG_ROOT not in analytics_settings.RAW_CSV_PATH.parents
 
 
 def test_the_repo_has_exactly_one_top_level_package():

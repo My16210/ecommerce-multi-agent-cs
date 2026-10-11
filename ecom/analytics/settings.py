@@ -74,11 +74,25 @@ class Settings:
     }
 
     # ===== 数据路径 =====
-    # 集中管理，避免各节点硬编码。数据在 <仓库根>/data/analytics/ 下，不进包目录——
-    # raw/ 是进仓库的输入、output/ 是跑出来的图，两个性质不同，所以分两级而不是平铺。
-    DATA_DIR = ANALYTICS_DATA_DIR
-    RAW_CSV_PATH = ANALYTICS_DATA_DIR / "raw" / "sales.csv"
+    # 集中管理，避免各节点硬编码。数据在 <仓库根>/data/analytics/ 下，不进包目录。
+    #
+    # 【换数据集 = 换一个目录，不改任何 .py】
+    # datasets/ 下每个目录就是一个数据集，里面固定两样东西：
+    #   data.csv    给模型操作的那张表（data_loader 和 code_executor 都只从这读）
+    #   NOTES.md    数据说明 + 默认口径。**口径的唯一真相来源**——analyst、self_corrector、
+    #               reviewer 三处拿到的都是它，所以不存在"两处口径写得不一致"这种事。
+    # 选哪个由环境变量决定。加第三个数据集 = 新建一个目录，本文件不用动。
+    DATASET_NAME = os.getenv("ANALYTICS_DATASET", "dataco")
+    DATASETS_DIR = ANALYTICS_DATA_DIR / "datasets"
+    DATASET_DIR = DATASETS_DIR / DATASET_NAME
+    # 名字保持 RAW_CSV_PATH 不变：它是 data_loader.py 和 code_executor.py 的引用点，
+    # 留着这个名字，切数据集时这两处自动跟着变——这就是"改配置不改代码"落到实处的样子。
+    RAW_CSV_PATH = DATASET_DIR / "data.csv"
+    DATASET_DOC_PATH = DATASET_DIR / "NOTES.md"
+    # source/ 是未清洗的原始下载（几十 MB，只在本机、不进仓库）；datasets/ 才是派生结果。
+    SOURCE_DIR = ANALYTICS_DATA_DIR / "source"
     OUTPUT_DIR = ANALYTICS_DATA_DIR / "output"
+    DATA_DIR = ANALYTICS_DATA_DIR
 
     # ===== MySQL（Text-SQL 用，可选） =====
     # 默认 3306 是 MySQL 的标准端口。本机 Docker 里那个 mysql8 在 3308，
