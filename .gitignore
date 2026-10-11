@@ -49,6 +49,12 @@ volumes/
 #                                改了历史数字就对不上了，所以必须进仓库
 #   data/analytics/datasets/     数据分析的输入数据，一个子目录一个数据集
 #                                （data.csv + NOTES.md，口径就写在 NOTES.md 里）
+#   data/orchestrator/seed/      订单库的种子（orders.csv + logistics.csv，7.9MB）。
+#                                这两份也是**派生产物，但必须进仓库**——它们由
+#                                derive_seed.py 从 96MB 的公开数据集派生，而那份
+#                                原始数据按上面的规则不入库。不留这两份 CSV，
+#                                clone 下来的人就既没有种子也没有原料，
+#                                `main.py --init-db` 直接跑不起来。
 
 # ——— Python ———
 .venv/

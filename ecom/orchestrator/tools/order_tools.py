@@ -17,9 +17,40 @@ from datetime import datetime
 
 from ecom.orchestrator.db.engine import Database, get_db
 
-# 能申请退货的状态。已下单（还没发货）走的是"取消订单"不是退货；
-# 已取消的订单没有货可退。这两条边界都是业务事实，不是漏写。
-RETURNABLE_STATUS = {"已发货", "运输中", "已签收"}
+# 能申请退货的状态。**只有 COMPLETE**——订单已完成，货在客户手里，才谈得上退。
+#
+# 为什么不把 CLOSED 也放进来：DataCo 的官方字段字典对 `Order Status` 只列了取值，
+# 没写 CLOSED 和 COMPLETE 的区别。**没有依据的映射就是编**，而这里编错的代价是
+# 系统替用户提交了一笔本不该受理的退货。所以宁可少放行一档——被拦下的用户还能
+# 找人工客服，被放行的错误申请是要花钱的。写操作的边界该往保守那边偏。
+#
+# 为什么 PROCESSING / PENDING 不行：那些订单还没履约完，"退"无从谈起，用户想做的
+# 其实是**取消**。取消和退货是两条流程，这里不能替用户换一个操作。
+#
+# （旧版这行是 `{"已发货", "运输中", "已签收"}`，配合手写的 5 个中文状态。
+#  换成真实数据后那 5 个状态没了：DataCo 的订单状态和配送状态是两个维度，
+#  "运输中"是配送状态里的说法，不是订单状态。口径收窄是事实，写在这里。）
+RETURNABLE_STATUS = {"COMPLETE"}
+
+# 状态的中文注释，只用在给人看的报错和回答里，**不参与任何判断**。
+# 判断一律比上面的英文集合——注释一旦参与判断，它就变成了第二个真相来源。
+STATUS_GLOSS = {
+    "COMPLETE": "订单已完成",
+    "CLOSED": "订单已关闭",
+    "PROCESSING": "处理中",
+    "PENDING": "待处理",
+    "PENDING_PAYMENT": "待支付",
+    "ON_HOLD": "已挂起",
+    "PAYMENT_REVIEW": "支付审核中",
+    "SUSPECTED_FRAUD": "疑似欺诈",
+    "CANCELED": "已取消",
+}
+
+
+def describe_status(status: str) -> str:
+    """`COMPLETE` → `COMPLETE（订单已完成）`。查不到的中文注释就不加括号。"""
+    gloss = STATUS_GLOSS.get(status)
+    return f"{status}（{gloss}）" if gloss else status
 
 # 同一订单不允许同时有两个待审核的退货申请——重复提交大多是用户没看到回执，
 # 放过去就会出现两笔退款。
@@ -91,9 +122,10 @@ def create_return(order_id: str, reason: str, db: Database = None) -> dict:
     order = get_order_status(order_id, db)
 
     if order["status"] not in RETURNABLE_STATUS:
+        allowed = "、".join(describe_status(s) for s in sorted(RETURNABLE_STATUS))
         raise ReturnNotAllowed(
-            f"订单 {order_id} 当前状态是「{order['status']}」，不能申请退货"
-            f"（可申请的状态：{'、'.join(sorted(RETURNABLE_STATUS))}）"
+            f"订单 {order_id} 当前状态是「{describe_status(order['status'])}」，"
+            f"不能申请退货（可申请的状态：{allowed}）"
         )
 
     for existing in get_returns(order_id, db):

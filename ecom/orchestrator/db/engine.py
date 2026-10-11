@@ -114,6 +114,25 @@ class Database:
             count = cursor.execute(self._translate(sql), params)
             return count if isinstance(count, int) else 0
 
+    def executemany(self, sql: str, rows: list) -> int:
+        """批量写。返回提交的行数。
+
+        **不是为了少写一个 for**：`execute` 每次调用都开一条新连接、单独提交
+        （见 connect()——这是刻意的短连接设计），拿它循环灌 12 万行种子，就是
+        12 万次开库 + 12 万次提交，实测要按分钟算。executemany 是一条连接、
+        一次提交，同一批数据降到秒级。
+
+        两个后端都认 `executemany`，所以这里没有方言分支——只有 `?` -> `%s`
+        那一层翻译照旧。
+        """
+        rows = list(rows)
+        if not rows:
+            return 0
+        with self.connect() as conn:
+            cursor = conn.cursor()
+            cursor.executemany(self._translate(sql), rows)
+            return len(rows)
+
     def init_schema(self) -> None:
         """建表。**幂等**——每次启动都调它，不该有副作用。"""
         ddl = SCHEMA_PATH.read_text(encoding="utf-8")

@@ -165,10 +165,10 @@ def test_the_decision_chain_renders_a_failed_worker(app):
     main.py -v 有测试钉着，界面这份是它的第二个视图——**两边必须显示同一件事**。
     这里用一个失败的 knowledge worker 把 `错误：...` 那条支路逼出来。
     """
-    app.st.session_state["agent_history"] = [{"role": "user", "content": "订单 100002 到哪了"}]
+    app.st.session_state["agent_history"] = [{"role": "user", "content": "订单 52644 到哪了"}]
     app.st.session_state["agent_turns"] = [
         {
-            "question": "订单 100002 到哪了",
+            "question": "订单 52644 到哪了",
             "elapsed_ms": 1234,
             "final": {
                 "answer": "（假答复）",

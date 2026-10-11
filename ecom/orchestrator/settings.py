@@ -89,6 +89,11 @@ ORDER_DB_PATH = Path(os.getenv("ORDER_DB_PATH", str(DATA_DIR / "orders.sqlite"))
 # 给了 DSN 就走 MySQL（需要 uv sync --extra mysql）。两种后端跑的是同一份 schema。
 ORDER_DB_DSN = os.getenv("ORDER_DB_DSN", "")
 
+# 订单种子数据（派生产物，**进仓库**）。`derive_seed.py` 写它、`seed.py` 读它。
+# 它和 orders.sqlite 不是一回事：sqlite 是跑一次 seed 就有的运行物（已 gitignore），
+# 这两份 CSV 才是"订单数据长什么样"的唯一来源，丢了就得重新下 96MB 才能造出来。
+ORDER_SEED_DIR = DATA_DIR / "orchestrator" / "seed"
+
 # ---------------------------------------------------------------------------
 # 对外请求体上限，防止一句 10 万字把路由 prompt 撑爆
 # ---------------------------------------------------------------------------

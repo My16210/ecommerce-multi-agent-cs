@@ -5,6 +5,7 @@
 理由不只是"跑得快"：真调模型意味着测试结果随模型版本、网络、当天负载浮动，
 那样的测试没法当回归用——它昨天红今天绿，你只会学会忽略它。
 """
+import shutil
 from pathlib import Path
 
 import pytest
@@ -56,13 +57,36 @@ class ExplodingLLM:
         raise self.exc
 
 
-@pytest.fixture
-def db(tmp_path) -> Database:
-    """一个灌好种子数据的临时 SQLite，与真实 data/orders.sqlite 完全隔离。"""
-    database = Database(path=tmp_path / "orders.sqlite", dsn="")
+@pytest.fixture(scope="session")
+def _seed_template(tmp_path_factory) -> Path:
+    """
+    整个测试会话只灌一次种子库，落在会话自己的 tmp 目录里，供各测试复制。
+
+    种子换成真实的 65752 笔订单 + 62897 条物流之后，这一句 `seed()` 要读 7.8MB
+    CSV 再写 12.8 万行，约 0.5 秒。原来"每个测试各灌一遍"的写法在这里就变成了
+    纯粹的重做——本文件 29 条测试要跑 15 秒，而它们要的其实是**同一份初始状态**：
+    没有任何一条测试去改这个库的初始内容，改的都是自己往里写的那几笔。
+    """
+    path = tmp_path_factory.mktemp("order_seed") / "template.sqlite"
+    database = Database(path=path, dsn="")
     database.init_schema()
     seed(database, force=True)
-    return database
+    return path
+
+
+@pytest.fixture
+def db(tmp_path, _seed_template) -> Database:
+    """
+    一个灌好种子数据的临时 SQLite，与真实 data/orders.sqlite 完全隔离。
+
+    实现是"复制模板"，不是"各灌一遍"（见 `_seed_template`）。复制一个几 MB 的
+    库文件是毫秒级，同时**保住了每个测试拿到独立库**这件事——这一点不能丢：
+    好几条测试的断言就是"库里没多出东西"（`get_returns(...) == []`），
+    要是几条测试共用同一个库，它们会互相把对方的结果看进去，红了还找不到原因。
+    """
+    path = tmp_path / "orders.sqlite"
+    shutil.copyfile(_seed_template, path)
+    return Database(path=path, dsn="")
 
 
 @pytest.fixture(autouse=True)

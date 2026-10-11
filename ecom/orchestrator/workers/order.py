@@ -25,6 +25,7 @@ from ecom.orchestrator.tools.order_tools import (
     OrderNotFound,
     ReturnNotAllowed,
     create_return,
+    describe_status,
     get_order_status,
     list_customer_orders,
     query_order,
@@ -36,11 +37,22 @@ from ecom.orchestrator.utils.tokens import EMPTY, usage_of
 
 logger = setup_logger(__name__)
 
-# 订单号：6 位以上纯数字。太短的（如 2025）不当订单号，那多半是年份。
-_ORDER_ID = re.compile(r"(?<!\d)(\d{6,})(?!\d)")
+# 订单号：5 位以上纯数字。太短的（如 2025）不当订单号，那多半是年份。
+#
+# 【为什么是 5 位】：DataCo 的 Order Id 实测是 1~5 位（最小 1，最大 77204，不补零）。
+# 门槛只能取"最长的那个量级"——放宽到 4 位会让「2025 年买的」里的 2025 被判成订单号，
+# 那比认不出短订单号更糟。所以 1~4 位的订单号在对话里**认不出来**，这是一条已知
+# 边界（写在 README 的"明确不做"里），不是在正则里偷偷补零绕过去。
+#
+# 【为什么是 (?<!\w) 而不是原来的 (?<!\d)】：客户号是 C20755 这个形状。
+# 如果只挡"前面是数字"，`C20755` 里那串 20755 会被当成订单号——一句话里同时
+# 提到客户号和订单号时，认出来的会是客户号。挡"前面是字母或数字"才分得开。
+#
+# 【这个形状和 core/router.py 的 `_RULES` 第一条必须一致】，改一处就要改另一处。
+_ORDER_ID = re.compile(r"(?<!\w)(\d{5,})(?!\d)")
 
 # 【"我想退"和"能不能退"是两件事，写死的写操作不能靠一个"退货"关键词触发】
-# 这是真踩过的：一句「订单 100002 到哪了，顺便问下你们的退货政策是什么」，
+# 这是真踩过的：一句「订单 52644 到哪了，顺便问下你们的退货政策是什么」，
 # 因为含"退货"两个字，被判成 create_return，**真的往库里插了一条退货申请**。
 # 用户只是问政策，系统却替他办了件事——这是这个 worker 能犯的最严重的错。
 #
@@ -167,20 +179,47 @@ def extract_intent(question: str, llm=None) -> dict:
 # ---------------------------------------------------------------------------
 # 结果 → 人话
 # ---------------------------------------------------------------------------
+# 「这单没有物流」分两种，回答要说清是哪一种。DataCo 里没有运单的那批订单，
+# 配送状态一律是 Shipping canceled（见 derive_seed.py 第 5 条）——所以判断依据
+# 换成订单状态：取消/疑似欺诈的单本来就没发出去，其余是运单还没回传。
+_NO_SHIPMENT_STATUS = {"CANCELED", "SUSPECTED_FRAUD"}
+
+
+def describe_route(logistics: dict) -> str:
+    """
+    物流的起止地怎么写。**单独一个函数是因为界面也要用同一份说法**
+    （`app.py` 的订单 Tab）。
+
+    发货地为空时**不能**拼出「起点 → 目的地」：路线是两个地名之间的关系，
+    只有一头就写不出路线，只能写"目的地"。这不是显示层的将就——是数据里
+    真的没有起点，硬凑一个就是在回答里塞了一个不存在的事实。
+
+    （公开的 DataCo 数据里只有 `Order City`，那是**目的地**；没有发货地。
+     所以这条分支不是边角料，它是**常态**——每一笔订单都走这里。）
+    """
+    origin = logistics.get("from_city") or ""
+    dest = logistics.get("to_city") or ""
+    if origin and dest:
+        return f"{origin} → {dest}"
+    if dest:
+        return f"目的地 {dest}"
+    return "路线未记录"
+
+
 def _fmt_tracking(data: dict, order_id: str) -> str:
     order, logistics = data["order"], data["logistics"]
     if not logistics:
-        return (
-            f"订单 {order_id} 目前状态是「{order['status']}」，还没有物流信息——"
-            f"{'订单尚未发货' if order['status'] in {'已下单', '已取消'} else '运单信息还没回传'}。"
-        )
+        status = describe_status(order["status"])
+        reason = "订单已取消，配送没有发生" if order["status"] in _NO_SHIPMENT_STATUS \
+            else "运单信息还没回传"
+        return f"订单 {order_id} 目前状态是「{status}」，没有物流信息——{reason}。"
 
-    # carrier / tracking_no 允许为空，而且**不是"数据没灌全"**：公开数据集里根本
-    # 没有这两项（承运商和运单号是快递公司的私有数据）。seed 如实留空，不编一个假的。
+    # carrier / tracking_no / from_city 允许为空，而且**不是"数据没灌全"**：
+    # 公开数据集里根本没有这三项（承运商和运单号是快递公司的私有数据；连"发货地"
+    # 都没有，只有目的地）。seed 如实留空，不编一个假的。
     #
     # 所以这里必须有分支：漏了它，回答里会出现「承运商 None，运单号 None」——
     # 比不显示更糟，它看起来像系统坏了，而不是"我们本来就没有这个信息"。
-    # 空值有两种走法（有物流没承运商 / 只有承运商没单号），一并处理。
     carrier = logistics.get("carrier") or ""
     tracking_no = logistics.get("tracking_no") or ""
     if carrier and tracking_no:
@@ -190,17 +229,24 @@ def _fmt_tracking(data: dict, order_id: str) -> str:
     else:
         head = f"订单 {order_id} 的物流："
 
+    # 起止地的写法抽到 describe_route 里了——界面要显示同一件事，两处各写一遍
+    # 迟早在某一种组合上分叉（这里三种情况，手抄一遍就是六个分支要同步）。
+    route = describe_route(logistics)
     return (
-        f"{head}{logistics['from_city']} → {logistics['to_city']}，"
-        f"当前「{logistics['status']}」，最近更新 {logistics['updated_at']}。"
+        f"{head}{route}，当前「{logistics['status']}」，最近更新 {logistics['updated_at']}。"
     )
 
 
 def _fmt_status(order: dict) -> str:
+    # 支付时间只在**有值**时才说。旧版这里是
+    #   ... if order['paid_at'] else '（未支付）'
+    # 换数据之后这个分支变成假话：DataCo 里没有支付时间这一列，`paid_at` 为空
+    # 表示的是"数据集没有这个字段"，而不是"这笔订单没付钱"。一句话里的空值
+    # 有两种含义，就不能用同一个说法兜——所以空着不说，比说错强。
+    paid = f"，支付时间 {order['paid_at']}" if order.get("paid_at") else ""
     return (
-        f"订单 {order['order_id']}：状态「{order['status']}」，"
-        f"金额 ￥{order['amount']:.2f}，下单时间 {order['created_at']}"
-        f"{'，支付时间 ' + order['paid_at'] if order['paid_at'] else '（未支付）'}。"
+        f"订单 {order['order_id']}：状态「{describe_status(order['status'])}」，"
+        f"金额 ￥{order['amount']:.2f}，下单时间 {order['created_at']}{paid}。"
     )
 
 
@@ -249,7 +295,7 @@ def run_order(question: str, chat_history: list = None) -> dict:
     # 挡下来的代价是多问一句；放过去的代价是替用户提了一个他没提的申请。
     #
     # 下面第二个分支把它顺带用在了"认不出动作、但明显在问退货"的情况上：
-    # 「订单 100002 能不能退」用一句"没有明确的订单操作"回，等于把球扔回给用户；
+    # 「订单 52644 能不能退」用一句"没有明确的订单操作"回，等于把球扔回给用户；
     # 直接告诉他"你是想问规则，还是要办"，他下一句就能接上。
     if action == "create_return" and policy_question(question):
         return _ask_before_writing(order_id, intent, tokens)
@@ -258,7 +304,7 @@ def run_order(question: str, chat_history: list = None) -> dict:
             return _ask_before_writing(order_id, intent, tokens)
         return {
             "answer": "这句话里没有明确的订单操作（查物流 / 查状态 / 申请退货）。"
-                      "可以试试直接说订单号，例如「订单 100002 到哪了」。",
+                      "可以试试直接说订单号，例如「订单 52644 到哪了」。",
             "insufficient": True,
             "data": {"intent": intent},
             "tokens": tokens,
@@ -266,7 +312,7 @@ def run_order(question: str, chat_history: list = None) -> dict:
 
     if action in {"tracking", "status", "create_return"} and not order_id:
         return {
-            "answer": "请提供订单号，例如「订单 100002 到哪了」。",
+            "answer": "请提供订单号，例如「订单 52644 到哪了」。",
             "insufficient": True,
             "data": {"intent": intent},
             "tokens": tokens,
@@ -322,7 +368,19 @@ def _guess_customer(question: str) -> str:
     """
     从话里猜客户号。**这是 demo 的将就**：真系统里客户身份来自登录态，
     绝不从自然语言里猜——那等于让任何人问出别人的订单。
-    这里只在同一句话里显式写了 C001 这种编号时才认，认不出就用演示账号。
+    这里只在同一句话里显式写了 C9995 这种编号时才认，认不出就用演示账号。
+
+    【为什么是 `(?<![A-Za-z0-9])` 而不是 `\\b`】
+    中文和编号之间没有空格：「客户C9995的订单」是最自然的写法，而中文汉字在
+    Python 的 `re` 里算 word 字符，`户` 和 `C` 之间**没有**词边界，`\\b` 会直接
+    认不出来。改成"前面不是字母数字"就两种写法都能认。
+
+    【为什么客户号带 C 前缀】
+    DataCo 的订单号和客户号都是纯数字，不加前缀的话「订单 37570」和「客户 37570」
+    是同一个字符串，规则层没法区分。前缀是派生时加的展示编码，不是原始字段——
+    见 derive_seed.py 第 2 条。
     """
-    match = re.search(r"\b(C\d{3,})\b", question, re.IGNORECASE)
-    return match.group(1).upper() if match else "C001"
+    match = re.search(r"(?<![A-Za-z0-9])(C\d{3,})(?!\d)", question, re.IGNORECASE)
+    # 认不出就用演示账号。C9995 是演示订单 52644 的客户：默认值必须是**库里真实
+    # 存在的**客户号，否则「我的订单」永远回一句"没有查询到订单"，看起来像坏了。
+    return match.group(1).upper() if match else "C9995"

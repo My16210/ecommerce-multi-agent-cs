@@ -8,7 +8,7 @@ from tests.orchestrator.conftest import ExplodingLLM, FakeLLM
 def workers(order=None, knowledge=None, analytics=None):
     """三个都塞满——留空的那个会被 base 走真注册表，测试就跑去连真库了。"""
     return {
-        "order": order or (lambda q, h: {"answer": "订单结论", "sources": ["100002"]}),
+        "order": order or (lambda q, h: {"answer": "订单结论", "sources": ["52644"]}),
         "knowledge": knowledge or (lambda q, h: {"answer": "知识库结论", "sources": ["faq.md"]}),
         "analytics": analytics or (lambda q, h: {"answer": "数据分析结论", "sources": ["sales.csv"]}),
     }
@@ -23,7 +23,7 @@ def plan_json(*plans):
 # ---------------------------------------------------------------------------
 def test_two_workers_run_in_one_round_and_get_merged():
     final = answer(
-        "订单 100002 到哪了，顺便问下退货政策",
+        "订单 52644 到哪了，顺便问下退货政策",
         workers=workers(),
         router_llm=FakeLLM('{"workers": ["order", "knowledge"], "confidence": 1.0}'),
         synth_llm=FakeLLM("合并后的答复"),
@@ -37,7 +37,7 @@ def test_two_workers_run_in_one_round_and_get_merged():
 
 def test_workers_outside_the_plan_are_not_called_at_all():
     final = answer(
-        "订单 100002 到哪了",
+        "订单 52644 到哪了",
         workers=workers(),
         router_llm=FakeLLM('{"workers": ["order"], "confidence": 1.0}'),
         record=False,
@@ -51,7 +51,7 @@ def test_a_crashing_worker_becomes_a_footnote_not_a_500():
         raise RuntimeError("数据库文件被删了")
 
     final = answer(
-        "订单 100002 到哪了，顺便问下退货政策",
+        "订单 52644 到哪了，顺便问下退货政策",
         workers=workers(order=boom),
         router_llm=FakeLLM('{"workers": ["order", "knowledge"], "confidence": 1.0}'),
         synth_llm=FakeLLM("合并后的答复"),
@@ -131,11 +131,11 @@ def test_results_do_not_leak_from_one_round_into_the_next():
 # 兜底：模型这条路整个不可用时，图还能不能跑通
 # ---------------------------------------------------------------------------
 def test_the_whole_graph_still_works_with_the_model_layer_dead():
-    # 路由挂 → 关键词规则接住（"100002" 是强信号）；只有一个 worker 出结论
+    # 路由挂 → 关键词规则接住（"52644" 是强信号）；只有一个 worker 出结论
     # → 汇总不调模型。所以两个模型角色全挂，链路依然是通的。
     dead = ExplodingLLM()
     final = answer(
-        "订单 100002 到哪了",
+        "订单 52644 到哪了",
         workers=workers(),
         router_llm=dead,
         synth_llm=dead,
@@ -157,7 +157,7 @@ def test_an_empty_question_still_terminates_with_something_to_say():
 # ---------------------------------------------------------------------------
 def test_tokens_cover_router_workers_and_synthesis():
     final = answer(
-        "订单 100002 到哪了，顺便问下退货政策",
+        "订单 52644 到哪了，顺便问下退货政策",
         workers=workers(),
         router_llm=FakeLLM('{"workers": ["order", "knowledge"], "confidence": 1.0}'),
         synth_llm=FakeLLM("合并后的答复"),
@@ -176,7 +176,7 @@ def test_one_request_writes_exactly_one_trace_line():
     from ecom.orchestrator.utils import trace
 
     final = answer(
-        "订单 100002 到哪了",
+        "订单 52644 到哪了",
         workers=workers(),
         router_llm=FakeLLM('{"workers": ["order"], "confidence": 1.0}'),
     )

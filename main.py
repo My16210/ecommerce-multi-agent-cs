@@ -1,7 +1,7 @@
 """
 命令行入口。三种用法：
 
-    uv run python main.py "订单 100002 到哪了"        # 问一句
+    uv run python main.py "订单 52644 到哪了"        # 问一句
     uv run python main.py                            # 交互模式（多轮）
     uv run python main.py --init-db                  # 重建订单库
 

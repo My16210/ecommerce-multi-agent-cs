@@ -48,17 +48,17 @@ def test_ok_but_silent_result_counts_as_thin_not_as_usable():
 def test_single_conclusion_never_calls_the_model():
     # 没东西可合并时调模型 = 凭空多一次幻觉机会、零信息增益。
     exploding = ExplodingLLM()
-    result = agg.aggregate(state(results=[usable("order", "订单 100002 已签收")]), llm=exploding)
-    assert result["answer"] == "订单 100002 已签收"
+    result = agg.aggregate(state(results=[usable("order", "订单 52644 已签收")]), llm=exploding)
+    assert result["answer"] == "订单 52644 已签收"
     assert result["synth_source"] == "concat"
     assert exploding.calls == 0
 
 
 def test_two_conclusions_are_merged_by_the_model():
-    llm = FakeLLM("订单 100002 已签收。退货政策方面，七天无理由。")
+    llm = FakeLLM("订单 52644 已签收。退货政策方面，七天无理由。")
     result = agg.aggregate(state(results=[usable("order"), usable("knowledge")]), llm=llm)
     assert result["synth_source"] == "llm"
-    assert result["answer"].startswith("订单 100002")
+    assert result["answer"].startswith("订单 52644")
     assert llm.call_count == 1
 
 
@@ -78,10 +78,10 @@ def test_merge_falls_back_when_the_model_returns_an_empty_body():
 
 def test_sources_are_deduped_but_keep_their_order():
     result = agg.aggregate(
-        state(results=[usable("order", sources=["100002", "100003"]), usable("knowledge", sources=["100002"])]),
+        state(results=[usable("order", sources=["52644", "100003"]), usable("knowledge", sources=["52644"])]),
         llm=ExplodingLLM(),
     )
-    assert result["sources"] == ["100002", "100003"]
+    assert result["sources"] == ["52644", "100003"]
 
 
 # ---------------------------------------------------------------------------
@@ -89,11 +89,11 @@ def test_sources_are_deduped_but_keep_their_order():
 # ---------------------------------------------------------------------------
 def test_a_broken_worker_does_not_kill_the_answer():
     result = agg.aggregate(
-        state(results=[usable("order", "订单 100002 已签收"), broken("analytics")]),
+        state(results=[usable("order", "订单 52644 已签收"), broken("analytics")]),
         llm=ExplodingLLM(),
     )
     assert result["decision"] == "answer"
-    assert "订单 100002 已签收" in result["answer"]
+    assert "订单 52644 已签收" in result["answer"]
     # 用户看到的是人话，不是异常原文——异常原文等于把内部结构报给外面
     assert "RuntimeError" not in result["answer"]
     assert "数据分析这块暂时跑不了" in result["answer"]

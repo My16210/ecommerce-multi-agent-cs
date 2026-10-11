@@ -53,10 +53,29 @@ def test_parse_reports_failure_without_raising():
 # 规则兜底
 # ---------------------------------------------------------------------------
 def test_rules_pick_up_order_id_and_multi_intent():
-    assert _rule_route("订单 100002 到哪了") == ["order"]
-    plan = _rule_route("订单 100002 到哪了，顺便问下退货政策")
+    assert _rule_route("订单 52644 到哪了") == ["order"]
+    plan = _rule_route("订单 52644 到哪了，顺便问下退货政策")
     assert set(plan) == {"order", "knowledge"}
     assert _rule_route("哪个地区卖得最好") == ["analytics"]
+
+
+def test_the_order_id_rule_matches_the_five_digit_ids_we_actually_have():
+    """裸订单号（一个关键词都没有）也要能路由到 order。
+
+    这条守的是**路由层和抽取层对"订单号是几位"的理解必须一致**。DataCo 的订单号
+    最大 77204，只有 5 位；而这条规则原来是 `\\d{6,}`——对真实订单**一笔都命中
+    不了**，同时会把发票号、长流水号这种 6 位以上的数字路由成"查订单"。最麻烦的
+    是两处各自看都"对"：路由认得出的，抽取层认不出。见 workers/order.py 的 `_ORDER_ID`。
+
+    代价也记在这里：门槛定在 5 位，12 位的发票号会被顺带路由到 order。它属于
+    "宁可多问一次"的方向——order worker 查不到会说"查不到订单号 XXX"，
+    而不是给出一个错的答案。
+    """
+    assert _rule_route("52644") == ["order"]
+    # 4 位不行：那多半是年份。"2025 年买的还能退吗"里没有订单号。
+    assert _rule_route("2025") == []
+    # 客户号是 C 开头，不该被当成订单号（路由和抽取两层的 `(?<!\\w)` 是同一个理由）
+    assert _rule_route("客户C20755") == []
 
 
 def test_rules_stay_silent_on_small_talk():

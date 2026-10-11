@@ -1,72 +1,97 @@
 """
-造模拟订单数据。
+把订单种子数据灌进订单库。
 
-**数据是写死的常量，不是随机生成的。** 理由：demo 和测试要的是同一份数据，
-随机（哪怕固定种子）会让"这条断言为什么是这个值"变成一道推理题；
-而写死之后，测试里可以直接写 `assert amount == 299.0`，一眼能看懂。
-代价是加一条订单要手动敲——20 条的量级，值。
+**数据不再是这个文件里的一串常量**，而是两份派生出来的 CSV：
 
-订单号用 6 位纯数字：够短，好念，而且命中 order worker 里 `\\d{6,}` 的订单号正则。
-真上线订单号是另一套编码，但那是接真库时换正则的事，不是这里的事。
+    data/orchestrator/seed/orders.csv      65752 笔订单
+    data/orchestrator/seed/logistics.csv   62897 条物流
+
+它们由 `ecom/orchestrator/db/derive_seed.py` 从 DataCo 公开数据集派生（那个
+脚本的模块开头写着每一条派生规则和它的理由：为什么订单号不补零、为什么客户号
+加 C 前缀、为什么 `paid_at` 一律为空、为什么"配送已取消"的订单没有物流行）。
+
+【从"手写 20 条"换成"派生 6.5 万条"，换掉的到底是什么】
+
+手写常量的好处是看得见——`assert amount == 299.0` 一眼就懂。但它有个说不出口的
+毛病：**它只证明了代码能处理我编出来的那种订单**。真实订单长什么样（订单号几位、
+状态有几种、物流缺哪几项），手写数据一个都答不上来。换成派生之后，测试里的断言
+仍然要写具体值（`assert amount == 327.75` 还是能一眼看懂），但那个值是**从真实
+数据里来的**，不是我想出来的。
+
+代价也得说清楚：种子数据不再是"随便改一个数字就行的文件"。改一个字段，这个文件
+不报错，改的是派生脚本 + 重跑 + 重新提交 CSV。这是"数据有出处"要付的钱。
+
+【为什么灌库要幂等，以及幂等的方式】
+
+演示第一步就是查单，而 clone 下来的人是空库。所以 `run_order` 开头会补一次
+`seed()`——它必须幂等，否则每问一句就往库里插一遍。
+
+幂等靠"看表空不空"，不是 `INSERT OR REPLACE`：后者的 SQLite / MySQL 写法不同
+（`INSERT OR REPLACE` vs `REPLACE INTO`），又会把一处方言差异漏进来。演示数据
+不需要增量更新，判空足够。
 """
+import csv
 from datetime import datetime
+from pathlib import Path
 
 from ecom.orchestrator.db.engine import Database, get_db
+from ecom.orchestrator.settings import ORDER_SEED_DIR
 
-ORDERS = [
-    # order_id, customer_id, 姓名, 状态, 金额, 地区, 下单时间, 支付时间
-    ("100001", "C001", "张伟", "已签收", 299.0, "华东", "2025-09-02 10:12", "2025-09-02 10:15"),
-    ("100002", "C001", "张伟", "运输中", 159.0, "华东", "2025-09-18 21:03", "2025-09-18 21:05"),
-    ("100003", "C002", "李娜", "已发货", 89.0, "华北", "2025-09-19 09:41", "2025-09-19 09:42"),
-    ("100004", "C002", "李娜", "已签收", 1299.0, "华北", "2025-08-27 14:20", "2025-08-27 14:22"),
-    ("100005", "C003", "王强", "已取消", 45.0, "华南", "2025-09-11 16:50", None),
-    ("100006", "C003", "王强", "已签收", 620.0, "华南", "2025-08-15 11:07", "2025-08-15 11:09"),
-    ("100007", "C004", "赵敏", "已下单", 78.0, "西南", "2025-09-20 08:30", "2025-09-20 08:31"),
-    ("100008", "C004", "赵敏", "已签收", 234.5, "西南", "2025-07-30 19:55", "2025-07-30 19:58"),
-    ("100009", "C005", "陈刚", "运输中", 1899.0, "华东", "2025-09-17 13:12", "2025-09-17 13:14"),
-    ("100010", "C005", "陈刚", "已签收", 56.0, "华东", "2025-08-05 10:00", "2025-08-05 10:02"),
-    ("100011", "C006", "刘洋", "已发货", 349.0, "华中", "2025-09-19 17:44", "2025-09-19 17:45"),
-    ("100012", "C006", "刘洋", "已签收", 99.0, "华中", "2025-09-01 12:33", "2025-09-01 12:35"),
-    ("100013", "C007", "孙丽", "已签收", 458.0, "东北", "2025-08-22 15:16", "2025-08-22 15:20"),
-    ("100014", "C007", "孙丽", "已取消", 120.0, "东北", "2025-09-06 09:09", None),
-    ("100015", "C008", "周杰", "运输中", 799.0, "西北", "2025-09-18 20:41", "2025-09-18 20:43"),
-    ("100016", "C008", "周杰", "已签收", 30.0, "西北", "2025-07-19 08:12", "2025-07-19 08:13"),
-    ("100017", "C009", "吴敏", "已发货", 129.0, "华东", "2025-09-20 07:05", "2025-09-20 07:06"),
-    ("100018", "C009", "吴敏", "已签收", 2680.0, "华东", "2025-08-11 22:10", "2025-08-11 22:12"),
-    ("100019", "C010", "郑凯", "已签收", 175.0, "华南", "2025-08-30 18:20", "2025-08-30 18:21"),
-    ("100020", "C010", "郑凯", "运输中", 560.0, "华南", "2025-09-19 11:11", "2025-09-19 11:12"),
-]
+ORDERS_CSV = Path(ORDER_SEED_DIR) / "orders.csv"
+LOGISTICS_CSV = Path(ORDER_SEED_DIR) / "logistics.csv"
 
-# 只给"已发货/运输中/已签收"的订单配物流——未发货和已取消的订单本来就没有运单，
-# 这不是数据缺失，是业务事实。worker 遇到这类订单要能正确地说"还没发货"。
-LOGISTICS = {
-    "100001": ("顺丰", "SF1234567890", "郑州", "上海", "已签收", "2025-09-05 14:20"),
-    "100002": ("中通", "ZT9988776655", "郑州", "上海", "派送中", "2025-09-20 09:10"),
-    "100003": ("圆通", "YT5566778899", "武汉", "北京", "运输中", "2025-09-20 06:30"),
-    "100004": ("顺丰", "SF2233445566", "武汉", "北京", "已签收", "2025-08-30 10:05"),
-    "100006": ("韵达", "YD1122334455", "广州", "深圳", "已签收", "2025-08-18 16:41"),
-    "100008": ("申通", "ST7788990011", "成都", "重庆", "已签收", "2025-08-02 12:18"),
-    "100009": ("顺丰", "SF3344556677", "杭州", "南京", "运输中", "2025-09-20 08:55"),
-    "100010": ("中通", "ZT4455667788", "杭州", "合肥", "已签收", "2025-08-08 09:33"),
-    "100011": ("圆通", "YT6677889900", "长沙", "武汉", "运输中", "2025-09-20 07:40"),
-    "100012": ("韵达", "YD2233445566", "长沙", "南昌", "已签收", "2025-09-04 11:02"),
-    "100013": ("顺丰", "SF8899001122", "沈阳", "大连", "已签收", "2025-08-25 15:50"),
-    "100015": ("中通", "ZT1231231234", "西安", "兰州", "运输中", "2025-09-20 05:20"),
-    "100016": ("申通", "ST4564564567", "西安", "银川", "已签收", "2025-07-22 10:07"),
-    "100017": ("圆通", "YT7897897890", "上海", "杭州", "运输中", "2025-09-20 06:00"),
-    "100018": ("顺丰", "SF6546546543", "上海", "苏州", "已签收", "2025-08-14 09:00"),
-    "100019": ("韵达", "YD3213213210", "广州", "佛山", "已签收", "2025-09-02 14:30"),
-    "100020": ("中通", "ZT6549873210", "广州", "东莞", "运输中", "2025-09-20 07:15"),
-}
+# 列顺序就是 CSV 的表头顺序（derive_seed.py 里的 ORDER_COLUMNS / LOGISTICS_COLUMNS）。
+# 两边各写一遍是有意的：这里显式列出 INSERT 的列名，改 CSV 的列序不会**悄悄**
+# 把姓名灌进状态列——SQLite 会照灌不误，而且类型都不冲突，看不出错。
+ORDER_COLUMNS = ("order_id", "customer_id", "customer_name", "status",
+                 "amount", "region", "created_at", "paid_at")
+LOGISTICS_COLUMNS = ("order_id", "carrier", "tracking_no", "from_city", "to_city",
+                     "status", "updated_at")
+
+ORDER_INSERT = (
+    "INSERT INTO orders "
+    "(order_id, customer_id, customer_name, status, amount, region, created_at, paid_at) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+)
+LOGISTICS_INSERT = (
+    "INSERT INTO logistics "
+    "(order_id, carrier, tracking_no, from_city, to_city, status, updated_at) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?)"
+)
+
+# 这几列在 CSV 里是空字符串，进库要变成 NULL。
+# **不能直接灌空字符串**：`paid_at` 空串在 SQLite 里是真值判定的边界（"空字符串"
+# 和"没有这个值"在 SQL 里是两个意思），而下游 `_fmt_status` 正是靠它判断要不要
+# 显示支付时间。派生出来的空是"数据里没有这一项"，语义上就是 NULL。
+NULLABLE = {"paid_at", "carrier", "tracking_no", "from_city"}
+
+
+def read_rows(path: Path, columns: tuple) -> list:
+    """读 CSV，返回按 columns 排好的 tuple 列表（直接喂给 executemany）。"""
+    with open(path, encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        rows = []
+        for raw in reader:
+            values = []
+            for column in columns:
+                value = (raw.get(column) or "").strip()
+                if column in NULLABLE and not value:
+                    values.append(None)
+                elif column == "amount":
+                    # 列是 REAL，显式转成 float 而不是把字符串交给 SQLite 的
+                    # 类型亲和性去猜——猜对了是运气，猜错了是"金额按字符串排序"。
+                    values.append(float(value))
+                else:
+                    values.append(value)
+            rows.append(tuple(values))
+        return rows
 
 
 def seed(db: Database = None, force: bool = False) -> int:
     """
-    灌入模拟数据。**幂等**：表里已有数据就直接返回，除非 force=True。
+    灌入订单种子数据，返回写入的订单数。**幂等**：表里已有数据就直接返回 0。
 
-    幂等的方式是"看表空不空"，不是 `INSERT OR REPLACE`——后者的 SQLite / MySQL
-    写法不同（`INSERT OR REPLACE` vs `REPLACE INTO`），又会把一处方言差异漏进来。
-    演示数据不需要增量更新，判空足够。
+    force=True 时先清空再灌（同时清掉退货申请——它挂在订单上，留着就是悬空引用）。
     """
     db = db or get_db()
     db.init_schema()
@@ -80,30 +105,30 @@ def seed(db: Database = None, force: bool = False) -> int:
         db.execute("DELETE FROM orders")
         db.execute("DELETE FROM return_requests")
 
-    for row in ORDERS:
-        db.execute(
-            "INSERT INTO orders "
-            "(order_id, customer_id, customer_name, status, amount, region, created_at, paid_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            row,
-        )
+    orders = read_rows(ORDERS_CSV, ORDER_COLUMNS)
+    logistics = read_rows(LOGISTICS_CSV, LOGISTICS_COLUMNS)
 
-    for order_id, (carrier, tracking_no, from_city, to_city, status, updated_at) in LOGISTICS.items():
-        db.execute(
-            "INSERT INTO logistics "
-            "(order_id, carrier, tracking_no, from_city, to_city, status, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (order_id, carrier, tracking_no, from_city, to_city, status, updated_at),
-        )
+    # 先灌订单再灌物流：logistics.order_id 指向订单，顺序反了在开了外键约束的
+    # 后端上会直接失败（现在两份 schema 都没声明外键，但顺序按依赖来不花钱）。
+    db.executemany(ORDER_INSERT, orders)
+    db.executemany(LOGISTICS_INSERT, logistics)
 
-    return len(ORDERS)
+    return len(orders)
 
 
 def main() -> None:
     db = get_db()
     inserted = seed(db, force=True)
-    print(f"订单库已重建：{db.path if db.backend == 'sqlite' else 'MySQL'}")
+    where = db.path if db.backend == "sqlite" else "MySQL"
+    print(f"订单库已重建：{where}")
     print(f"  订单 {inserted} 条，物流 {db.count('logistics')} 条")
+    print(f"  没有物流的订单 {inserted - db.count('logistics')} 条"
+          f"（配送状态为 Shipping canceled，不是数据缺失）")
+    rows = db.query("SELECT order_id, customer_name, status FROM orders "
+                    "WHERE order_id = '52644'")
+    if rows:
+        r = rows[0]
+        print(f"  演示订单：{r['order_id']} {r['customer_name']} {r['status']}")
     print(f"  时间戳示例：{datetime.now():%Y-%m-%d %H:%M:%S}")
 
 

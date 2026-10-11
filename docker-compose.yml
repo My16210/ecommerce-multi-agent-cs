@@ -10,11 +10,11 @@
 #     docker compose --profile milvus up -d
 #
 # 首次跑要点一次库和一次入库（都复用同一个镜像，跑完即弃）：
-#     docker compose run --rm app python main.py --init-db                  # 20 笔订单
+#     docker compose run --rm app python main.py --init-db                  # 65752 笔订单
 #     docker compose run --rm app python -m ecom.knowledge.cli.ingest       # 建向量库
 #
 # 其它常用的一次性命令：
-#     docker compose run --rm app python main.py "订单 100002 到哪了" -v    # 命令行问答
+#     docker compose run --rm app python main.py "订单 52644 到哪了" -v     # 命令行问答
 #     docker compose run --rm app python -m ecom.knowledge.cli.review list  # 人审队列
 #     docker compose run --rm app python -m ecom.analytics.cli.main         # 数据分析单跑
 #

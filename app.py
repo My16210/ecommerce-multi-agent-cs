@@ -52,8 +52,14 @@ from ecom.orchestrator.core.aggregate import WORKER_LABELS
 from ecom.orchestrator.core.supervisor import answer
 from ecom.orchestrator.db.engine import get_db
 from ecom.orchestrator.settings import MAX_ROUNDS, WORKER_TIMEOUT
-from ecom.orchestrator.tools.order_tools import OrderNotFound, get_returns, query_order
+from ecom.orchestrator.tools.order_tools import (
+    OrderNotFound,
+    describe_status,
+    get_returns,
+    query_order,
+)
 from ecom.orchestrator.workers.analytics import run_analytics
+from ecom.orchestrator.workers.order import describe_route
 
 st.set_page_config(page_title="多 Agent 电商智能客服", page_icon="🛒", layout="wide")
 
@@ -217,33 +223,46 @@ def render_order_tab() -> None:
     order, logistics = detail["order"], detail["logistics"]
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("状态", order["status"])
-    c2.metric("金额", f"￥{order['amount']}")
+    # 状态用 describe_status 带上中文注释：库里存的是 COMPLETE / PENDING_PAYMENT
+    # 这种英文原值（见 order_tools.STATUS_GLOSS），给演示的人看纯英文会以为没翻译完。
+    c1.metric("状态", describe_status(order["status"]))
+    # 金额一律 .2f：数据库里是 REAL，直接 f-string 会打出 629.9200000000001 这种
+    # 东西。worker 那边的回答已经格式化过了，界面不跟着做就会两边不一致。
+    c2.metric("金额", f"￥{order['amount']:.2f}")
     c3.metric("客户", order.get("customer_name") or "-")
     c4.metric("地区", order.get("region") or "-")
 
+    # [这里原来写的是 `if paid_at else '（未支付）'`] 换成真实数据后这是**假话**：
+    # DataCo 里根本没有支付时间这一列，`paid_at` 为空表示"数据集没有这个字段"，
+    # 不是"这笔订单没付钱"。同一句话里的空值有两种含义就不能用同一个说法兜——
+    # 空着不说，比说错强。（worker 那边的 `_fmt_status` 是同一个道理，两处一致。）
     st.caption(
         f"下单 {order.get('created_at')}"
-        + (f"　支付 {order.get('paid_at')}" if order.get("paid_at") else "　（未支付）")
+        + (f"　支付 {order.get('paid_at')}" if order.get("paid_at") else "")
     )
 
     st.divider()
     st.subheader("物流")
     if not logistics:
-        # "没有物流"有两种：还没发货，或者这一单不发货。这里不猜是哪种——
-        # 只有订单状态能说明，而那已经显示在上面了。
-        st.info("这单还没有物流记录")
-    else:
-        # 时间线按业务顺序展示。库里只有一行当前状态（没有轨迹表），所以这里
-        # **不画进度条**：画一个凭 status 推出来的四段进度，看起来更漂亮，
-        # 但那是在数据没有的粒度上伪造信息。
-        st.markdown(
-            f"**{logistics.get('carrier') or '（承运商未知）'}**　"
-            f"运单号 `{logistics.get('tracking_no') or '-'}`"
+        st.info("这单没有物流记录")
+        st.caption(
+            "订单状态为 CANCELED / SUSPECTED_FRAUD 的订单本来就没有发货，"
+            "不是数据缺失。（公开数据集里没有运单表，只有配送状态。）"
         )
+    else:
+        # 库里只有一行当前状态（没有轨迹表），所以这里**不画进度条**：画一个凭
+        # status 推出来的四段进度，看起来更漂亮，但那是在数据没有的粒度上伪造信息。
+        #
+        # 承运商 / 运单号 / 发货地在公开数据里**根本不存在**，所以"没有"是常态。
+        # 原来这里写的是「（承运商未知）　运单号 -」，对每一笔订单都成立——
+        # 满屏的"未知"读起来像系统坏了，而不是"我们本来就没有这个信息"。有的才显示。
+        if logistics.get("carrier") or logistics.get("tracking_no"):
+            st.markdown(
+                f"**{logistics.get('carrier') or '承运商未记录'}**　"
+                f"运单号 `{logistics.get('tracking_no') or '-'}`"
+            )
         st.markdown(
-            f"{logistics.get('from_city') or '?'} → {logistics.get('to_city') or '?'}　"
-            f"当前：**{logistics.get('status') or '-'}**"
+            f"{describe_route(logistics)}　当前：**{logistics.get('status') or '-'}**"
         )
         st.caption(f"最后更新 {logistics.get('updated_at') or '-'}")
 
