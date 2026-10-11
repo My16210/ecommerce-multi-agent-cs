@@ -174,9 +174,24 @@ def _fmt_tracking(data: dict, order_id: str) -> str:
             f"订单 {order_id} 目前状态是「{order['status']}」，还没有物流信息——"
             f"{'订单尚未发货' if order['status'] in {'已下单', '已取消'} else '运单信息还没回传'}。"
         )
+
+    # carrier / tracking_no 允许为空，而且**不是"数据没灌全"**：公开数据集里根本
+    # 没有这两项（承运商和运单号是快递公司的私有数据）。seed 如实留空，不编一个假的。
+    #
+    # 所以这里必须有分支：漏了它，回答里会出现「承运商 None，运单号 None」——
+    # 比不显示更糟，它看起来像系统坏了，而不是"我们本来就没有这个信息"。
+    # 空值有两种走法（有物流没承运商 / 只有承运商没单号），一并处理。
+    carrier = logistics.get("carrier") or ""
+    tracking_no = logistics.get("tracking_no") or ""
+    if carrier and tracking_no:
+        head = f"订单 {order_id} 的物流：{carrier}，运单号 {tracking_no}，"
+    elif carrier:
+        head = f"订单 {order_id} 的物流：{carrier}，"
+    else:
+        head = f"订单 {order_id} 的物流："
+
     return (
-        f"订单 {order_id} 的物流：{logistics['carrier']}，运单号 {logistics['tracking_no']}，"
-        f"{logistics['from_city']} → {logistics['to_city']}，"
+        f"{head}{logistics['from_city']} → {logistics['to_city']}，"
         f"当前「{logistics['status']}」，最近更新 {logistics['updated_at']}。"
     )
 

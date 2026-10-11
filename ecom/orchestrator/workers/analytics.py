@@ -99,7 +99,9 @@ def run_analytics(question: str, chat_history: list = None) -> dict:
     return {
         "answer": report,
         "insufficient": not report.strip(),
-        "sources": ["sales.csv（模拟销售数据）"],
+        # 来源标签由子进程从**当前数据集自己的 NOTES.md** 里带出来，不在这里写死。
+        # 写死的话，换数据集时这个回答底下会一直挂着旧数据集的名字，还不报错。
+        "sources": [payload.get("source_label") or "数据分析"],
         "tokens": payload.get("tokens") or {"in": 0, "out": 0},
         "elapsed_ms": payload.get("elapsed_ms"),
         "data": {

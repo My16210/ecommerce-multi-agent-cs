@@ -62,6 +62,10 @@ def main() -> int:
             "chart_generated": bool(result.get("chart_generated")),
             # 审查有没有真的通过，要如实带出去——报告里可能已标注了风险
             "review_passed": bool(result.get("review_passed")),
+            # 数据来源标签也要带出去：上层 worker 把它写进回答的 sources。
+            # 原先 worker 那边写死的是「sales.csv（模拟销售数据）」，换数据集之后
+            # 那句话就成了假的，而且不报错——回答底下挂着一个不对的来源。
+            "source_label": result.get("dataset_label") or result.get("dataset_name") or "",
             "tokens": {
                 "in": int(result.get("deepseek_prompt_tokens", 0))
                 + int(result.get("qwen_prompt_tokens", 0)),
