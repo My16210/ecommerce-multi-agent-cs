@@ -52,9 +52,28 @@ def describe_status(status: str) -> str:
     gloss = STATUS_GLOSS.get(status)
     return f"{status}（{gloss}）" if gloss else status
 
-# 同一订单不允许同时有两个待审核的退货申请——重复提交大多是用户没看到回执，
-# 放过去就会出现两笔退款。
+# ——— 退货申请的状态 ———
+#
+# 这三个值是**中文**，和上面那 9 个英文状态是两个方向，理由写在 schema.sql：
+# `orders.status` 的读者是代码和模型，它是数据源原值，改一个就多一个没有依据的
+# 映射；退货状态是我们自己造的、读者是人（后台界面、给用户的话术）。
+# 一句话：**数据源给的字段保留原值，我们自己造的状态用中文。**
+#
+# 这里是取值域的**唯一来源**。审核那边（ecom/orchestrator/admin/returns.py）
+# 从这里 import，不在那边再抄一份——两份状态清单只会在"加一个状态"时漂。
 OPEN_RETURN_STATUS = "待审核"
+APPROVED_RETURN_STATUS = "已通过"
+REJECTED_RETURN_STATUS = "已拒绝"
+RETURN_STATUSES = (OPEN_RETURN_STATUS, APPROVED_RETURN_STATUS, REJECTED_RETURN_STATUS)
+
+# 挡住重复申请的两种状态。**"已通过"必须也在里面，而且它是最要紧的一个**：
+# 审完之后这笔申请已经不是"待审核"了，如果只比 待审核，同一笔订单就能被再申请
+# 一次——放过去就是**两笔退款**，而且是在"看起来一切正常"的情况下发生的。
+#
+# **"已拒绝"刻意不在里面**：被拒绝之后应当允许重新申请（补了理由、时间过了、
+# 换了客服）。少了这一条，用户会撞上一个"你被拒绝过，所以永远不能再申请"的
+# 系统，而界面上没有任何一句话说明这件事。
+BLOCKING_RETURN_STATUSES = {OPEN_RETURN_STATUS, APPROVED_RETURN_STATUS}
 
 
 class OrderNotFound(Exception):
@@ -129,7 +148,14 @@ def create_return(order_id: str, reason: str, db: Database = None) -> dict:
         )
 
     for existing in get_returns(order_id, db):
-        if existing["status"] == OPEN_RETURN_STATUS:
+        if existing["status"] in BLOCKING_RETURN_STATUSES:
+            if existing["status"] == APPROVED_RETURN_STATUS:
+                # 状态已经通过时，错误话术必须换一句：对用户说"请勿重复提交"
+                # 会让他以为申请还卡在审核里，然后一直等一个不会来的结果。
+                raise ReturnNotAllowed(
+                    f"订单 {order_id} 的退货申请（{existing['return_id']}）已经通过，"
+                    f"无需重复申请"
+                )
             raise ReturnNotAllowed(
                 f"订单 {order_id} 已经有一笔在审核中的退货申请"
                 f"（{existing['return_id']}），请勿重复提交"

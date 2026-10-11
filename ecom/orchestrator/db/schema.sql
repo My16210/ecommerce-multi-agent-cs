@@ -50,8 +50,14 @@ CREATE TABLE IF NOT EXISTS logistics (
     updated_at  VARCHAR(32)
 );
 
--- 退货申请。status 只有三种：待审核 / 已通过 / 已拒绝。
+-- 退货申请。status 只有三种：待审核 / 已通过 / 已拒绝
+-- （取值域的唯一来源是 order_tools 里那三个常量，别在这里再抄一份）。
+--
 -- **这里没有"自动通过"**：退货是花钱且有争议的操作，模型不该有最终决定权。
+-- 模型那条路只会写 `待审核`——写另外两个值的是**人**，走
+-- ecom/orchestrator/admin/returns.py（后台 / CLI），不经过任何工具函数。
+-- 这条边界是靠目录结构守的：`tools/` 是模型能调到的，`admin/` 不是。
+--
 -- 表本身不阻止重复申请，去重规则在工具层（见 order_tools.create_return），
 -- 因为"什么算重复"是会变的业务规则，不该焊进 DDL。
 CREATE TABLE IF NOT EXISTS return_requests (
@@ -60,4 +66,33 @@ CREATE TABLE IF NOT EXISTS return_requests (
     reason     VARCHAR(255) NOT NULL,
     status     VARCHAR(16)  NOT NULL DEFAULT '待审核',
     created_at VARCHAR(32)  NOT NULL
+);
+
+-- 审核痕迹：谁、什么时候、通过还是拒绝、留下什么备注。
+--
+-- 【为什么不给 return_requests 加三列，而是新开一张表】
+-- `init_schema()` 只会 `CREATE TABLE IF NOT EXISTS`，**已经存在的 orders.sqlite
+-- 不会自动多出新列**。所以加列就得引入一套 schema 迁移机制（SQLite 要读
+-- PRAGMA table_info、MySQL 要读 information_schema），而那是本仓库的第一个
+-- 演进机制——为了加三列而引入它，收益和分量不匹配。新表天然被
+-- `CREATE TABLE IF NOT EXISTS` 覆盖，一行迁移代码都不用写。
+--
+-- 【两张表的分工，别弄反】
+-- `return_requests.status` 仍然是**唯一真相**（列表、筛选、去重全都看它）；
+-- 这张表只放**过程痕迹**。没有任何一行 = 还没人审过，这个语义是自洽的。
+--
+-- 【今天这个理由还只是理论上的，但下个月就不是了】
+-- data/orders.sqlite 里 return_requests 现在是 0 行，所以"老库里有人下的结论、
+-- 删不得"目前并不成立——单看今天，加列 + 重灌库也够。选新表的真正理由是
+-- 下面两条：① 能不引入机制就不引入机制（和 FLOWCHART 里「能用设计绕开的
+-- 并发问题，就不该用锁去救」是同一条）；② 一旦这套上线演示过，这张表里就会
+-- 有**人下的结论**，到那时"重灌库"就等于抹掉人的决定。在只有派生数据的库上
+-- 假设"删除即无损失"，是这次改动最容易留下的技术债。
+CREATE TABLE IF NOT EXISTS return_reviews (
+    -- 一个申请只审一次（幂等），所以 return_id 直接做主键，不需要额外去重逻辑
+    return_id  VARCHAR(32) PRIMARY KEY,
+    decision   VARCHAR(16) NOT NULL,
+    reviewer   VARCHAR(64),
+    note       VARCHAR(255),
+    created_at VARCHAR(32) NOT NULL
 );
