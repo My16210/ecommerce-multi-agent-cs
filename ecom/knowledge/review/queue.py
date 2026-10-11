@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -84,6 +85,19 @@ STATUSES = ("pending", "approved", "rejected")
 
 _conn = None
 
+# 【为什么必须有一把锁】下面 `connect()` 用 `check_same_thread=False` 让**进程内
+# 共用同一个连接**，但 sqlite3 的连接对象本身不是为并发设计的。而这里的调用方
+# 是并发的：`admin.py`（人在审）和 app 那条路（模型在写）可能同时进来，Streamlit
+# 每个会话又是自己的线程。
+#
+# 只开 `check_same_thread=False` 却不配锁，等于把"多线程共用一个连接"这个口子
+# 主动开着——那样得到的不是"能并发"，是"偶尔炸"。
+#
+# 读也一起锁：共用的是同一个连接对象，读写不是两条独立的路。
+# `ecom/orchestrator/session.py` 是同一类存储、同样的形状，那边一直是这么做的；
+# 这里原来漏了。
+_lock = threading.Lock()
+
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -99,11 +113,20 @@ def connect() -> sqlite3.Connection:
     global _conn
     if _conn is None:
         Path(REVIEW_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-        # check_same_thread=False：和 main.py 里 SqliteSaver 的用法一致
-        _conn = sqlite3.connect(REVIEW_DB_PATH, check_same_thread=False)
-        _conn.row_factory = sqlite3.Row
-        _conn.executescript(SCHEMA)
-        _conn.commit()
+        # check_same_thread=False：和 main.py 里 SqliteSaver 的用法一致。
+        # 它只是关掉 sqlite 的"跨线程用同一连接就报错"这道自检，
+        # **并发安全由上面那把 `_lock` 负责**，两者缺一不可。
+        conn = sqlite3.connect(REVIEW_DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        # WAL：让"人正在审"和"服务正在写"不互相阻塞。默认 journal 模式下
+        # 一个写者会挡住所有读者。
+        conn.execute("PRAGMA journal_mode=WAL")
+        # 万一还是撞上锁（比如宿主上另一个进程正持着），等 5 秒再报错，
+        # 而不是立刻抛 "database is locked"。
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.executescript(SCHEMA)
+        conn.commit()
+        _conn = conn
     return _conn
 
 
@@ -145,26 +168,27 @@ def enqueue(question: str, result: dict, verdict: dict) -> tuple:
     ]
     now = _now()
 
-    conn = connect()
-    row = conn.execute(
-        UPSERT_SQL,
-        {
-            "fingerprint": fingerprint(question),
-            "question": question,
-            "answer": result.get("answer") or "",
-            "worthy": 1 if verdict.get("worthy") else 0,
-            "category": verdict.get("category"),
-            "score": verdict.get("score"),
-            "reason": verdict.get("reason"),
-            "kb_hits": len(contexts),
-            "kb_top_score": max(scores) if scores else 0.0,
-            "web_hits": len(result.get("web_contexts") or []),
-            "sources_json": json.dumps(result.get("sources") or [], ensure_ascii=False),
-            "created_at": now,
-            "updated_at": now,
-        },
-    ).fetchone()
-    conn.commit()
+    with _lock:
+        conn = connect()
+        row = conn.execute(
+            UPSERT_SQL,
+            {
+                "fingerprint": fingerprint(question),
+                "question": question,
+                "answer": result.get("answer") or "",
+                "worthy": 1 if verdict.get("worthy") else 0,
+                "category": verdict.get("category"),
+                "score": verdict.get("score"),
+                "reason": verdict.get("reason"),
+                "kb_hits": len(contexts),
+                "kb_top_score": max(scores) if scores else 0.0,
+                "web_hits": len(result.get("web_contexts") or []),
+                "sources_json": json.dumps(result.get("sources") or [], ensure_ascii=False),
+                "created_at": now,
+                "updated_at": now,
+            },
+        ).fetchone()
+        conn.commit()
 
     # 走冲突分支时 ask_count 一定已被 +1 成 >= 2，所以只有全新插入才是 1。
     # 这样不用再补一条 SELECT 就能判断是不是新行。
@@ -183,13 +207,16 @@ def list_items(worthy_only: bool = True, status: str = "pending", limit: int = 5
     sql += " ORDER BY score DESC, id DESC LIMIT ?"
     params.append(limit)
 
-    return [dict(row) for row in connect().execute(sql, params).fetchall()]
+    with _lock:
+        rows = connect().execute(sql, params).fetchall()
+    return [dict(row) for row in rows]
 
 
 def get_item(item_id: int) -> dict:
-    row = connect().execute(
-        "SELECT * FROM question_review WHERE id = ?", (item_id,)
-    ).fetchone()
+    with _lock:
+        row = connect().execute(
+            "SELECT * FROM question_review WHERE id = ?", (item_id,)
+        ).fetchone()
     return dict(row) if row else None
 
 
@@ -198,25 +225,27 @@ def set_status(item_id: int, status: str, note: str = None, doc_path: str = None
     if status not in STATUSES:
         raise ValueError(f"未知状态 {status!r}，可选：{STATUSES}")
 
-    conn = connect()
-    cursor = conn.execute(
-        """
-        UPDATE question_review SET
-            status = ?, reviewed_at = ?, review_note = COALESCE(?, review_note),
-            doc_path = COALESCE(?, doc_path)
-        WHERE id = ?
-        """,
-        (status, _now(), note, doc_path, item_id),
-    )
-    conn.commit()
+    with _lock:
+        conn = connect()
+        cursor = conn.execute(
+            """
+            UPDATE question_review SET
+                status = ?, reviewed_at = ?, review_note = COALESCE(?, review_note),
+                doc_path = COALESCE(?, doc_path)
+            WHERE id = ?
+            """,
+            (status, _now(), note, doc_path, item_id),
+        )
+        conn.commit()
     return cursor.rowcount > 0
 
 
 def stats() -> dict:
     """各状态的条数，供 CLI 概览用"""
-    rows = connect().execute(
-        "SELECT status, COUNT(*) AS n FROM question_review GROUP BY status"
-    ).fetchall()
+    with _lock:
+        rows = connect().execute(
+            "SELECT status, COUNT(*) AS n FROM question_review GROUP BY status"
+        ).fetchall()
     return {row["status"]: row["n"] for row in rows}
 
 

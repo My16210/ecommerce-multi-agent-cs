@@ -28,6 +28,7 @@ from ecom.orchestrator.settings import (
     ROUTER_TEMPERATURE,
     ROUTER_TIMEOUT,
 )
+from ecom.orchestrator.utils.ids import ORDER_ID_RE
 from ecom.orchestrator.utils.json_utils import loads_or_none
 from ecom.orchestrator.utils.llm import get_llm
 from ecom.orchestrator.utils.logger import setup_logger
@@ -70,13 +71,10 @@ ROUTER_PROMPT = """你是电商客服系统的调度中心。理解用户这句�
 _RULES = [
     # 订单号是强信号：一串数字，基本只可能是订单号。
     #
-    # 【位数门槛必须和 workers/order.py 的 `_ORDER_ID` 一模一样】现在是 5 位起步。
-    # 换真实数据时 Worker 那边从 6 位放宽到了 5 位，这里原来还是 6 位——**这个分叉
-    # 不会报错**：DataCo 的订单号最大 77204（5 位），所以 6 位那条规则对真实订单
-    # 一笔都命中不了，同时又会把发票号、日期串这种 6 位以上的数字路由成"查订单"。
-    # 更麻烦的是两处各自看都"对"——路由认得出的订单号，抽取层认不出。这类 bug
-    # 排查时最费时间，所以两处用同一个形状，并在注释里互相点名。
-    (re.compile(r"(?<!\w)(\d{5,})(?!\d)"), "order"),
+    # 【形状定义在 utils/ids.py，这里只引用】以前这里和 workers/order.py 各写了
+    # 一份，换真实数据时放宽位数只改了一边，**分叉不报错**——路由认得出的订单号，
+    # 抽取层认不出。那次事故的完整经过记在 utils/ids.py 的模块 docstring 里。
+    (ORDER_ID_RE, "order"),
     (
         re.compile(
             r"订单|物流|快递|发货|签收|运单|到哪|到货|退回|退货申请|退款进度|包裹|谁买的"

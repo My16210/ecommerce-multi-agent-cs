@@ -83,7 +83,10 @@ def test_syntax_error_is_reported_not_raised_as_security_error():
 def test_run_code_computes_result(df, tmp_path):
     out = run_code("result = df['金额'].sum()", df, tmp_path, tmp_path / "chart.png")
     assert out["error"] is None
-    assert out["result"] == "131975"
+    # 金额三行 71988 + 47992 + 29995 = 149975。
+    # 这里原来写的是 131975——是换数据之前那版 fixture 的和，**断言没跟着改**。
+    # 它在宿主上一直显示为红，但原因被"缺 matplotlib"盖住了（宿主上根本没跑到这一行）。
+    assert out["result"] == "149975"
     assert out["chart_generated"] is False
     assert out["chart_path"] == ""
 

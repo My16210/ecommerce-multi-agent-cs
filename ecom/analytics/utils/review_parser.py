@@ -13,6 +13,18 @@ _PASS_RE = re.compile(r"^(判定[:：]?\s*)?(通过|正确|没问题|没有问�
 # 「不通过」的写法
 _FAIL_RE = re.compile(r"(不通过|错误|不正确|有问题|fail|incorrect|wrong)", re.IGNORECASE)
 
+# 冒号后面**只有一个结论词**（「判定：不通过」而不是「错误：排序方向反了」）。
+#
+# 两者必须分开：前者说明原因被写在了第二行，后者原因就在冒号后面。
+# 所以这里是**整串锚定**（^...$），不能只匹配前缀——`不通过，因为X` 有原因，
+# 判成结论词就会把它丢掉。
+_VERDICT_ONLY_RE = re.compile(
+    r"^\s*(判定|结论|结果|审查|review)?\s*[:：]?\s*"
+    r"(不通过|通过|错误|不正确|有问题|没问题|没有问题|正确|fail|incorrect|wrong|pass|ok|correct)"
+    r"\s*[。.!！]?\s*$",
+    re.IGNORECASE,
+)
+
 
 def parse_review(content: str) -> tuple[bool, str]:
     """容忍 markdown 围栏、列表前缀、「判定：」前缀、中英文混写。
@@ -36,8 +48,20 @@ def parse_review(content: str) -> tuple[bool, str]:
     if _FAIL_RE.search(first_line):
         # 取「错误：xxx」里的 xxx 作为意见；没有冒号就用整句
         parts = re.split(r"[:：]", first_line, maxsplit=1)
-        feedback = parts[1].strip() if len(parts) > 1 and parts[1].strip() else text
-        return False, feedback
+        has_colon = len(parts) > 1
+        feedback = parts[1].strip() if has_colon else ""
+
+        # 有冒号、但冒号后面只剩一个结论词（或干脆是空的），说明**原因写在第二行**——
+        # 提示词就是这么要求的，见 analytics/agents/reviewer.py。
+        #
+        # 不往下翻的后果不是"少点信息"，而是 feedback 退化成「不通过」三个字，
+        # 被喂进 self_corrector 那一轮：它拿到的等于一句废话，改无可改。
+        if has_colon and (not feedback or _VERDICT_ONLY_RE.match(feedback)):
+            feedback = "\n".join(text.splitlines()[1:]).strip() or feedback
+
+        # 翻完还是空（比如整段就只有「判定：不通过」一行）就退回整段。
+        # **不能返回空串**：上面「审查输出为空 → 保守放行」那条语义是靠非空来区分的。
+        return False, feedback or text
 
     # 首行判不出来就扫全文
     if _FAIL_RE.search(text):

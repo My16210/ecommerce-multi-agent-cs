@@ -98,10 +98,34 @@ class Database:
                 "database": database,
             }
         except ValueError as exc:
+            # 【报错里**不回显 dsn 本身**】这一串一定含有数据库口令，而这条异常最常
+            # 出现在"启动失败"的日志里——等于顺手把口令抄进了日志。
+            # 报错该说清"怎么错了"，但没必要把口令一起带上，所以改成只说缺哪一段。
             raise ValueError(
-                f"ORDER_DB_DSN 格式不对：{dsn!r}。应该是 "
-                "mysql://user:password@host:3306/dbname"
+                "ORDER_DB_DSN 格式不对。需要 mysql://user:password@host:3306/dbname，"
+                f"但这段值{Database._describe_dsn(dsn)}"
             ) from exc
+
+    @staticmethod
+    def _describe_dsn(dsn: str) -> str:
+        """描述 DSN **缺了哪一段**，但不回显它的内容。
+
+        按 `_parse_dsn` 里完全相同的顺序重新走一遍拆分，所以第一个失败的地方
+        就是 `_describe_dsn` 第一个报出来的地方——诊断和报错说的是同一件事。
+        """
+        if not dsn:
+            return "是空的"
+        if "://" not in dsn:
+            return "没有 `://`（少了 mysql:// 这个开头）"
+        rest = dsn.split("://", 1)[1]
+        if "@" not in rest:
+            return "没有 `@`（少了 @host:3306/dbname 这一段）"
+        credentials, location = rest.split("@", 1)
+        if ":" not in credentials:
+            return "的 `@` 前面没有 `:`（少了 user:password 里的那个冒号）"
+        if "/" not in location:
+            return "的 `@` 后面没有 `/`（少了 /dbname）"
+        return "的端口不是数字"
 
     # ——— 语句 ———
     def _translate(self, sql: str) -> str:

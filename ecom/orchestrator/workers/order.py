@@ -30,6 +30,7 @@ from ecom.orchestrator.tools.order_tools import (
     list_customer_orders,
     query_order,
 )
+from ecom.orchestrator.utils.ids import ORDER_ID_RE
 from ecom.orchestrator.utils.json_utils import loads_or_none
 from ecom.orchestrator.utils.llm import get_llm
 from ecom.orchestrator.utils.logger import setup_logger
@@ -37,19 +38,9 @@ from ecom.orchestrator.utils.tokens import EMPTY, usage_of
 
 logger = setup_logger(__name__)
 
-# 订单号：5 位以上纯数字。太短的（如 2025）不当订单号，那多半是年份。
-#
-# 【为什么是 5 位】：DataCo 的 Order Id 实测是 1~5 位（最小 1，最大 77204，不补零）。
-# 门槛只能取"最长的那个量级"——放宽到 4 位会让「2025 年买的」里的 2025 被判成订单号，
-# 那比认不出短订单号更糟。所以 1~4 位的订单号在对话里**认不出来**，这是一条已知
-# 边界（写在 README 的"明确不做"里），不是在正则里偷偷补零绕过去。
-#
-# 【为什么是 (?<!\w) 而不是原来的 (?<!\d)】：客户号是 C20755 这个形状。
-# 如果只挡"前面是数字"，`C20755` 里那串 20755 会被当成订单号——一句话里同时
-# 提到客户号和订单号时，认出来的会是客户号。挡"前面是字母或数字"才分得开。
-#
-# 【这个形状和 core/router.py 的 `_RULES` 第一条必须一致】，改一处就要改另一处。
-_ORDER_ID = re.compile(r"(?<!\w)(\d{5,})(?!\d)")
+# 订单号的形状（5 位起步、(?<!\w) 挡客户号 C20755）定义在 utils/ids.py，
+# 这里只引用。以前这里和 core/router.py 的 `_RULES` 各写了一份，换真实数据时
+# 放宽位数只改了一边，**分叉不报错**。事故经过记在 utils/ids.py 的 docstring 里。
 
 # 【"我想退"和"能不能退"是两件事，写死的写操作不能靠一个"退货"关键词触发】
 # 这是真踩过的：一句「订单 52644 到哪了，顺便问下你们的退货政策是什么」，
@@ -98,7 +89,7 @@ def _rule_extract(question: str) -> dict:
     两条判断顺序不能换：先看"这是不是在问政策"（那就不是要办退货），
     再按动作词表扫。
     """
-    match = _ORDER_ID.search(question)
+    match = ORDER_ID_RE.search(question)
     order_id = match.group(1) if match else ""
 
     action = None
@@ -140,7 +131,7 @@ def _llm_extract(question: str, llm) -> dict:
     if action not in ACTIONS:
         action = None
     order_id = str(parsed.get("order_id") or "").strip()
-    if not _ORDER_ID.fullmatch(order_id):
+    if not ORDER_ID_RE.fullmatch(order_id):
         order_id = ""  # 模型给的订单号也要过同一道校验，不能因为"是模型说的"就信
     return {
         "action": action,
