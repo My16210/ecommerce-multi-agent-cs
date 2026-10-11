@@ -14,13 +14,15 @@
 
 **它不是**：一个把提示词写得花哨的单体 chatbot，也不是三个 bot 互相聊天的"群体智能"。它是一个**调度 + 隔离 + 汇总**的工程结构，每一层为什么这么切、哪些地方现在不该做，下面都写清楚了。
 
-> 三份文档，按顺序读：
+> 四份文档，按顺序读：
 >
 > 1. **[docs/项目说明.md](docs/项目说明.md)** —— 给评审看的导读，不假设你读过代码。
 >    "它是什么 / 为什么这么做 / 做到什么程度"。
 > 2. **本文件** —— 开发者视角的完整版：目录、逐条实现、踩过的坑、验证到哪一步。
 > 3. **[docs/技术文档.md](docs/技术文档.md)** —— **要改代码的人读的**。每个契约长什么样、
 >    为什么是这个形状、改它会连带动什么，**每处配真实代码片段**。
+> 4. **[docs/上线清单.md](docs/上线清单.md)** —— 换个轴问问题：**这套东西要真上线还差什么**。
+>    按"出事顺序"排，每条写清现在什么样、会怎么出事、要补什么，最后有一节**明确不做**。
 
 ---
 
@@ -58,6 +60,8 @@
 ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一入口所在地
 ├── pyproject.toml               一张依赖表（合并三家）
 ├── uv.lock                      锁文件（容器里生成，构建走 --frozen）
+├── LICENSE                      MIT
+├── .github/workflows/tests.yml  CI：ruff + pytest
 ├── .env / .env.example          一份配置
 ├── main.py                      CLI —— **第一入口**，排查问题用这个
 ├── app.py                       Streamlit 界面 —— 演示用
@@ -71,6 +75,7 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 │   │   ├── tools/               **模型能调到的**（order_tools.py 的纯函数）
 │   │   ├── admin/               **只有人能下的结论**（returns.py 的退货审核）
 │   │   ├── cli/                 returns.py / session.py —— 和界面共用同一份实现
+│   │   ├── utils/ids.py         订单号的形状 —— 唯一一份定义
 │   │   └── session.py           多轮记忆的存取层（自己开 sqlite，不用 Database）
 │   ├── knowledge/               知识库：retriever / vector_store / embedding / generator /
 │   │                            document_loader / review / web_search / cli（10 个脚本）
@@ -89,6 +94,7 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 │                                会话库在 data/orchestrator/sessions.db（同样不进仓库）
 ├── logs/                        日志 + requests.jsonl（trace）
 ├── docs/                        项目说明.md（导读）｜技术文档.md（**要改代码的人读的**）
+│                                上线清单.md（**要真上线还差什么**，含"明确不做"）
 └── tests/                       orchestrator/ knowledge/ analytics/ + 几个跨系统的不变量测试
 ```
 
@@ -149,6 +155,11 @@ docker compose run --rm app python -m ecom.knowledge.cli.ingest        # 建向�
 # → http://localhost:8501     客户界面
 # → http://127.0.0.1:8502     后台（要 .env 里的 ADMIN_PASSWORD）
 ```
+
+**两条都只发布到 `127.0.0.1`，不绑 `0.0.0.0`。** 用 `localhost` 访问完全不受影响；
+但同局域网的另一台机器打不开它们——这是故意的（app 那条**没有任何鉴权**，
+而它能触发一次数据分析，也就是让模型生成的 Python 跑起来）。
+真要跨机器演示：`APP_BIND=0.0.0.0 docker compose up -d`。
 
 换 Milvus：`docker compose --profile milvus up -d`（四个服务一起起）。
 
@@ -629,32 +640,42 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 ## 测试
 
 ```bash
-uv run pytest        # 520 条：516 passed / 2 failed / 2 skipped
+uv run pytest        # 520 条：518 passed / 2 skipped
 uv run ruff check .
 ```
 
 （**这个数要在装了全部 extra 的环境里跑**才算得准。宿主上少几个包时是 505 条 /
-498 passed / 3 failed / 4 skipped——少掉的那 15 条挂在 `importorskip` 上，
-多出来的那条红是缺 matplotlib 造成的，见下面。）
+499 passed / **2 failed** / 4 skipped——少掉的那 15 条挂在 `importorskip` 上，
+剩下的 2 条红是**宿主没装 matplotlib** 造成的，见下面。）
+
+`CI`（[.github/workflows/tests.yml](.github/workflows/tests.yml)）上是 **517 passed / 3 skipped**，
+比容器里少一条：干净 checkout 上没有 `data/orders.sqlite` 和向量库，界面真渲染那条会 skip。
 
 **一条测试都不联网。** 不是图快——真调模型意味着测试结果随模型版本、网络、当天负载浮动，那样的测试没法规格回归，它昨天红今天绿，你只会学会忽略它。所有模型调用都用 `FakeLLM` / `ExplodingLLM` 顶掉。
 
-那 2 条失败**合并前就在红**（搬过来的，不是合并改出来的）。但这里有一件值得写下来的事：
+### 那两条红灯是怎么修的（以及它教了什么）
+
+改之前容器里是 516 passed / **2 failed** / 2 skipped。两条都是**真缺陷**：
+
+- `test_review_parser::test_verdict_style_fail` —— 提示词要求「不通过时原因写在第二行」，
+  而解析器只取首行冒号后的文本，于是 feedback 退化成「不通过」三个字，
+  被喂进自我纠正那一轮等于一句废话。
+- `test_sandbox::test_run_code_computes_result` —— **断言值陈旧**：fixture 三行金额
+  加起来是 `71988+47992+29995 = 149975`，断言写的是 `131975`。这条在原 `sales_agent`
+  仓库里就是这个样子，是搬过来的老账。
+
+第二条值得单独记一笔，因为它**在宿主上伪装成了另一回事**：
 
 | | 宿主（没装 matplotlib） | 容器（装了全部 extra） |
 |---|---|---|
-| `test_sandbox::test_run_code_computes_result` | `ModuleNotFoundError: No module named 'matplotlib'` | `assert '149975' == '131975'` |
-| `test_review_parser::test_verdict_style_fail` | 真的断言失败 | 同样的断言失败 |
+| `test_sandbox::test_run_code_computes_result` | `assert "ModuleNotFoundError: No module named 'matplotlib'" is None` | `assert '149975' == '131975'` |
 
-**同一条测试，在两个环境里红的原因不一样。** 宿主那侧是**环境缺口**：它把一条
-**陈旧的期望值**伪装成了"没装包"。补上 matplotlib 之后才露出真面目 —— fixture
-三行金额加起来是 `71988+47992+29995 = 149975`，而断言写的是 `131975`
-（`tests/analytics/test_sandbox.py:86`）。这条**在原 `sales_agent` 仓库里就是
-这个样子**（同一个断言同样写 131975），是搬过来的老账，不是这次改出来的。
+**同一条测试，在两个环境里红的原因不一样。** 宿主那侧是**环境缺口**，它把那条陈旧的
+期望值藏在了后面——只看宿主的话，你会以为"装上 matplotlib 就好了"，而装上之后它照样红。
+**这就是为什么要用完整环境跑一遍，也是为什么"宿主上红是缺包"这个结论不能直接信。**
 
-**这就是为什么要用完整环境跑一遍**：只跑宿主那套的话，你会一直以为"那两条是没装包，
-装上就好了"——而装上之后它们照样红，只是换了个理由。合并**没有改变行为**，
-所以这一轮也没去修它们；修不修是另一件事。
+（宿主上现在还剩 2 条红，都还是同一个原因：那个 venv 没装 matplotlib，
+`run_code` 一进去就报 `ModuleNotFoundError`。**在容器里这两条是绿的。**）
 
 几条值得单独说的：
 
@@ -689,7 +710,9 @@ uv run ruff check .
 | ✅ | **真实 Streamlit 运行时** | 真跑：`streamlit.testing.v1.AppTest` 把两个入口跑完，6 条全绿。**这补上了原来那一栏 ❌** |
 | ✅ | **合并后的 `API`（FastAPI）真起服务** | 容器内真起 uvicorn：`/health` 200（含 workers + order_db）、`/openapi.json` 元数据齐、空问题 422、`/trace/不存在` 404、真提问 200（257+29 token / 1.2s）。**这一条走了网络、花了 token**，不属于"测试不联网"那一栏 |
 | ✅ | **Milvus 那条代码路径** | 真跑：连宿主常驻的 v2.5.5，`ecom_verify_<随机>` 临时集合走完 add / count / search / delete / drop，**零残留**（另有一条专门查残留）。⚠️ 见下面的版本错位 |
-| ✅ | 520 条测试、ruff | 516 passed / 2 failed / 2 skipped。**那 2 条合并前就在红**，而且**同一条测试在宿主和容器里红的原因不一样**（见「测试」一节） |
+| ✅ | 520 条测试、ruff | 容器里 **518 passed / 0 failed / 2 skipped**。原来那 2 条红灯都是真缺陷，已修（见「测试」一节）。CI 上是 517 passed / 3 skipped |
+| ❌ | **CI 本身能不能真跑绿** | 工作流已写好，里面的每条命令都在本地容器里验过（`uv sync --all-extras --frozen` → `ruff` → `pytest` 全过），也拿 `git archive` 出的干净 checkout 预演了一遍。**但仓库还没推到 GitHub，所以 Actions 一次都没真跑过**——不把没跑的写成跑过的 |
+| ✅ | **许可证** | 有了 `LICENSE`（MIT），`pyproject.toml` 里声明了同一个。之前**一个都没有**——公开仓库没有 LICENSE 等于"保留所有权利"，别人不能合法复用 |
 | ✅ | **`uv sync` 能否装成** | 真构建：镜像里解析出 **150 个包**并装成，五个 extra 全在（matplotlib / streamlit / pymilvus / pymysql / tavily-python / fastapi 逐个确认过） |
 | ✅ | **数据分析跑出一张图** | 真跑（容器内）：DeepSeek 生成代码 → sandbox 执行 → `chart_generated: true`，7.8s，图落在磁盘上。中文标签正常——这一条第一次跑出来是**豆腐块**，见"坑 7" |
 | ✅ | 镜像能构建、容器能跑 | 真构建 + 真跑：`docker compose run --rm app python -m ecom.analytics.cli.analyze "…"` 走完全程 |
@@ -725,3 +748,8 @@ uv run ruff check .
 - **路由不解析代词回指**（真跑 `/chat` 时发现的，不是推测）。带历史追问「那它的金额是多少」，历史**确实进了 prompt**（token 从 257 涨到 387），但路由第一层是关键词规则，`plan` 是空的，于是答了"没听明白"。**会话存储没问题，缺的是指代消解**——这是一条已知限制，不是 bug。真要做，得先决定"把上一轮提到的实体带进路由提示词"这件事由谁负责，而不是顺手往正则里加几个词。
 - **Milvus 客户端与服务端版本错位**。本机常驻的服务端是 **v2.5.5**，而 `pyproject.toml` 把 pymilvus pin 在 `>=2.6,<3`、compose 里那个服务是 `milvusdb/milvus:v2.6.24`。实测客户端 2.6 连 2.5.5 服务端这几个接口都能用（验证矩阵里那一行就是跑通的证据），但**这条对应关系没有保证**。真要长期用，服务端该换到 2.6.x 对齐 pin。
 - **`admin.py` 是演示级鉴权**。一个明文口令，没有用户、没有角色、没有审计（"审核人"是界面上手填的一个字符串，填不填都行）。它挡住的是"随手扫到这个端口的人"，**别把它说成"做了权限系统"**。第二层是 compose 里那个 `127.0.0.1` 绑定。
+- **两个界面现在都只绑 `127.0.0.1`**（原来只有 admin 绑，app 发布在 `0.0.0.0` 且无任何鉴权）。app 那条没有口令那一层，所以绑定是它**唯一**的一层。要跨机器演示就 `APP_BIND=0.0.0.0 docker compose up -d`——那一刻是你**自己**决定暴露它，而不是默认敞着。
+
+> **上面这些"已知限制"是散落的。** 如果想知道**它们合起来意味着什么、真上线会先坏在哪里**，
+> 看 **[docs/上线清单.md](docs/上线清单.md)**——它按"出事顺序"重排了一遍，并且专门有一节讲
+> **哪些是故意不做的、为什么现在补它是错的**。
