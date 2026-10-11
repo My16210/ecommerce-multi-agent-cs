@@ -25,7 +25,7 @@ def _embeddings(count):
 
 
 def _chunks(specs):
-    """specs 形如 [("LangGraph基础.md", "第一段"), ...]"""
+    """specs 形如 [("售后政策.md", "第一段"), ...]"""
     return [
         {"text": text, "source": source, "chunk_id": index}
         for index, (source, text) in enumerate(specs)
@@ -136,6 +136,51 @@ def test_all_chunks_returns_everything(store_factory):
 
 def test_all_chunks_on_empty_store_returns_empty_list(store_factory):
     assert store_factory().all_chunks() == []
+
+
+# --------------------------------------------------------------------------
+# 契约条款 6：delete_source —— 清理"库里有、盘上没有"的孤儿
+#
+# 这一条补得晚：add_chunks 的幂等只管得住"文件还在盘上"的情况，
+# 文件被删掉之后，库里的 chunk 谁也动不了，检索却照样召回。
+# --------------------------------------------------------------------------
+
+
+def test_delete_source_removes_only_that_source(store_factory):
+    store = store_factory()
+    store.add_chunks(_chunks([("a.md", "x"), ("b.md", "y")]), _embeddings(2))
+
+    store.delete_source("a.md")
+
+    assert store.count() == 1
+    assert {chunk["source"] for chunk in store.all_chunks()} == {"b.md"}
+
+
+def test_delete_missing_source_is_a_noop(store_factory):
+    """删一个不存在的 source 不能报错
+
+    孤儿清理是照着"库里有"的名单去删的，中间天然会出现删不中的情况，
+    这里一抛异常，整轮入库就断在最后一步了。
+    """
+    store = store_factory()
+    store.add_chunks(_chunks([("a.md", "x")]), _embeddings(1))
+
+    store.delete_source("从来没入过库.md")
+
+    assert store.count() == 1
+
+
+def test_deleting_every_source_empties_the_store(store_factory):
+    """语料整体换掉时，库里不能剩下任何旧 chunk"""
+    store = store_factory()
+    store.add_chunks(_chunks([("a.md", "x"), ("b.md", "y")]), _embeddings(2))
+
+    store.delete_source("a.md")
+    store.delete_source("b.md")
+
+    assert store.count() == 0
+    assert store.all_chunks() == []
+    assert store.search([0.0] * DIM, top_k=5) == []
 
 
 def test_all_chunks_reflects_deletes(store_factory):

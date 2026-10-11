@@ -1,10 +1,10 @@
-{"id": "unans-01", "question": "LangGraph 有没有官方的 Java 版 SDK？", "type": "unanswerable", "why": "三份技术文档只讲 Python API，全库 grep Java / JDK 零命中"}
-{"id": "unans-02", "question": "RAGFlow 开源版和企业版的定价分别是多少？", "type": "unanswerable", "why": "RAGFlow介绍.md 只讲定位和功能；全库 grep 定价/企业版 只命中电商的价格保护，与此无关"}
-{"id": "unans-03", "question": "BGE-M3 模型是在多少条数据上训练出来的？", "type": "unanswerable", "why": "语料只提到用它做向量化（维度 1024、支持多语言），没有训练数据规模"}
-{"id": "unans-04", "question": "qwen-plus 的上下文窗口最大支持多少 token？", "type": "unanswerable", "why": "只有 RAG检索增强生成.md:423 泛泛提到「LLM 的上下文窗口有限」，从不给具体模型的规格数字"}
-{"id": "unans-05", "question": "LangGraph 和 LangChain 分别采用什么开源许可证？", "type": "unanswerable", "why": "全库 grep 许可证 / License / Apache / MIT 零命中；文档只讲怎么用，不讲授权条款"}
-{"id": "unans-06", "question": "你们有线下实体门店吗，都开在哪些城市？", "type": "unanswerable", "why": "全库 grep 门店 / 线下 / 实体店 只命中售后政策里「数字化商品」一句，与门店无关"}
-{"id": "unans-07", "question": "这套系统单机能支撑多少 QPS 的并发问答？", "type": "unanswerable", "why": "全库 grep 连接池 / 并发数 / QPS 零命中。注意：上一版这里是「开发票的税率」，被余弦自检 0.661 标出来后我 grep 了「税率」——零命中，就以为没事。其实语料写的是「专票的**税点**是多少？一般为 13%」，换了词而已。可见 grep 不能证明「没有」。"}
-{"id": "unans-08", "question": "你们公司的客服电话和人工服务时间是多少？", "type": "unanswerable", "why": "支付与账户安全.md:52 出现过「拨打客服电话」这个短语，但全库没有任何号码或服务时间"}
-{"id": "unans-09", "question": "这个项目的单元测试覆盖率是多少？", "type": "unanswerable", "why": "全库 grep 覆盖率 / 单元测试 / pytest 零命中。原题是「个人店铺升级企业店铺要哪些资质」——余弦 0.562 没越线、grep 资质/入驻 也零命中，但人工读 top chunk 时看到支付与账户安全.md「六、企业账户」写着营业执照/法人身份证/对公账户，那就是答案。**余弦和 grep 都没抓住，是读出来的**。"}
-{"id": "unans-10", "question": "LangGraph 目前的稳定版本号是多少？", "type": "unanswerable", "why": "全库 grep 版本号 / v2. 零命中；文档讲概念和用法，不记录版本"}
+{"id": "unans-01", "question": "你们平台的线下实体门店都开在哪些城市？", "type": "unanswerable", "why": "全库 grep 门店 零命中；「线下」只出现在电子商务法第四条「促进线上线下融合发展」、网络交易监督管理办法第四条「线上一体化监管」——都是监管原则，不是门店清单"}
+{"id": "unans-02", "question": "你们公司的客服电话和人工服务时间是多少？", "type": "unanswerable", "why": "支付与账户安全.md:52 出现过「拨打客服电话」这个短语，但全库没有任何号码，也没有服务时间"}
+{"id": "unans-03", "question": "快递保价的费率是按什么标准收的？", "type": "unanswerable", "why": "快递暂行条例第二十一、二十七条只说「按与寄件人约定的保价规则」确定赔偿责任，从不给费率。别被物流与发票.md:40「未保价包裹赔付上限为运费的 3-5 倍」骗到——那是**未保价**的赔付，不是**保价**的收费。上一版这里是「开发票的税率」，被余弦自检 0.661 标出来后我 grep「税率」零命中就以为没事，其实语料写的是「专票的**税点**…一般为 13%」，换个词而已。**grep 不能证明「没有」**。"}
+{"id": "unans-04", "question": "平台对商家每一笔订单抽成百分之几？", "type": "unanswerable", "why": "全库 grep 抽成 / 佣金 / 抽佣 零命中；法规只讲平台经营者的审核义务和责任，不讲分成比例"}
+{"id": "unans-05", "question": "你们平台去年的年度活跃买家有多少？", "type": "unanswerable", "why": "全库 grep 活跃买家 / GMV / 交易额 零命中；语料是规则文本，不含经营规模数据"}
+{"id": "unans-06", "question": "商家拒绝退货时，消费者可以要求平台先行赔付的最高金额是多少？", "type": "unanswerable", "why": "消费者权益保护法实施条例只写「鼓励和引导经营者…先行赔付」，不给金额。这条是刻意留的对照：grep「先行赔付」**有**命中，余弦也未必越线，只有把那一句读完才知道它不含数字。原 unans-09 的教训——**余弦和 grep 都没抓住，是读出来的**。"}
+{"id": "unans-07", "question": "这套系统单机能支撑多少 QPS 的并发问答？", "type": "unanswerable", "why": "全库 grep QPS / 并发 / 吞吐 零命中。这条问的是系统自身能力，语料里没有运维数据"}
+{"id": "unans-08", "question": "这个项目的单元测试覆盖率是多少？", "type": "unanswerable", "why": "全库 grep 覆盖率 / 单元测试 / pytest 零命中；语料是业务文档，不含工程指标"}
+{"id": "unans-09", "question": "消费者权益保护法实施条例从公布到现在一共修订过几次？", "type": "unanswerable", "why": "该文件抬头只记「2024年3月15日国务院令第778号公布，自2024年7月1日起施行」，没有修订次数。topic 在语料里（文件名就是），但次数没有——这正是弃答题该有的样子"}
+{"id": "unans-10", "question": "平台对快递延误的订单有补偿吗？补偿标准是多少？", "type": "unanswerable", "why": "全库 grep 补偿 零命中；快递暂行条例只讲快件延误的赔偿责任按民事法律定，不讲平台对消费者的补偿方案"}

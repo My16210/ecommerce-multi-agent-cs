@@ -5,16 +5,16 @@
 候选摆到人面前、统计人确认过的那些。标注必须由人来做——模型生成标注再叫它
 "金标准"，就是拿一份合成集冒充真值，评测分数越高越自欺。
 
-与 data/eval_set.jsonl 的关系
+与 data/knowledge/eval_set.jsonl 的关系
 ----------------------------
-那份 290 题是 `build_eval_set.py` 让模型对着每个 chunk 出的题，**题和答案同源**，
+那份 152 题是 `build_eval_set.py` 让模型对着每个 chunk 出的题，**题和答案同源**，
 所以它的分数只能回答"检索能不能找回出题时看的那一段"，不能回答"这题出得对不对"。
 这份金标准是在同一批语料上、由人挑出来的子集，用来给合成集的分数量一个**偏差**：
 两者接近说明合成集可信，差得远说明合成集在报喜。
 
 三个子命令
 ----------
-    uv run python gold_set.py build --n 50     # 抽样 + 检索候选 → data/gold_set.jsonl
+    uv run python gold_set.py build --n 50     # 抽样 + 检索候选 → data/knowledge/gold_set.jsonl
     uv run python gold_set.py label            # 逐条人审（默认只标 pending 的）
     uv run python gold_set.py report           # 只统计人确认过的条目
 
@@ -74,7 +74,7 @@ def stratified_sample(cases: list, n: int, seed: int = SEED) -> list:
     """
     按题型分层抽样，保证改写型 / 术语型都够数。
 
-    为什么不直接 random.sample：290 题里两类题的比例是固定的，整体随机抽 50 题，
+    为什么不直接 random.sample：152 题里两类题的比例是固定的，整体随机抽 50 题，
     万一抽出来 45 题是术语型，那"改写型检索好不好"这个结论就没有样本支撑了。
     分层是先按题型分桶、再把名额摊到每个桶，**桶内**才随机。
 
@@ -177,7 +177,7 @@ def _now() -> str:
 def build(args) -> int:
     cases = load_eval_set(args.set_path)
     if not cases:
-        print(f"评测集是空的：{args.set_path or 'data/eval_set.jsonl'}。"
+        print(f"评测集是空的：{args.set_path or 'data/knowledge/eval_set.jsonl'}。"
               "请先跑 uv run python build_eval_set.py")
         return 1
 
@@ -379,8 +379,8 @@ def main() -> int:
     p_build.add_argument("--candidates", type=int, default=DEFAULT_CANDIDATES,
                          help=f"每条摆出多少候选（默认 {DEFAULT_CANDIDATES}，"
                               "要比 report 的 --top-k 宽）")
-    p_build.add_argument("--set-path", default=None, help="源评测集，默认 data/eval_set.jsonl")
-    p_build.add_argument("--gold-path", default=None, help="输出文件，默认 data/gold_set.jsonl")
+    p_build.add_argument("--set-path", default=None, help="源评测集，默认 data/knowledge/eval_set.jsonl")
+    p_build.add_argument("--gold-path", default=None, help="输出文件，默认 data/knowledge/gold_set.jsonl")
 
     p_label = sub.add_parser("label", help="逐条人工标注")
     p_label.add_argument("--only-pending", action="store_true",

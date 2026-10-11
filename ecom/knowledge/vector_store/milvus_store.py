@@ -152,6 +152,21 @@ class MilvusStore:
         self.client.flush(self.collection_name)
         logger.info("写入 %d 个 chunk，集合当前共 %d 条", len(rows), self.count())
 
+    def delete_source(self, source: str) -> None:
+        """
+        删掉某个 source 的全部 chunk（用途见契约：清理已从盘上删掉的文档）。
+
+        filter 的写法与 add_chunks 里那段删除保持一致，用的是同一个 _quote。
+        """
+        self.client.delete(
+            collection_name=self.collection_name,
+            filter=f"source == {_quote(source)}",
+        )
+        # 和 add_chunks 一样要 flush：删除落在 growing segment 里而不 flush，
+        # 紧接着的 count() / all_chunks() 可能还看得见那些行，
+        # 于是"刚清完孤儿、库里还剩几条"这种自相矛盾的现象就出现了。
+        self.client.flush(self.collection_name)
+
     def search(self, query_embedding: list, top_k: int = 5) -> list:
         """
         检索最相关的chunk

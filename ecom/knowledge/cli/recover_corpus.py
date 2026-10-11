@@ -1,15 +1,18 @@
 """
 从向量库还原原始语料
-功能：把库里已经切碎的 chunk 拼回整篇文档，写回 data/documents/
+功能：把库里已经切碎的 chunk 拼回整篇文档，写回 data/knowledge/documents/
 
 为什么需要这个脚本
 ------------------
-本项目出过一次事故：`data/documents/` 下的三份教程语料在磁盘上丢了，只剩
-切好的 253 个 chunk 还留在向量库里。检索还能用，但**只要谁删掉
-`data/vector_store/`，语料就永久没了**——项目再也重建不起来。
+本项目出过一次事故：`data/knowledge/documents/` 下的三份教程语料在磁盘上丢了，
+只剩切好的 253 个 chunk 还留在向量库里。检索还能用，但**只要谁删掉
+`data/knowledge/vector_store/`，语料就永久没了**——项目再也重建不起来。
+
+（那三份教程语料后来按计划换成了法规原文，但这次事故的教训跟语料是什么无关，
+脚本照旧能用：所有内容都由 documents/ 单向生成，向量库始终只是派生物。）
 
 这是"向量库被当成了数据源"的典型后果。向量库应该是**派生物**：所有内容都由
-`data/documents/` 经 ingest.py 单向生成，删掉随时能重建。这个脚本就是把已经
+`data/knowledge/documents/` 经 ingest.py 单向生成，删掉随时能重建。这个脚本就是把已经
 倒过来的依赖关系扳回去，让磁盘重新成为唯一真源。
 
 还原的难点：丢失的分隔符
@@ -214,9 +217,9 @@ def diagnose(chunks: list) -> list:
 
 def resolve_target(source: str) -> Path:
     """
-    把 source 映射成 data/documents 下的落盘路径。
+    把 source 映射成 data/knowledge/documents 下的落盘路径。
 
-    source 是入库时记下来的相对路径，可能带子目录（data/documents/reviewed/
+    source 是入库时记下来的相对路径，可能带子目录（data/knowledge/documents/reviewed/
     下的文档，source 就是 "reviewed/xxx.md"）。但它是**库里的数据**，不能无条件
     当成可信路径用：绝对路径和 .. 都能指到 documents 目录外面去。
     """
@@ -246,7 +249,7 @@ def describe_overlaps(overlaps: list) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="从向量库还原 data/documents 下的语料")
+    parser = argparse.ArgumentParser(description="从向量库还原 data/knowledge/documents 下的语料")
     parser.add_argument("--force", action="store_true", help="已存在的文件也覆盖")
     parser.add_argument("--dry-run", action="store_true", help="只打印报告，不写盘")
     args = parser.parse_args()
@@ -263,7 +266,7 @@ def main():
 
     if not chunks:
         print("向量库是空的，没有东西可以还原。")
-        print("（新环境直接把原始文档放进 data/documents/ 再跑 ingest.py 就行）")
+        print("（新环境直接把原始文档放进 data/knowledge/documents/ 再跑 ingest.py 就行）")
         return 1
 
     print(f"库里 {total} 条，读出 {len(chunks)} 条")

@@ -16,6 +16,7 @@
 
 各脚本的职责：
     ask.py            问一句，走完整张图（带会话持久化）
+    fetch_corpus.py   抓法规原文当语料（带出处抬头，产物提交进仓库）
     ingest.py         把 documents/ 切块、向量化、入库（**向量库唯一写入口**）
     review.py         人审队列：看待审问题、批准/驳回
     build_eval_set.py 用模型生成 chunk 级合成评测集

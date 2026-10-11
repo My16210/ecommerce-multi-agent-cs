@@ -1035,7 +1035,7 @@ def main() -> int:
     p_build = sub.add_parser("build", help="跑检索+生成，写出答案快照")
     p_build.add_argument("--n", type=int, default=30, help="可答题抽多少条（默认 30）")
     p_build.add_argument("--top-k", type=int, default=TOP_K)
-    p_build.add_argument("--set-path", default=None, help="源评测集，默认 data/eval_set.jsonl")
+    p_build.add_argument("--set-path", default=None, help="源评测集，默认 data/knowledge/eval_set.jsonl")
     p_build.add_argument("--out", default=ANSWER_EVAL_PATH)
     p_build.add_argument("--resume", action="store_true", help="在已有快照上续跑，只补没跑过的题")
 

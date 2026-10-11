@@ -63,11 +63,11 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 │   │                            **全项目唯一一处读 .env、唯一一处算项目根**
 │   ├── orchestrator/            编排：supervisor / router / aggregate / workers / tools / db
 │   ├── knowledge/               知识库：retriever / vector_store / embedding / generator /
-│   │                            document_loader / review / web_search / cli（9 个脚本）
+│   │                            document_loader / review / web_search / cli（10 个脚本）
 │   └── analytics/               数据分析：agents / core（graph + sandbox）/ utils / cli
 │
 ├── data/                        三个子系统的数据按目录分开
-│   ├── knowledge/               documents/（含「电商客服示例」语料）、评测集、金标准、向量库
+│   ├── knowledge/               documents/（「电商客服示例」+「法规原文」两组语料）、评测集、金标准、向量库
 │   ├── analytics/raw/sales.csv
 │   └── orders.sqlite
 ├── logs/                        日志 + requests.jsonl（trace）

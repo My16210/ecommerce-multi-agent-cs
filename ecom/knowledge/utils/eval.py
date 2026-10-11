@@ -6,13 +6,13 @@
 
 | | 期望答案有几个候选 | 能回答什么 |
 |---|---|---|
-| 内置 9 条（source 级） | 3 份文档 | 只能当冒烟测试：Top-5 里"沾到"正确的文档太容易 |
-| 合成评测集（chunk 级） | 253 个 chunk | 才分得开好坏 |
+| 内置 9 条（source 级） | 17 份文档 | 只能当冒烟测试：Top-5 里"沾到"正确的文档太容易 |
+| 合成评测集（chunk 级） | 184 个 chunk | 才分得开好坏 |
 
 source 级的 Recall@5 必然接近满分，**不是语料太小，是粒度太粗**——期望答案
-只有 3 个候选时，随便召回 5 条都能命中。换成 chunk 级，候选变成 253 个，
+只有 17 个候选时，随便召回 5 条都能命中。换成 chunk 级，候选变成 184 个，
 同一套系统立刻量得出差别，而且不需要新语料。合成评测集由 build_eval_set.py
-生成，落在 data/eval_set.jsonl。
+生成，落在 data/knowledge/eval_set.jsonl。
 
 **评测集只用 SILICONFLOW key（embedding）**。生成评测集才要 QWEN key，
 跑评测不要——答疑链路还没通的时候也能先验证检索质量。
@@ -30,36 +30,57 @@ from ecom.knowledge.settings import EVAL_SET_PATH, HYBRID_SEARCH, TOP_K
 from ecom.knowledge.vector_store import get_vector_store
 
 # 小评测集：问题 → 期望召回的文件名
-# 语料是 data/documents 下那三份教程笔记，换语料时这里要跟着改
+# 语料是 data/knowledge/documents 下那 10 篇法规原文 + 7 篇电商客服示例，
+# 换语料时这里要跟着改。**每条都对着盘上真实存在的文件**，且答案确实在那一篇里。
 #
 # 这里刻意混了两类问题：
 #   - **自然语言改写型**（前 6 条）：问法和原文措辞不一样，考的是语义理解，向量路的强项
-#   - **术语精确型**（后 3 条）：问题里带着语料里罕见的专有名词（SqliteSaver / RRF /
-#     RecursiveCharacterTextSplitter），考的是精确词面匹配，BM25 的强项
+#   - **术语精确型**（后 3 条）：问题里带着语料里罕见的专有名词（个人信息处理者 /
+#     有奖销售 / 快递运单），考的是精确词面匹配，BM25 的强项
 #
 # 只测前一类的话，这个评测集**在原理上就测不出词汇检索**——两路都会拿满分，
 # 看不出混合检索到底有没有用。补后一类不是为了把数字做好看，是因为一个只有
 # 改写型问题的评测集，本来就不足以衡量一个检索系统。
 #
+# 术语型的这三个词是**量出来的**、不是猜的：上面的词在整个语料里只出现在一份
+# 文档里（个人信息处理者 76 次只在个人信息保护法，有奖销售 16 次只在规范促销行为
+# 暂行规定，快递运单 9 次只在快递暂行条例）。不唯一的词不能用——「三包」出现在
+# 三包规定和售后政策两份文档里，拿它出题，BM25 命中哪一份都算对，题就废了。
+#
 # 这 9 条**留着**，而且不删：它们是手写的、每条都有人看过，是合成评测集出事时的
 # 对照组。合成集再大也是模型出的，模型出的题集体跑偏（比如全押在某一类上）
 # 时，这 9 条是唯一能证明"检索本身没坏"的东西。
 TEST_CASES = [
-    {"question": "LangGraph 里的节点、边、状态分别是什么？", "expected_source": "LangGraph基础.md"},
-    {"question": "LangGraph 和 LangChain 有什么区别？", "expected_source": "LangGraph基础.md"},
-    {"question": "怎么用 Checkpointer 保持多轮对话的上下文？", "expected_source": "LangGraph基础.md"},
-    {"question": "大模型有哪些局限，RAG 是怎么解决的？", "expected_source": "RAG检索增强生成.md"},
-    {"question": "什么是检索增强生成？", "expected_source": "RAG检索增强生成.md"},
-    {"question": "RAGFlow 是做什么的？", "expected_source": "RAGFlow介绍.md"},
-    # ↓ 术语型：这三个词在整个语料里只出现在对应的那一份文档里
-    {"question": "SqliteSaver 是干什么用的？", "expected_source": "LangGraph基础.md"},
+    {"question": "三包有效期从什么时候开始算？", "expected_source": "部分商品修理更换退货责任规定.md"},
+    {"question": "发票可以拆本使用吗？", "expected_source": "中华人民共和国发票管理办法.md"},
     {
-        "question": "RRF 是怎么把两路结果融合到一起的？",
-        "expected_source": "RAG检索增强生成.md",
+        "question": "商家收了预付款之后停业跑路了，消费者能怎么办？",
+        "expected_source": "中华人民共和国消费者权益保护法实施条例.md",
     },
     {
-        "question": "RecursiveCharacterTextSplitter 的分隔符怎么配？",
-        "expected_source": "RAG检索增强生成.md",
+        "question": "电子合同里，商品什么时候算交付给消费者？",
+        "expected_source": "中华人民共和国电子商务法.md",
+    },
+    {
+        "question": "七天无理由退货，哪些商品是不适用的？",
+        "expected_source": "网络购买商品七日无理由退货暂行办法.md",
+    },
+    {
+        "question": "通过网络直播卖东西，算不算网络交易、要不要办登记？",
+        "expected_source": "网络交易监督管理办法.md",
+    },
+    # ↓ 术语型：这三个词在整个语料里只出现在对应的那一份文档里
+    {
+        "question": "个人信息处理者处理个人信息要遵守哪些原则？",
+        "expected_source": "中华人民共和国个人信息保护法.md",
+    },
+    {
+        "question": "有奖销售最高奖的金额不能超过多少？",
+        "expected_source": "规范促销行为暂行规定.md",
+    },
+    {
+        "question": "快递运单上要载明哪些内容？",
+        "expected_source": "快递暂行条例.md",
     },
 ]
 
@@ -213,8 +234,8 @@ def evaluate(top_k: int = TOP_K, cases: list = None, verbose: bool = None,
         print(f"MRR        = {mrr:.3f}（满分 1.000，命中越靠前越高）")
 
         if level == "source":
-            # 语料只有三份文档，Top-5 里"沾到"正确的那份太容易，Recall 必然接近满分、
-            # 区分不出好坏。精度是同一批结果里的另一半信息。
+            # 期望答案只有十几个候选文档，Top-5 里"沾到"正确的那份太容易，Recall 必然
+            # 接近满分、区分不出好坏。精度是同一批结果里的另一半信息。
             print(
                 f"精度       = {relevant_hits}/{returned} = {precision:.1%}"
                 f"（召回的每条里，有多少条真的来自期望文档）"
@@ -253,7 +274,7 @@ def evaluate(top_k: int = TOP_K, cases: list = None, verbose: bool = None,
 def main():
     parser = argparse.ArgumentParser(description="检索召回率测评")
     parser.add_argument("--set", dest="use_set", action="store_true",
-                        help="用合成评测集（data/eval_set.jsonl）而不是内置的 9 条")
+                        help="用合成评测集（data/knowledge/eval_set.jsonl）而不是内置的 9 条")
     parser.add_argument("--set-path", default=None, help="指定评测集文件")
     parser.add_argument("--top-k", type=int, default=TOP_K, help=f"默认 {TOP_K}")
     args = parser.parse_args()

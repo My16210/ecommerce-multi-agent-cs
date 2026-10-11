@@ -32,6 +32,12 @@ data/analytics/output/
 # 别人 clone 之后照着脚本重跑得出来，没必要为此背一个 96MB 的二进制。
 data/analytics/source/
 
+# 知识库语料的**原始下载页**（政府网站的整页 HTML）。和上面同一个道理：
+# 几百 KB 的整页 HTML 只是中间物，该进仓库的是 fetch_corpus.py 从里面抽出的
+# 正文（documents/法规原文/）。留着这份缓存是为了改截断规则时不必重抓，
+# 但它不该跟着仓库走——要复现就重跑一次 fetch_corpus.py。
+data/knowledge/source/
+
 logs/
 
 # Milvus 的 Docker 数据卷（docker-compose.milvus.yml 会建 volumes/{etcd,minio,milvus}）

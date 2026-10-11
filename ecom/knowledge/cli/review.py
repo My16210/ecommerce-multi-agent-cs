@@ -11,7 +11,7 @@
     uv run python review.py approve 3 --note "已核对，补了版本号"
     uv run python review.py reject 3 --note "一次性问题"
 
-approve 会把内容落地成 data/documents/reviewed/ 下的一个 md 文件，
+approve 会把内容落地成 data/knowledge/documents/reviewed/ 下的一个 md 文件，
 **然后需要你自己跑一次 `uv run python ingest.py` 才真正进向量库。**
 
 为什么不在这里顺手入库：ingest.py 是向量库的唯一写入口。
@@ -132,7 +132,7 @@ def cmd_show(args) -> int:
 
 def approve_item(item_id: int, note: str = None) -> dict:
     """
-    通过一条待审核记录：渲染成 md 落到 data/documents/reviewed/，并把状态改成 approved。
+    通过一条待审核记录：渲染成 md 落到 data/knowledge/documents/reviewed/，并把状态改成 approved。
 
     返回 {"ok", "path", "already", "message"}，**不打印**——命令行印中文提示、
     Streamlit 渲染成 st.success，展示归调用方（和 judge.record_question 一个套路）。

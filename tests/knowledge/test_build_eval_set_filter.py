@@ -14,7 +14,7 @@ def _chunk(source: str, chunk_id: int) -> dict:
 
 
 CORPUS = [
-    _chunk("LangGraph基础.md", 0),
+    _chunk("中华人民共和国电子商务法.md", 0),
     _chunk("售后政策.md", 0),
     _chunk("售后政策.md", 1),
     _chunk("物流与发票.md", 0),

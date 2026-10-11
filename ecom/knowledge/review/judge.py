@@ -174,10 +174,10 @@ def record_question(question: str, result: dict) -> dict:
 if __name__ == "__main__":
     # 造一份"知识库没答好、主要靠联网"的现场，应该被判为 kb_gap
     demo = {
-        "answer": "Milvus 的 COSINE 返回的是相似度，越大越相关。",
-        "contexts": [{"score": 0.31, "source": "RAG检索增强生成.md", "chunk_id": 3}],
+        "answer": "七天无理由退货的期限，自消费者签收商品之日起计算。",
+        "contexts": [{"score": 0.031, "source": "售后政策.md", "chunk_id": 3}],
         "web_contexts": [{"url": "https://example.com"}, {"url": "https://example.org"}],
-        "sources": ["RAG检索增强生成.md", "https://example.com"],
+        "sources": ["售后政策.md", "https://example.com"],
     }
-    print(json.dumps(judge("Milvus 的 COSINE 相似度和 Chroma 的距离有什么区别？", demo),
+    print(json.dumps(judge("七天无理由退货的七天从哪一天开始算？", demo),
                      ensure_ascii=False, indent=2))

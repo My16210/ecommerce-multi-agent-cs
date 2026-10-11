@@ -60,11 +60,15 @@ class ChromaStore:
         )
         logger.info("写入 %d 个 chunk，集合当前共 %d 条", len(chunks), self.collection.count())
 
+    def delete_source(self, source: str) -> None:
+        """
+        删掉某个 source 的全部 chunk（用途见契约：清理已从盘上删掉的文档）。
+
+        删一个不存在的 source 不会报错——Chroma 的 delete 本来就是空操作。
+        """
+        self.collection.delete(where={"source": {"$eq": source}})
+
     def search(self, query_embedding: list, top_k: int = 5) -> list:
-        """
-        检索最相关的chunk
-        返回：[{"text": ..., "source": ..., "chunk_id": ..., "score": ...}, ...]
-        """
         total = self.collection.count()
         if total == 0:
             logger.warning("向量库为空，请先运行 ingest.py 入库")

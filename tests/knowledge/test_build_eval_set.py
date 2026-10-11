@@ -273,8 +273,8 @@ def _long_chunks(source, count):
 def test_sample_chunks_is_stratified_per_document():
     """按文档分层，而不是全库随机抽
 
-    三份文档分别 140/95/18 段，全库随机抽会让最短的那份几乎抽不到题，
-    而它偏偏是唯一一份"介绍某个产品"的语料，题型和另外两份不一样。
+    十篇法规长短差得远（长的二十多段、短的只有 3 段），全库随机抽会让最短的
+    那篇几乎抽不到题。
     """
     chunks = _long_chunks("a.md", 5) + _long_chunks("b.md", 3)
     picked = sample_chunks(chunks, limit=2)

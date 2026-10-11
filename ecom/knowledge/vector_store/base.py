@@ -49,6 +49,7 @@ class VectorStore(Protocol):
     3. 空库、或 `top_k` 超过库里总条数，`search` 都**不得抛异常**，返回 `[]`
     4. `count()` 允许是近似值（Milvus 的 row_count 有这个性质），只用于判空和夹 top_k
     5. `all_chunks()` 返回全库 chunk，但**不保证顺序**，调用方按 (source, chunk_id) 自己排
+    6. `delete_source` 删掉某个 source 的全部 chunk；删不存在的 source **不报错**
     """
 
     def add_chunks(self, chunks: list, embeddings: list) -> None:
@@ -74,6 +75,21 @@ class VectorStore(Protocol):
         两边都不等于 chunk_id。调用方自己按 (source, chunk_id) 排。
 
         没有分页，chunk 上万时注意内存。
+        """
+        ...
+
+    def delete_source(self, source: str) -> None:
+        """
+        删掉某个 source 的全部 chunk。删一个**不存在**的 source 不报错（幂等）。
+
+        为什么不能靠 `add_chunks([], [])` 顺手删掉：add_chunks 在 chunks 为空时
+        直接 return，根本走不到删除那一步。看着聪明的写法其实是个空操作。
+
+        为什么需要这个方法：add_chunks 的"按 source 幂等"只在**文件还在盘上**时
+        成立——它的前提是这次调用提到了这个 source。文件一旦被删掉，就再也没有
+        哪次 add_chunks 会提到它，它留在库里的 chunk 会永远留着，而且检索照样
+        能召回。症状是"语料换了、评测数字对不上，但库里看着一切正常"。
+        ingest.py 因此在入库后对比一次"库里有、盘上没有"，用这个方法清掉孤儿。
         """
         ...
 
