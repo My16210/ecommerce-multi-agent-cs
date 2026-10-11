@@ -1,10 +1,15 @@
 # ============================================================================
 # 多 Agent 电商智能客服 —— 部署编排
 #
-# 默认（不带 profile）只起一个 app 服务，向量库用 Chroma 嵌入式、订单库用
-# SQLite，**零外部依赖**：
+# 默认（不带 profile）起两个服务，向量库用 Chroma 嵌入式、订单库用 SQLite，
+# **零外部依赖**：
 #     docker compose up -d
-#     → http://localhost:8501
+#     → http://localhost:8501       客户界面（app.py）
+#     → http://127.0.0.1:8502       后台管理端（admin.py，需要 .env 里的 ADMIN_PASSWORD）
+#
+# 两个是**并列的两个入口**，不是一个套一个：app 面向客户演示，admin 给人下
+# 结论用（目前只有"批准退货"）。它们共用同一个镜像，只是 CMD 不同。
+# 后台那一条**故意只绑 127.0.0.1**，理由写在 admin 服务上方。
 #
 # 要换成 Milvus：加上 `milvus` profile，四个服务一起起
 #     docker compose --profile milvus up -d
@@ -94,6 +99,66 @@ services:
     restart: unless-stopped
 
     # 健康检查继承镜像里那份（Streamlit 的 /_stcore/health），不在这里重复一遍。
+
+  # --------------------------------------------------------------------------
+  # 后台管理端（另一个入口，同一个镜像）
+  #     docker compose up -d
+  #     → http://127.0.0.1:8502
+  # --------------------------------------------------------------------------
+  # 【为什么它必须在这里，而不是"让用户自己 streamlit run admin.py"】
+  # **本机 PyPI 不通，用户根本装不了 streamlit。** app.py 一直是靠 compose 跑的，
+  # 后台也得有自己那一条，否则这个入口在用户的机器上打不开——写了等于没写。
+  #
+  # 【端口绑 127.0.0.1，不绑 0.0.0.0——这是密码之外的第二层】
+  # 两层挡的不是同一件事：口令挡"能连到这个端口的人"，绑定挡"根本连不到这个
+  # 端口的人"（同局域网的另一台机器、宿主上任何程序）。**两层都要有。**
+  # 注意 `ports` 左半边写 127.0.0.1 才有效——只写 "8502:8502" 等于绑所有网卡。
+  #
+  # 副作用（要如实说）：**这也意味着它不能被反向代理从外面转发**。真上线时得
+  # 把那层代理自己接过来，而不是把这一行改回 0.0.0.0。
+  admin:
+    build:
+      context: .
+    image: ecom-cs:local
+
+    # 和 app 一样：密钥运行时注入，不烤进镜像。ADMIN_PASSWORD 也走这里——
+    # 没配的话 admin.py 会 **st.error + st.stop**（fail closed，见 admin.py）。
+    env_file:
+      - path: .env
+        required: false
+
+    # 覆盖镜像里的 CMD：同一个镜像跑另一个入口。
+    # --server.address=0.0.0.0 仍然要写（容器内得监听所有网卡，由上面的
+    # ports 那一行负责只把它发布到宿主本机）。
+    command: [
+      "streamlit", "run", "admin.py",
+      "--server.address=0.0.0.0",
+      "--server.port=8502",
+      "--server.headless=true",
+      "--browser.gatherUsageStats=false",
+    ]
+
+    ports:
+      # 左边的 127.0.0.1 **不能省**。被占了就 ADMIN_PORT=8602 docker compose up -d
+      - "127.0.0.1:${ADMIN_PORT:-8502}:8502"
+
+    volumes:
+      # 和 app 是同一份数据。两个容器同时连一个 sqlite 文件是安全的——
+      # 退货审核动的是订单库，会话库只有 app 那条路在写（见 session.py 的连接复用）。
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+    # 【健康检查必须覆盖，不能继承】镜像里那份 HEALTHCHECK 探的是 8501
+    # （CMD 里写死的端口），而这个容器跑的是 8502——不覆盖的话它会**永远不健康**，
+    # 而服务其实是好的。这种"探针指着另一个端口"的错，看日志是看不出来的。
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request\nok = False\ntry:\n    ok = urllib.request.urlopen('http://127.0.0.1:8502/_stcore/health', timeout=3).status == 200\nexcept Exception:\n    pass\nsys.exit(0 if ok else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 25s
+      retries: 3
+
+    restart: unless-stopped
 
   # --------------------------------------------------------------------------
   # 以下三个只在 `--profile milvus` 时启动
