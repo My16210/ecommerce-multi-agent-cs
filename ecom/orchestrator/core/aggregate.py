@@ -27,6 +27,17 @@ insufficient=True 才是**有信息量的失败**：它看过了，这个单元�
 【汇总输出为什么是自由文本，不是 JSON】
 早先版本要求汇总也返回 {"answer": ...}，结果模型经常把整段正文塞进 JSON 字符串里，
 换行和引号全被转义，反而更容易崩、更难读。**人要读的正文就让它直接是正文。**
+
+【这里**刻意不读** `chat_history`】
+调用方（API / 界面 / CLI）会传一整份对话历史进来，`CSState` 里有这个字段——
+但这个文件一次都不该碰它。理由和上面那条同源：汇总只做"各说各的、不替谁判对错"，
+它手上已经有三个 worker 的**结构化结论**了；再把历史塞给它，等于给它素材去
+改写和脑补，**多一次幻觉机会、零信息增益**。
+
+指代消解（「那能退吗」指哪一笔）是 router 和 order worker 的事，已经在那两处
+做完了——轮到汇总时，"这笔订单"早就被解析成了具体订单号。汇总不需要知道用户
+上一轮说过什么。所以"历史只在汇总时用一次"那句老话是**说反了**：它一次都没用过，
+真正用的是 router、order worker 和 knowledge worker。
 """
 from ecom.orchestrator.settings import MAX_ROUNDS, SYNTH_TEMPERATURE, SYNTH_TIMEOUT
 from ecom.orchestrator.utils.llm import get_llm

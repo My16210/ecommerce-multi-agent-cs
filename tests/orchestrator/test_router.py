@@ -138,3 +138,54 @@ def test_retry_tokens_all_counted():
     # 三次都没解析出来 → 三次调用都要记账。只记最后一次会让成本表静静少算。
     result = route("订单 100002 到哪了", llm=FakeLLM("坏输出"))
     assert result["tokens"] == {"in": 30, "out": 15}
+
+
+# ---------------------------------------------------------------------------
+# 跨轮指代：路由也得知道这句话在说上一轮的哪件事
+# ---------------------------------------------------------------------------
+def _history_with_52644() -> list:
+    return [
+        {"role": "user", "content": "订单 52644 到哪了"},
+        {"role": "assistant", "content": "订单 52644 的物流：目的地 San Salvador。"},
+    ]
+
+
+def test_the_router_prompt_carries_the_previous_turn():
+    """LLM 那一路必须看得见上文——没有它，「那能退吗」在分类器眼里是一句没主语的话。
+
+    断言落在"假模型收到的 prompt 里有什么"上：这是能验的**可观察契约**，
+    不必去猜模型的判断。
+    """
+    fake = FakeLLM('{"workers": ["order"], "confidence": 0.9}')
+    route("那能退吗", llm=fake, chat_history=_history_with_52644())
+    prompt = fake.calls[0][1][1]
+    assert "52644" in prompt
+    assert "用户" in prompt
+
+
+def test_the_rule_layer_carries_the_entity_for_a_followup():
+    """真的出过事的那条路：LLM 吐了个空计划，兜底规则必须自己接得上。
+
+    （README「已知限制」记的那个失败，就是发生在这一层——所以光给 LLM 加
+      上文不够，`_rule_route` 也得携带实体。）
+    """
+    result = route("那能退吗", llm=FakeLLM("不是 JSON"), chat_history=_history_with_52644())
+    assert result["plan"] == ["order"]
+    assert result["source"] == "rule"
+
+
+def test_a_followup_without_an_anaphora_word_does_not_summon_the_order_worker():
+    """**门槛管的是"接着上一轮说"，不是"上一轮说过订单"。**
+
+    少了这条，「退货政策是什么」会因为在订单问题后面出现而顺带带上 order——
+    一个纯政策问题被拉去查订单，正是"往关键词表里加词做指代消解"的典型翻车。
+    """
+    result = route("退货政策是什么", llm=FakeLLM("不是 JSON"), chat_history=_history_with_52644())
+    assert "order" not in result["plan"]
+
+
+def test_routing_without_history_stays_single_turn():
+    # 不传 chat_history = 单轮。行为必须和加指代消解之前**一模一样**：
+    # 「那能退吗」没有上文就不该冒出 order。
+    result = route("那能退吗", llm=FakeLLM("不是 JSON"))
+    assert "order" not in result["plan"]

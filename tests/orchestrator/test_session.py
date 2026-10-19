@@ -158,7 +158,7 @@ def test_purge_removes_only_stale_sessions(store):
 
     result = store.purge(older_than_days=30)
 
-    assert result == {"sessions": 1, "messages": 2}
+    assert result == {"sessions": 1, "messages": 2, "memories": 0}
     assert store.get_session(old) is None
     assert store.get_session(fresh) is not None
 
@@ -176,7 +176,127 @@ def test_purge_measures_idle_time_not_age(store):
 
 
 def test_purge_on_an_empty_store_is_a_no_op(store):
-    assert store.purge(older_than_days=30) == {"sessions": 0, "messages": 0}
+    assert store.purge(older_than_days=30) == {"sessions": 0, "messages": 0, "memories": 0}
+
+
+# ——— 记忆（存储这一半；蒸馏/召回在 test_memory.py）———
+
+def _fill(store, sid: str, turns: int) -> None:
+    """给会话灌 `turns` 轮问答。消息 id 从 1 开始，一问一答两条。"""
+    for i in range(turns):
+        store.append_turn(sid, f"问{i}", f"答{i}")
+
+
+def test_out_of_window_messages_stops_at_the_window_edge(store):
+    """滑出窗口的才蒸馏，窗口内的不蒸馏。
+
+    `HISTORY_TURNS` 默认 6，所以窗口是 12 条消息。这里按 `_window_size()`
+    现算而不是写死 12——写死的话，谁把 `HISTORY_TURNS` 调一下就红一片，
+    而那种红说明不了代码有问题。
+    """
+    window = store._window_size()
+    turns = window // 2 + 4  # 比窗口多 4 轮，保证真有滑出去的
+    total = turns * 2
+    sid = store.ensure_session("chat")
+    _fill(store, sid, turns)
+
+    rows = store.out_of_window_messages(sid, limit=10**6)
+
+    assert [r["id"] for r in rows] == list(range(1, total - window + 1))
+    # 两段互补、不重叠：窗口内 + 窗口外 正好是全部消息，中间没有缝
+    assert len(rows) + len(store.history(sid)) == total
+
+
+def test_distilled_messages_are_not_offered_again(store):
+    """水位线挡住已经蒸馏过的那一段——否则每跑一次 distill 都要从头付一次钱。"""
+    window = store._window_size()
+    turns = window // 2 + 4
+    sid = store.ensure_session("chat")
+    _fill(store, sid, turns)
+
+    store.add_memory(sid, "摘要", "关键词", None, turns * 2 - window)
+
+    assert store.out_of_window_messages(sid, limit=10**6) == []
+
+
+def test_a_short_session_has_nothing_to_distill(store):
+    """窗口都还没装满，所有消息都在窗口里——`distill` 说的「无可蒸馏」就是这种。"""
+    sid = store.ensure_session("chat")
+    _fill(store, sid, store._window_size() // 2)
+
+    assert store.out_of_window_messages(sid, limit=10**6) == []
+
+
+def test_writing_the_same_watermark_twice_keeps_one_row(store):
+    """幂等由**数据库**保证，不是由 `_lock` 保证。
+
+    那把锁是进程内的，而 `distill` 是独立进程的 CLI：cron 撞上手动执行时，
+    两边会读到同一个水位线、蒸馏同一批消息、各插一条。`UNIQUE` + `INSERT OR
+    IGNORE` 让第二次成为 no-op——**这条测试就是在钉那个约束真的建上了**。
+    """
+    sid = store.ensure_session("chat")
+    _fill(store, sid, 10)
+
+    assert store.add_memory(sid, "摘要一", "词", None, 8) is True
+    assert store.add_memory(sid, "摘要二", "词", None, 8) is False
+
+    rows = store.memories_for(sid)
+    assert len(rows) == 1
+    assert rows[0]["summary"] == "摘要一"  # 先到的那条留着，后来的被丢掉
+
+
+def test_memories_come_back_oldest_first(store):
+    """按时间正序读回来——它是一段经历，倒着读没有意义。"""
+    sid = store.ensure_session("chat")
+    _fill(store, sid, 20)
+    store.add_memory(sid, "第一段", "", None, 8)
+    store.add_memory(sid, "第二段", "", None, 16)
+
+    assert [m["summary"] for m in store.memories_for(sid)] == ["第一段", "第二段"]
+
+
+def test_delete_takes_the_memories_with_it(store):
+    """删了会话却留着摘要 = 隐私上的假动作：用户以为删干净了，摘要还躺在库里。
+
+    返回契约仍然是**消息条数**（`api.py` / CLI 在用它），所以这里同时钉住
+    "删干净了"和"返回值没变"两件事。
+    """
+    sid = store.ensure_session("chat")
+    _fill(store, sid, 10)
+    store.add_memory(sid, "摘要", "", None, 8)
+
+    assert store.delete_session(sid) == 20
+    assert store.memories_for(sid) == []
+    left = store.connect().execute(
+        "SELECT COUNT(*) AS n FROM memories WHERE session_id = ?", (sid,)
+    ).fetchone()["n"]
+    assert left == 0
+
+
+def test_purge_takes_the_memories_with_it(store):
+    sid = store.ensure_session("chat")
+    _fill(store, sid, 10)
+    store.add_memory(sid, "摘要", "", None, 8)
+    _age(sid, days=40)
+
+    result = store.purge(older_than_days=30)
+
+    assert result == {"sessions": 1, "messages": 20, "memories": 1}
+    assert store.memories_for(sid) == []
+
+
+def test_memories_are_scoped_to_their_own_session(store):
+    """**这条表是会话内的，不是用户画像**——两个会话之间不许串。
+
+    写法上没有任何东西拦着"按关键词跨会话捞摘要"，所以只能靠这条钉住。
+    """
+    a = store.ensure_session("a")
+    b = store.ensure_session("b")
+    _fill(store, a, 10)
+    _fill(store, b, 10)
+    store.add_memory(a, "A 的摘要", "", None, 8)
+
+    assert [m["summary"] for m in store.memories_for(b)] == []
 
 
 # ——— 并发 ———

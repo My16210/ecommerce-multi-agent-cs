@@ -55,7 +55,10 @@ from ecom.orchestrator.tools.order_tools import (
 )
 from ecom.settings import ADMIN_PASSWORD
 
-st.set_page_config(page_title="电商客服后台", page_icon="🔐", layout="wide")
+# layout 保持 "wide"：订单表要宽度，审核卡片也要并排摆按钮。客户界面那边改成
+# 了 centered（对话要一条窄列），**但这两个入口的诉求本来就不一样**，不用统一。
+# 主题（颜色 / 圆角 / 深浅）走仓库根的 .streamlit/config.toml，两个入口共用一份。
+st.set_page_config(page_title="电商客服后台", page_icon=":material/lock:", layout="wide")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -95,10 +98,12 @@ def require_login() -> None:
     if st.session_state.get("admin_ok"):
         return
 
-    st.title("🔐 电商客服后台")
+    # 登录页**不能出现 st.subheader**——`test_admin_smoke.py` 拿它当"有没有把页面
+    # 渲染出来"的判据（未登录时必须是空的）。换皮时别顺手加。
+    st.title("电商客服后台", icon=":material/lock:")
     st.caption("这个后台能对花钱的操作下结论（批准退货），所以有门禁。")
     entered = st.text_input("口令", type="password", key="admin_pw")
-    if st.button("进入", key="admin_login"):
+    if st.button("进入", key="admin_login", icon=":material/login:"):
         if check_password(entered, ADMIN_PASSWORD):
             st.session_state["admin_ok"] = True
             st.rerun()
@@ -120,9 +125,9 @@ def render_returns_page() -> None:
 
     counts = returns.stats()
     col_a, col_b, col_c = st.columns(3)
-    col_a.metric("待审核", counts.get(RETURN_STATUSES[0], 0))
-    col_b.metric("已通过", counts.get(RETURN_STATUSES[1], 0))
-    col_c.metric("已拒绝", counts.get(RETURN_STATUSES[2], 0))
+    col_a.metric("待审核", counts.get(RETURN_STATUSES[0], 0), border=True)
+    col_b.metric("已通过", counts.get(RETURN_STATUSES[1], 0), border=True)
+    col_c.metric("已拒绝", counts.get(RETURN_STATUSES[2], 0), border=True)
 
     status = st.selectbox("看哪个状态", list(RETURN_STATUSES), index=0, key="ret_status")
     rows = returns.list_returns(status=status, limit=200)
@@ -151,11 +156,15 @@ def render_returns_page() -> None:
             note = st.text_area("审核备注", key=f"note_{row['return_id']}", height=80)
             reviewer = st.text_input("审核人", key=f"who_{row['return_id']}")
             col_pass, col_reject, _ = st.columns([1, 1, 4])
+            # 图标只走 icon=，**不拼进 label**：`test_admin_smoke.py` 是按精确成员
+            # 断言 `"通过"` / `"拒绝"` 这两个标签的，拼个前缀进去那条就红了。
             with col_pass:
-                if st.button("通过", key=f"pass_{row['return_id']}"):
+                if st.button("通过", key=f"pass_{row['return_id']}",
+                             icon=":material/check_circle:"):
                     _review(row["return_id"], RETURN_STATUSES[1], note, reviewer)
             with col_reject:
-                if st.button("拒绝", key=f"rej_{row['return_id']}"):
+                if st.button("拒绝", key=f"rej_{row['return_id']}",
+                             icon=":material/cancel:"):
                     _review(row["return_id"], RETURN_STATUSES[2], note, reviewer)
 
 
@@ -224,14 +233,14 @@ def render_orders_page() -> None:
             else:
                 st.caption("这笔订单没有物流记录。")
 
-    st.divider()
+    st.space("medium")
     customer_id = st.text_input("客户号（例如 C20755）", key="admin_customer_id")
     if customer_id.strip():
         rows = list_customer_orders(customer_id.strip())
         if not rows:
             st.warning(f"客户 {customer_id.strip()} 名下没有订单")
         else:
-            st.dataframe(rows, use_container_width=True)
+            st.dataframe(rows, width="stretch")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -264,7 +273,8 @@ def render_kb_queue_page() -> None:
             note = st.text_input("审核备注", key=f"kb_note_{item['id']}")
             col_ok, col_no, _ = st.columns([1, 1, 4])
             with col_ok:
-                if st.button("批准进知识库", key=f"kb_ok_{item['id']}"):
+                if st.button("批准进知识库", key=f"kb_ok_{item['id']}",
+                             icon=":material/check_circle:"):
                     # 复用 CLI 那个函数，一行都不重写——它的返回值就是为界面设计的
                     # （`就已经从 cmd_approve 里拆出来给界面复用`）。
                     result = kb_review.approve_item(item["id"], note=note or None)
@@ -274,7 +284,7 @@ def render_kb_queue_page() -> None:
                     else:
                         st.error(result["message"])
             with col_no:
-                if st.button("拒绝", key=f"kb_no_{item['id']}"):
+                if st.button("拒绝", key=f"kb_no_{item['id']}", icon=":material/cancel:"):
                     kb_queue.set_status(item["id"], "rejected", note=note or None)
                     st.warning(f"已拒绝 #{item['id']}（不进知识库）")
                     st.rerun()
@@ -285,20 +295,28 @@ def main() -> None:
     require_login()
 
     with st.sidebar:
-        st.header("🔐 后台")
-        st.caption("演示级鉴权：一个明文口令，没有用户、没有角色。")
-        if st.button("退出", key="admin_logout"):
+        st.header("后台", icon=":material/admin_panel_settings:")
+        # 徽章而不是又一句说明：这句话是给人看的"别把它当成权限系统"，
+        # 用 caption 写会被当成普通说明读过去，做成徽章反而显眼。
+        st.badge("演示级鉴权：明文口令", icon=":material/lock_open:", color="orange")
+        if st.button("退出", key="admin_logout", icon=":material/logout:"):
             st.session_state["admin_ok"] = False
             st.rerun()
-        st.divider()
+        st.space("medium")
         st.caption(
             "**这里不能做的事**：不执行退款、不改订单状态、不改模型的判定。"
             "后台只登记人的决定。"
         )
 
-    st.title("🔐 电商客服后台")
+    st.title("电商客服后台", icon=":material/lock:")
 
-    tab_returns, tab_orders, tab_kb = st.tabs(["📦 退货审核", "🔍 订单与物流", "📚 知识库队列"])
+    # Tab 标签里可以加图标，但**三个中文子串不能动**——真运行时那条测试是拿
+    # 「退货审核」「订单与物流」「知识库队列」当子串去匹配的。
+    tab_returns, tab_orders, tab_kb = st.tabs([
+        ":material/assignment_return: 退货审核",
+        ":material/search: 订单与物流",
+        ":material/menu_book: 知识库队列",
+    ])
     with tab_returns:
         render_returns_page()
     with tab_orders:

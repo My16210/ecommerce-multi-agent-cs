@@ -73,7 +73,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from ecom.orchestrator import session
+from ecom.orchestrator import memory, session
 from ecom.orchestrator.core.supervisor import answer
 from ecom.orchestrator.db.engine import get_db
 from ecom.orchestrator.settings import API_KEY, MAX_QUESTION_CHARS, MAX_ROUNDS
@@ -100,11 +100,14 @@ async def lifespan(_: FastAPI):
     清理，所以要外挂一行 cron——这条写进 README 的已知限制。
     """
     result = session.purge()
+    # 记忆也一起报：它是这段对话的摘要，**也是用户说过的话**。只报消息数的话，
+    # "记忆有没有被删掉"这件事在日志里看不见——而它恰恰是最该被看见的那部分。
     logger.info(
-        "会话库就绪：%s（清理过期 %s 个会话 / %s 条消息）",
+        "会话库就绪：%s（清理过期 %s 个会话 / %s 条消息 / %s 条记忆）",
         session.SESSION_DB_PATH,
         result["sessions"],
         result["messages"],
+        result["memories"],
     )
     yield
 
@@ -283,7 +286,11 @@ def chat(req: ChatRequest) -> dict:
     session_id = session.ensure_session(req.session_id)
     history = session.history(session_id)
 
-    final = answer(req.question, history)
+    # 记忆拼在真实历史**前面**，而且**每轮现拼、不落盘**——把 `augmented_history`
+    # 的返回值直接交给 `answer()`，**不要存回去**（存回去会跨轮重复累积）。
+    # 会话还没跑过 `distill`（库是空的）时它原样返回，**一次 embedding 都不调**，
+    # 所以没有记忆的会话在这条路上是零额外开销。
+    final = answer(req.question, memory.augmented_history(session_id, req.question, history))
 
     # **先答完再落盘**。反过来的话，模型调用失败也会留下一条"问了没答"的
     # 记录。`append_turn` 内部一问一答是同一个提交，所以这里要么成对写入，

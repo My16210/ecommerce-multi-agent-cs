@@ -15,7 +15,6 @@
 """
 import argparse
 import json
-import sys
 import time
 
 from ecom.orchestrator.core.aggregate import WORKER_LABELS
@@ -23,29 +22,17 @@ from ecom.orchestrator.core.supervisor import answer
 from ecom.orchestrator.db.engine import get_db
 from ecom.orchestrator.db.seed import seed
 from ecom.orchestrator.settings import MAX_ROUNDS, WORKER_TIMEOUT
+
+# GBK 控制台下把打不出来的字符换掉。实现在 utils/console.py——`cli/memory.py`
+# 打印记忆摘要时也用同一份（同一个坑，两处各写一份迟早分叉，而且**只在别人的
+# 终端上才看得见**）。这里保留 `_safe` 这个名字只是为了不动下面那一堆调用点。
+from ecom.orchestrator.utils.console import safe as _safe
 from ecom.orchestrator.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
 LINE = "=" * 66
 THIN = "-" * 56
-
-
-def _safe(text: str) -> str:
-    """
-    GBK 控制台下把打不出来的字符换掉。
-
-    和 rag 项目同一个坑：Windows 控制台默认 cp936，`¥`（U+00A5）、`✅` 这类字符
-    会直接让 print 抛 UnicodeEncodeError——**在回答已经生成之后才崩**，
-    用户看到的是崩溃而不是答案。
-    项目内的约定是用 ￥（U+FFE5）这类 GBK 里有的替代字符，这里是最后一道保险。
-    """
-    try:
-        text.encode(sys.stdout.encoding or "utf-8")
-        return text
-    except (UnicodeEncodeError, LookupError):
-        encoding = sys.stdout.encoding or "utf-8"
-        return text.encode(encoding, errors="replace").decode(encoding, errors="replace")
 
 
 def show(question: str, final: dict, verbose: bool, elapsed_ms: int) -> None:
@@ -117,7 +104,8 @@ def run_question(question: str, chat_history: list, verbose: bool, as_json: bool
 
 
 def interactive(verbose: bool, as_json: bool) -> int:
-    # chat_history 只喂给汇总那一步（见 core/state.py 的上下文隔离说明）。
+    # chat_history 喂给 router（指代消解）和各 worker；汇总节点刻意不读它
+    # （见 core/state.py 的上下文隔离说明）。
     history: list = []
     print(_safe("多 Agent 电商客服。输入问题回车，quit / 退出 结束。"))
     while True:

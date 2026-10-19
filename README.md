@@ -63,8 +63,9 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 ├── LICENSE                      MIT
 ├── .github/workflows/tests.yml  CI：ruff + pytest
 ├── .env / .env.example          一份配置
+├── .streamlit/config.toml       主题（浅/深两套）—— app.py 和 admin.py **共用这一份**
 ├── main.py                      CLI —— **第一入口**，排查问题用这个
-├── app.py                       Streamlit 界面 —— 演示用
+├── app.py                       Streamlit 界面 —— 主区只有对话，另外三个视图收在侧边栏
 ├── admin.py                     Streamlit 后台 —— **要口令**，能批准退货的那一个
 ├── api.py                       FastAPI    —— 可选
 │
@@ -74,9 +75,10 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 │   ├── orchestrator/            编排：supervisor / router / aggregate / workers / db
 │   │   ├── tools/               **模型能调到的**（order_tools.py 的纯函数）
 │   │   ├── admin/               **只有人能下的结论**（returns.py 的退货审核）
-│   │   ├── cli/                 returns.py / session.py —— 和界面共用同一份实现
+│   │   ├── cli/                 returns.py / session.py / memory.py —— 和界面共用同一份实现
 │   │   ├── utils/ids.py         订单号的形状 —— 唯一一份定义
-│   │   └── session.py           多轮记忆的存取层（自己开 sqlite，不用 Database）
+│   │   ├── session.py           会话与记忆的存取层（自己开 sqlite，不用 Database）
+│   │   └── memory.py            蒸馏 / 召回（要联网，所以不塞进 session.py）
 │   ├── knowledge/               知识库：retriever / vector_store / embedding / generator /
 │   │                            document_loader / review / web_search / cli（10 个脚本）
 │   └── analytics/               数据分析：agents / core（graph + sandbox）/ utils / cli
@@ -272,7 +274,7 @@ $ uv run python main.py "订单 52644 到哪了，顺便问下你们的退货政
 
 1. **自然语言消息要再解析一遍**，等于把"理解"这件事做了两次，每次都可能出错，而且出错时分不清是"上游没说清"还是"下游理解错"。
 2. 结构化结果能被程序直接消费——汇总按字段合并、trace 按字段聚合，不用再写一层"从散文里抠信息"的代码。
-3. **上下文隔离的落点就在这**：每个 worker 拿到的是 `question` 和它自己需要的那点东西，**不是完整对话历史**。历史只在汇总那一步用一次。
+3. **上下文隔离的落点就在这**：每个 worker 拿到的是 `question` 和它自己需要的那点东西，**不是完整对话历史**。`chat_history` 是**节点输入**——由调用方给一份、图从不往里写；读它的是 router（指代消解）和各 worker，**汇总节点刻意不读**（那一步只做"各说各的、不替谁判对错"，给它历史等于给它素材去改写和脑补）。
 
 ### 三、`ok=False` 和 `insufficient=True` 是两件事
 
@@ -362,7 +364,7 @@ $ uv run python main.py "订单 52644 到哪了，顺便问下你们的退货政
 
 > **这里是有意不做的：不合成假值充数。** 演示里"承运商是中通，运单号 ZT9988776655"比"目的地圣萨尔瓦多"好看得多，但那是编的——数据里没有的东西一旦被补上，下游"不许引用不存在的事实"那道检查也就跟着失效了。留空 + 文档说明，是这里唯一诚实的做法。
 
-**三、订单号是 1~5 位，不是 6 位以上。** 这个位数假设在**两个地方**存在过：`workers/order.py` 的抽取正则和 `core/router.py` 的路由规则。两处一起改才发现——`\b\d{6,}\b` 对真实订单号**一笔都命中不了**（最大 77204），却会把 6 位以上的发票号路由成"查订单"。**两处各自看都对，合起来就是"路由认得出、抽取认不出"**，这类分叉不会报错，只能靠"把它写进注释并互相点名"来防。
+**三、订单号是 1~5 位，不是 6 位以上。** 这个位数假设在**两个地方**存在过：`workers/order.py` 的抽取正则和 `core/router.py` 的路由规则。两处一起改才发现——`\b\d{6,}\b` 对真实订单号**一笔都命中不了**（最大 77204），却会把 6 位以上的发票号路由成"查订单"。**两处各自看都对，合起来就是"路由认得出、抽取认不出"**，这类分叉不会报错。**修法不是"写进注释互相点名"，是让它只剩一份**：订单号的形状现在只定义在 [`utils/ids.py`](ecom/orchestrator/utils/ids.py)，router 和 order 都 import 它。**能靠"只有一份"消掉的分叉，就不该指望靠注释去对齐**——注释不会在你改另一边的时候变红。（跨轮指代判定同理，只有 `utils/entities.py` 一份。）
 
 代价如实记：**1~4 位的订单号在自然语言里认不出来**。门槛定在 5 位是因为放宽到 4 位会让「2025 年买的」里的 2025 被判成订单号，而认错一个订单号比认不出更糟（见下面「明确不做」）。
 
@@ -529,9 +531,11 @@ uv sync --extra ui
 uv run streamlit run app.py
 ```
 
-四个 Tab 共用一份进程：**智能客服**（答复 + 决策链，就是 `main.py -v` 那份内容的可视化）、**订单**（订单详情 + 物流 + 退货申请）、**数据看板**（报告 + 生成的图）、**知识库**（答复 + 引用到的段落，逐 token 流出来）。
+**主区只有对话**，另外三块收在侧边栏的「直连视图」里 —— 之所以是这个形状，是因为这四个东西里只有一个是"来回说话"：**对话**（答复 + 决策链，就是 `main.py -v` 那份内容的可视化）、**订单**（订单详情 + 物流 + 退货申请）、**数据看板**（报告 + 生成的图）、**知识库**（答复 + 引用到的段落，逐 token 流出来）。把它们并排成四个 Tab，等于说这四件事是同一层级的；收起来之后，页面本身就在说"提问是主线，另外三个是随时可以拐进去看一眼的地方"。
 
-四个 Tab 是**一件事的四个面**，不是三个 App 加一个新 Tab：点开订单 Tab 看到的就是提示词里那个 `query_order`，不是另一个项目。
+四个视图仍然是**一件事的四个面**，共用一份进程、一份配置：点进订单视图看到的就是提示词里那个 `query_order`，不是另一个项目。换个视图只是换一个渲染函数，**不重启、不换进程**。
+
+主题（浅色 / 深色两套）在仓库根的 `.streamlit/config.toml` 里，两个入口共用一份。**右上角「⋮」→ Settings → Theme** 可以直接切 Light / Dark / System —— 不需要任何额外控件，这是 Streamlit 自己的设置菜单。`.streamlit/` 既不在 `.gitignore` 也不在 `.dockerignore`，而镜像是 `COPY . /app`，所以宿主和容器里用的是**同一个文件**。
 
 **但 CLI 才是第一入口，这个顺序不能反**：界面会把"哪一层慢、哪一层挂了"藏起来——超时变成一个转圈动画、异常变成一个红色弹框。调试期用 `main.py -v`，演示时才上界面。
 
@@ -543,7 +547,9 @@ uv run streamlit run app.py
 uv run streamlit run admin.py       # → 8502，需要 .env 里的 ADMIN_PASSWORD
 ```
 
-**它和 `app.py` 并列，不是它的一个 Tab**，这条是设计决定不是偷懒。`app.py` 的 docstring 里写着「不做登录 / 权限：这是离线演示，加一套假登录只会让演示多几步点击」——**那句话现在依然成立，因为后台不是它**。把两者合成一个文件的那天，那句注释就得划掉，而 `app.py` 的定位（面向客户、clone 下来点开就能用）会被一个密码框毁掉。
+**它是和 `app.py` 并列的第二个进程，不是它的一个视图**，这条是设计决定不是偷懒。`app.py` 的 docstring 里写着「不做登录 / 权限：这是离线演示，加一套假登录只会让演示多几步点击」——**那句话现在依然成立，因为后台不是它**。把两者合成一个文件的那天，那句注释就得划掉，而 `app.py` 的定位（面向客户、clone 下来点开就能用）会被一个密码框毁掉。
+
+它**吃的是同一份主题**（`.streamlit/config.toml`），但**没有自己的主题开关**——右上角本来就能切，再加一个就是重复入口。`layout` 也仍然是 `"wide"`：订单表要宽度，审核卡片要并排摆按钮，这两个诉求和"对话收成一条窄列"不一样。
 
 三个页面，**只有一个能写**：
 
@@ -583,6 +589,52 @@ uv run python -m ecom.orchestrator.cli.returns approve R1 --note "客户提供�
 
 同一个 `session_id` 连问两轮，第二轮带得上第一轮的上文。落盘在 `data/orchestrator/sessions.db`（**和订单库分开一个文件**——订单库是"灌一次就不动"的派生数据，会话是"每天都在长"的运行数据）。
 
+**这份历史拿去干什么**（一句话：不是"喂给汇总"，而是"喂给判断"）：**router** 用它做指代消解（「那能退吗」是指哪一笔），**order worker** 用它抽实体，**knowledge worker** 用它生成答案；**汇总节点（`aggregate.py`）刻意不读它**——那一步只做"各说各的、不替谁判对错"。
+
+### 指代消解：只携带订单号，而且读可以、写不可以
+
+判定集中在 [`ecom/orchestrator/utils/entities.py`](ecom/orchestrator/utils/entities.py) 的 `carried_order_id`——router 的规则层和 order worker 走**同一个函数**。为什么要收成一份：这个仓库真出过"两处各写一份、分叉不报错"的事故（订单号位数门槛，见 `utils/ids.py` 的 docstring）。
+
+它是**"携带上一轮提到的实体"，不是往关键词表里加词**——加词会让一个纯政策问题被拉去查订单。三条保守规则，任何一条不满足就**不猜**：只扫用户发言（客服回答里 5 位以上的数字太多）、只看最近 `HISTORY_TURNS` 条、那条消息里有 ≥2 个订单号就放弃。
+
+边界两条，都是有意选的：
+
+- **只有订单号**会被携带（金额、商品名没做——那要的是字段级消解）。
+- **读操作可以回退到携带来的号，写操作（`create_return`）不可以**。所以「订单 52644 到哪了」→「那能退吗」会答"如果要为 **订单 52644** 提交退货申请，回一句确认"，**而不会自动提交**；「那我要退货」也不用携带来的号，退回"请提供订单号"。**代价**：明确诉求时用户得再说一次订单号。这是拿"少问一次"换"绝不对错误订单办事"。
+
+它**不解决"聊久了早期信息滑出窗口"**——那是另一件事，见下一节。
+
+
+### 会话内长期记忆：蒸馏 + 按需召回
+
+`history()` 只带最近 `HISTORY_TURNS` 轮。聊到第 20 轮时，第 3 轮说过的订单号、诉求、结论都已经滑出窗口——模型看不见了，于是会重复问、或者答非所问。这一层把**滑出窗口的那一段**压成一条摘要存进 `memories` 表，需要时**按语义召回**，拼在真实历史**前面**（[`ecom/orchestrator/memory.py`](ecom/orchestrator/memory.py)）。
+
+**存的是"可执行的事实"，不是关键词。** 「超出范围就把前文提炼成关键字另存」这个想法很自然，但它只能告诉你**聊过什么话题**，不能告诉你**结论是什么**——而多轮里真正要继承的恰恰是结论。所以 `summary` 写事实（哪一笔订单、诉求、落到什么结论），`keywords` 只当**索引**：CLI 列表里给人扫一眼，不参与回答。
+
+**是"按需召回"，不是"每轮全灌"。** 全灌 = 每轮把整段记忆塞进 prompt，token 随会话长度线性涨，而且大部分和当前问题无关。召回 = 先按语义挑最相关的 `MEMORY_TOP_K` 条。**不设相似度阈值**：池子是这个会话自己的、条数天然少，加一个没实测过的阈值只会**静默丢掉记忆**。池子为空时**一次 embedding 都不调**——没有记忆的会话在这条路上是零额外开销。
+
+**蒸馏放在 CLI，不放在问答路径上**：
+
+```bash
+uv run python -m ecom.orchestrator.cli.memory distill --session <id>   # 或 --all
+uv run python -m ecom.orchestrator.cli.memory list    --session <id>   # 沉淀了哪些
+uv run python -m ecom.orchestrator.cli.memory recall  --session <id> "问题"   # dry-run
+```
+
+放问答路径上意味着**用户每问一句都可能多一次模型调用**，而且是不可控的那种（第一次问就触发全量蒸馏）。收成一条显式命令之后，模型调用只在有人敲它的时候发生，可以挂 cron，也可以在成本紧张时**不跑**。**代价说清：记忆不是实时的**——要有人跑 `distill` 才更新。这和 `purge` 要外挂 cron 是同一个立场：**不为了让数据"自动正确"而把不确定性塞进请求路径**。
+
+`recall` 那条子命令是**必须有**的：召回是个黑盒，没有它，"线上为什么没带记忆"只能靠猜。它是 dry-run，只读、打印池子大小 / 命中条数 / 每条余弦。这是本仓库「宁可暴露」的一贯做法。
+
+**幂等由数据库保证，不是由锁保证。** `session.py` 那把 `_lock` 是**进程内**的，而蒸馏是独立进程的 CLI——cron 撞上手动执行时，两边会读到同一个水位线、蒸馏同一批消息、各插一条。`UNIQUE(session_id, through_message_id)` + `INSERT OR IGNORE` 让第二次成为 no-op。这就是"水位线"（`through_message_id`）的用途：**记住"已经蒸馏到哪条消息"，而不是记住"是哪条消息"**。
+
+边界三条，都是有意选的：
+
+- **记忆不参与写操作授权**，和上一节的"携带的订单号"同一条底线：摘要里的订单号是模型写的，拿它去提交退货等于替用户对一笔可能错的订单办事。所以一个只提「那笔订单」的**追问，在 order worker 那里仍然可能落到"请提供订单号"**——这条路径宁可多问一次。（router 读得到记忆，所以它至少能被路由对。）
+- **这张表是会话内的，不是用户画像。** 按 `session_id` 键，跨会话一条都召不回来——理由和下面「不做用户画像」那一条完全相同：先有身份，才谈得上画像。
+- **换 embedding 模型会让已存向量失效**，没有版本号落点，也就没有自动重算。记为已知限制。
+
+### 会话操作台
+
 ```bash
 uv run python -m ecom.orchestrator.cli.session list
 uv run python -m ecom.orchestrator.cli.session show <id>
@@ -610,14 +662,17 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 - **界面刻意不把会话号放进 URL**（不做 `st.query_params`）。它是 bearer token，进了 URL 就会进浏览器历史、代理日志、Referer 头。**代价**：新开一个标签页 = 新的一段对话。这条由 `test_a_new_browser_session_starts_a_new_conversation` 钉着——写成测试是因为"没做的能力"最容易被下一个人当成 bug 顺手补上，而补法正好是那个不该做的。
 - **侧边栏只显示前 12 位**。侧边栏是最容易被截图发出去的地方。
 
-### 两个旋钮不要合并
+### 三个旋钮不要合并
 
 | 旋钮 | 管什么 | 性质 |
 |---|---|---|
-| `HISTORY_TURNS = 6` | 喂给模型多少上下文 | **成本** |
+| `HISTORY_TURNS = 6` | 喂给模型多少原文 | **成本** |
 | `SESSION_TTL_DAYS = 30` | 留多久 | **合规** |
+| `MEMORY_TOP_K = 3` | 带几条记忆进 prompt | **成本（另一条通道）** |
 
 看起来都可以叫"留多少"，但改动的动机完全不同。合并成一个开关，会在有人想省钱的时候顺手把合规期限也改掉。
+
+`HISTORY_TURNS` 和 `MEMORY_TOP_K` 同属成本，但**是两条独立通道**：前者是"最近几轮的原文"，后者是"更早那一段的摘要"。一个调大不意味着另一个也该调大——原文精确但贵，摘要便宜但有损，两者不是同一种东西的多少，**所以不给它们一个共同的倍率**。（还有第四个旋钮 `MEMORY_DISTILL_MAX_MESSAGES = 40`，它管的是一次蒸馏喂给模型多少消息，属于离线成本，更不该混进来。）
 
 ### 过期只在两处触发
 
@@ -627,6 +682,12 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 
 ```bash
 17 4 * * * cd /path/to/ecom_cs && uv run python -m ecom.orchestrator.cli.session purge
+```
+
+**蒸馏同样要外挂**（它也不在问答路径上）：跑晚了只是记忆旧一点，跑漏了不会丢消息（水位线没推进，下次接着蒸），所以它不挑时间——但**不能指望它自己发生**。
+
+```bash
+23 4 * * * cd /path/to/ecom_cs && uv run python -m ecom.orchestrator.cli.memory distill --all
 ```
 
 ---
@@ -644,7 +705,7 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 ## 测试
 
 ```bash
-uv run pytest        # 520 条：518 passed / 2 skipped
+uv run pytest        # 555 条（宿主 .venv 实测：553 passed / 2 skipped）
 uv run ruff check .
 ```
 
@@ -691,7 +752,7 @@ uv run ruff check .
 - `test_the_analytics_worker_still_goes_through_a_process_boundary` —— 守着那条边界的替代物：命令行里必须出现 `subprocess`，且不许直接 `import ecom.analytics`。
 - `test_the_three_settings_modules_agree_on_the_root` —— 坑 5 的回归测试。
 - `tests/test_app_smoke.py` / `tests/test_admin_smoke.py` —— 往 `sys.modules` 塞一个**假的 streamlit**，把界面真跑一遍。理由同上：这两个文件是唯一连 import 都进不去的（没装 `--extra ui`），写错一个函数名跑遍全套测试都不会有人报警。**这份假模块不记录关键字参数**，所以断言一律用位置参数——而"未登录看不到后台"这种**真正的**分权保证，放在一条**不依赖 streamlit** 的测试里（门禁逻辑被抽成了纯函数 `check_password`）。
-- `tests/test_app_real_streamlit.py` —— 在**真的 Streamlit 运行时**里（`AppTest`）把 `app.py` / `admin.py` 跑完。补的是假模块够不着的那一段：真版本里函数签名对不对、`st.tabs` 认不认这几个标签、`st.stop()` 是不是真的能中断脚本。**它不证明"界面能用"**：没有浏览器、没有 CSS、没有布局；交互路径（打字触发一次真实问答）也没走过——那会调模型。
+- `tests/test_app_real_streamlit.py` —— 在**真的 Streamlit 运行时**里（`AppTest`）把 `app.py` / `admin.py` 跑完。补的是假模块够不着的那一段：真版本里函数签名对不对、`st.pills(format_func=...)` 和 `st.status(type="compact")` 这些新调用认不认、`st.stop()` 是不是真的能中断脚本。**它不证明"界面能用"**：没有浏览器、没有 CSS、没有布局；交互路径（打字触发一次真实问答）也没走过——那会调模型。
 - `tests/test_api.py` —— 用 `TestClient` 打 HTTP，**monkeypatch 掉 `supervisor.answer`**，所以不联网。覆盖两个鉴权方向、错误体结构、以及"同一个 `session_id` 第二次请求能拿到历史"（会话持久化的真正回归测试）。
 - `tests/orchestrator/test_return_review.py` —— 幂等、竞态（`counts[0] == 0`）、以及**两个方向各一条**的重复申请拦截（`已通过` 必须拦、`已拒绝` 必须放）。
 - `tests/test_milvus_live.py` —— 唯一连**外部服务**的一条，默认 skip，`ECOM_LIVE_MILVUS=1` 才跑。
@@ -714,7 +775,7 @@ uv run ruff check .
 | ✅ | **真实 Streamlit 运行时** | 真跑：`streamlit.testing.v1.AppTest` 把两个入口跑完，6 条全绿。**这补上了原来那一栏 ❌** |
 | ✅ | **合并后的 `API`（FastAPI）真起服务** | 容器内真起 uvicorn：`/health` 200（含 workers + order_db）、`/openapi.json` 元数据齐、空问题 422、`/trace/不存在` 404、真提问 200（257+29 token / 1.2s）。**这一条走了网络、花了 token**，不属于"测试不联网"那一栏 |
 | ✅ | **Milvus 那条代码路径** | 真跑：连宿主常驻的 v2.5.5，`ecom_verify_<随机>` 临时集合走完 add / count / search / delete / drop，**零残留**（另有一条专门查残留）。⚠️ 见下面的版本错位 |
-| ✅ | 520 条测试、ruff | 容器里 **518 passed / 0 failed / 2 skipped**。原来那 2 条红灯都是真缺陷，已修（见「测试」一节）。CI 上是 517 passed / 3 skipped |
+| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条**，现在宿主 `.venv` 上是 **555 条 / 553 passed / 2 skipped**，`ruff` 干净 |
 | ✅ | **CI 本身真跑绿了** | 真跑：[run #38132662970](https://github.com/My16210/ecommerce-multi-agent-cs/actions/runs/38132662970)（2026-10-11）——`ruff: All checks passed!`，`pytest: 517 passed, 3 skipped, 15.06s`，和本机干净 checkout 预演的数字一致。**这一栏原来是 ❌**：工作流写过、命令本地验过，但没推上去就一次都没真跑过。<br>真跑还多抓到两处**本地永远看不出来**的东西：① `python-version-file` 这个输入名**不存在**，setup-uv 只打一条 warning 就忽略它，workflow 照样绿、看着像钉住了版本；② `astral-sh/setup-uv` **没有 `v10` 这个大版本 tag**（它的可移动大版本 tag 只发到 v7），钉 `@v10` 会让 job 在 "Set up job" 阶段就红，得钉精确的 `@v10.3.0`。两处都改成实测过的写法 |
 | ✅ | **许可证** | 有了 `LICENSE`（MIT），`pyproject.toml` 里声明了同一个。之前**一个都没有**——公开仓库没有 LICENSE 等于"保留所有权利"，别人不能合法复用 |
 | ✅ | **`uv sync` 能否装成** | 真构建：镜像里解析出 **150 个包**并装成，五个 extra 全在（matplotlib / streamlit / pymilvus / pymysql / tavily-python / fastapi 逐个确认过） |
@@ -731,7 +792,11 @@ uv run ruff check .
 写得和做了什么一样重要。
 
 - **不做多智能体自由对话**（一群 agent 互相聊天、投票、辩论）。那种结构里，一次错误会被下游放大，而且**没法定位是哪一环错了**。这里用结构化契约 + 单向数据流，代价是"不如自由对话灵活"，换来的是每一步都能查。
-- **长期记忆：做了"会话"，没做"用户画像"。** 这一条以前写的是「不做长期记忆……要真做，得先想清楚存哪、怎么删、合规怎么办」——现在那三个问题**有答案了**：落盘在 `data/orchestrator/sessions.db`（存哪）、按 30 天过期 + `purge` / `delete` 命令（怎么删）、过期是默认行为而不是可选项（合规）。**但仍然不做用户画像**：跨会话的用户级记忆需要"这个人是谁"稳定可信，而这里客户身份是从话里猜的（`_guess_customer`），没有登录态，做出来的画像会挂在错误的身份上。**先有身份，才谈得上画像** —— 这是顺序问题，不是工作量问题。
+- **长期记忆：做了"会话"，没做"用户画像"。** 这一条以前写的是「不做长期记忆……要真做，得先想清楚存哪、怎么删、合规怎么办」——现在那三个问题**有答案了**：落盘在 `data/orchestrator/sessions.db`（存哪）、按 30 天过期 + `purge` / `delete` 命令（怎么删）、过期是默认行为而不是可选项（合规）。
+
+  **会话内那层摘要（`memories` 表）同一条边界，也要说死**：它是按 `session_id` 键的，**不是"开始做画像"的先例**。删会话连它一起删（`delete_session` / `purge` 都级联到 `memories`）——删了会话却留着它的摘要，是**隐私上的假动作**：用户以为删干净了，而摘要还躺在库里。
+
+  **仍然不做用户画像**：跨会话的用户级记忆需要"这个人是谁"稳定可信，而这里客户身份是从话里猜的（`_guess_customer`），没有登录态，做出来的画像会挂在错误的身份上。**先有身份，才谈得上画像** —— 这是顺序问题，不是工作量问题。
 - **不把 `session_id` 当账号。** 它是 bearer token（拿到就能读到整段历史），所以：界面不把它放进 URL、侧边栏只显示前 12 位、默认 30 天过期。**没做的能力写成测试钉住**（`test_a_new_browser_session_starts_a_new_conversation`），因为最容易被下一个人当成 bug 顺手补上——而补法（`st.query_params`）正好是那个不该做的。
 - **不执行退款、不改 `orders.status`。** 后台的"批准退货"只做两件事：改 `return_requests.status` + 插一行 `return_reviews` 痕迹，**在同一个事务里**。没有支付网关可调，**假装退款比不做更坏**；而 `orders.status` 是数据源原值，改它就是在编造数据。
 - **不给 `return_requests` 加列，也不引入 schema 迁移机制。** 审核痕迹放**新表** `return_reviews`，用 `CREATE TABLE IF NOT EXISTS` 天然兼容老库。理由两条：这个项目里"删库重灌"一直是免费的（全是派生数据），为了加三列而引入第一个迁移机制，收益和分量不匹配；以及**一旦这套被演示过，库里就会有人下的结论**，那时再重灌就等于抹掉人的决定——**在一个只有派生数据的库上引入"删除即无损失"的隐含假设，是最容易留下的技术债**。
@@ -749,7 +814,7 @@ uv run ruff check .
 - **`_guess_customer` 是从自然语言里猜客户号的 demo 将就**。真系统里客户身份来自登录态，绝不从话里猜——那等于让任何人问出别人的订单。这一点在代码里也标了警告。
 - **一条依赖装不上就少一条腿**。数据分析是核心能力，但它依赖 matplotlib 出图——缺了它整个 worker 会走"自动重试 3 次后放弃"的路径，报告里说"分析未能完成"，而不是崩掉。这是设计里的降级，但它意味着**环境不全时这个项目看起来是"三分之二可用"的**。
 - **会话过期要有外挂的 cron，长驻进程不会自我清理。** 过期只在两处触发：进程启动时一次、CLI 显式调用。**不做**懒加载式的"读的时候顺手删"——那会让读操作产生写副作用，出问题时极难定位。这个代价是**换来的**，不是漏掉的。同一台机器跑三个副本的话，各自清各自的。
-- **路由不解析代词回指**（真跑 `/chat` 时发现的，不是推测）。带历史追问「那它的金额是多少」，历史**确实进了 prompt**（token 从 257 涨到 387），但路由第一层是关键词规则，`plan` 是空的，于是答了"没听明白"。**会话存储没问题，缺的是指代消解**——这是一条已知限制，不是 bug。真要做，得先决定"把上一轮提到的实体带进路由提示词"这件事由谁负责，而不是顺手往正则里加几个词。
+- **跨轮指代消解只做"订单号"这一种实体，而且只在指代词出现时才触发。** 这条原来叫"路由不解析代词回指"（真跑 `/chat` 时发现的，不是推测）：带历史追问「那它的金额是多少」，历史**确实进了 prompt**（token 从 257 涨到 387），但路由第一层是关键词规则，`plan` 是空的，于是答了"没听明白"。**现在修了**，判定集中在 [`utils/entities.py`](ecom/orchestrator/utils/entities.py)，router 的规则层和 order worker 走同一个函数（细节见上面「会话持久化」一节）。三条边界，都是有意的：**（1）只有订单号**会被携带，金额 / 商品名没做；**（2）读操作可以回退到携带来的号，写操作 `create_return` 不可以**（所以它永远**不会**替用户对一笔猜出来的订单提交退货）；**（3）携带只覆盖最近 `HISTORY_TURNS` 条用户发言**。它**不解决**"聊久了早期信息滑出窗口"——那是会话内长期记忆，见上面「会话内长期记忆：蒸馏 + 按需召回」一节。
 - **Milvus 客户端与服务端版本错位**。本机常驻的服务端是 **v2.5.5**，而 `pyproject.toml` 把 pymilvus pin 在 `>=2.6,<3`、compose 里那个服务是 `milvusdb/milvus:v2.6.24`。实测客户端 2.6 连 2.5.5 服务端这几个接口都能用（验证矩阵里那一行就是跑通的证据），但**这条对应关系没有保证**。真要长期用，服务端该换到 2.6.x 对齐 pin。
 - **`admin.py` 是演示级鉴权**。一个明文口令，没有用户、没有角色、没有审计（"审核人"是界面上手填的一个字符串，填不填都行）。它挡住的是"随手扫到这个端口的人"，**别把它说成"做了权限系统"**。第二层是 compose 里那个 `127.0.0.1` 绑定。
 - **两个界面现在都只绑 `127.0.0.1`**（原来只有 admin 绑，app 发布在 `0.0.0.0` 且无任何鉴权）。app 那条没有口令那一层，所以绑定是它**唯一**的一层。要跨机器演示就 `APP_BIND=0.0.0.0 docker compose up -d`——那一刻是你**自己**决定暴露它，而不是默认敞着。

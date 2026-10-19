@@ -77,7 +77,9 @@ def _install_fake_streamlit(pressed_keys=(), inputs=None):
 
     for _name in (
         "caption markdown warning info error success title header subheader "
-        "divider metric dataframe json code write text expander container"
+        "divider metric dataframe json code write text expander container "
+        # 后台换皮新增的两个：状态用 badge，间距用 space 替掉分割线。
+        "badge space"
     ).split():
         setattr(st, _name, _recorder(_name))
 

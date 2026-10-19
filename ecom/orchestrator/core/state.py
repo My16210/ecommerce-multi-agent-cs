@@ -9,8 +9,9 @@ Agent 之间**不传自然语言**。Worker 之间不互相对话，它们只跟
    而且出错时很难定位是"上游表达不清"还是"下游理解错"。
 2. 结构化结果能被程序直接消费——汇总节点可以按字段拼接、trace 能按字段聚合，
    不用再写一层"从散文里抠信息"的代码。
-3. 上下文隔离的落点就在这里：每个 worker 拿到的是 `question` 和它自己需要的
-   那点上下文，**不是完整对话历史**。历史只在汇总时用一次。
+3. 上下文隔离的落点就在这里：worker 之间**不共享会话**，各自拿到 `question`
+   和它自己需要的那点上下文。"最近几轮对话"是随调用一起传进来的**节点输入**
+   （`chat_history`），不是谁都能改的共享状态——见下面 `CSState.chat_history` 的说明。
 
 【为什么 results 要用 reducer】
 worker 节点是**并行**执行的（同一超步），多个节点同时往 `results` 写。
@@ -52,7 +53,14 @@ class WorkerResult(TypedDict, total=False):
 class CSState(TypedDict, total=False):
     # ——— 输入 ———
     question: str
-    chat_history: list  # [{"role": "user"/"assistant", "content": ...}]，只在汇总时用
+    # [{"role": "user"/"assistant"/"memory", "content": ...}]
+    # **这是节点输入，不是图状态**：由调用方塞进来，图自己不累加、不修改它。
+    # 读它的有三个地方：router（指代消解，见 core/router.py 开头）、order worker
+    # （抽实体）、knowledge worker（生成答案）。
+    # **汇总节点（core/aggregate.py）刻意不读它**——那一步只做"各说各的、不替谁
+    # 判对错"，给它历史等于给它素材去改写和脑补：多一次幻觉机会，零信息增益。
+    # （"只在汇总时用一次"是仓库里说反了的旧说法，一并纠正。）
+    chat_history: list
 
     # ——— 路由 ———
     plan: list  # 本轮要调用哪些 worker（worker 名的子集）

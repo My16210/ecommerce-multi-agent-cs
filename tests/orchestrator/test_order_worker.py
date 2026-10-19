@@ -292,3 +292,93 @@ def test_a_successful_return_is_only_registered_not_approved(wired):
     assert "待审核" in result["answer"]
     # 决定权在人手里——模型不该有"通过退货"的能力
     assert get_returns(COMPLETE_ORDER, wired)[0]["status"] == "待审核"
+
+
+# ---------------------------------------------------------------------------
+# 跨轮指代：**读可以携带，写不可以**（见 order.py 模块 docstring）
+# ---------------------------------------------------------------------------
+def _history_with_the_order() -> list:
+    """上一轮用户提过订单号。这就是 README「已知限制」里描述的那个场景。"""
+    return [
+        {"role": "user", "content": f"订单 {COMPLETE_ORDER} 到哪了"},
+        {"role": "assistant", "content": f"订单 {COMPLETE_ORDER} 的物流：目的地 San Salvador。"},
+    ]
+
+
+def test_a_followup_inherits_the_order_id_for_a_read():
+    # 「它到哪了」里没有订单号，主语在上一轮。规则这条路就该接得上，不必去问模型。
+    intent = extract_intent("它到哪了", llm=ExplodingLLM(), chat_history=_history_with_the_order())
+    assert intent["action"] == "tracking"
+    assert intent["order_id"] == COMPLETE_ORDER
+    assert intent["order_id_source"] == "context"
+    assert intent["source"] == "rule"
+
+
+def test_the_carried_order_id_is_tagged_with_where_it_came_from():
+    """来源标记是写操作那道闸的全部依据，所以三种情况都要钉住。
+
+    不标来源，`run_order` 就分不开"用户自己说的号"和"从上下文猜的号"。
+    """
+    from_question = extract_intent(f"订单 {COMPLETE_ORDER} 到哪了", llm=ExplodingLLM())
+    from_context = extract_intent("那能退吗", llm=ExplodingLLM(), chat_history=_history_with_the_order())
+    neither = extract_intent("你好", llm=ExplodingLLM())
+    assert from_question["order_id_source"] == "question"
+    assert from_context["order_id_source"] == "context"
+    assert neither["order_id_source"] == ""
+
+
+def test_a_read_followup_is_answered_for_the_carried_order(wired):
+    # 携带来的号在**读**这条路上是照常用的——答错了用户当场看得出来。
+    result = run_order("它到哪了", chat_history=_history_with_the_order())
+    assert result["insufficient"] is False
+    assert COMPLETE_ORDER in result["answer"]
+    assert "San Salvador" in result["answer"]
+
+
+def test_a_carried_order_id_is_never_used_to_file_a_return(wired):
+    """**这一组里最重要的一条。**
+
+    「那我要退货」携带来 52644，但写操作**不许**用猜来的号：拿它去提交退货申请，
+    等于把"一条已知限制"升级成"替用户对错误订单提交退货"，而且**它已经落库了**。
+    所以它必须退回"请提供订单号"，等用户显式给出。
+    """
+    result = run_order("那我要退货", chat_history=_history_with_the_order())
+    assert result["insufficient"] is True
+    assert "订单号" in result["answer"]
+    assert get_returns(COMPLETE_ORDER, wired) == []   # 库里没多出东西
+
+
+def test_a_policy_followup_names_the_carried_order_but_still_asks_first(wired):
+    """README「已知限制」那一幕修好之后的样子。
+
+    「订单 52644 到哪了」→「那能退吗」：第二轮认得出主语是 52644（答案里点名它），
+    但**仍然止步在"确认申请退货"**——指代消解修的是"听不听得懂"，不是"该不该动手"。
+
+    （`wired` 把模型换成"调用即抛"，所以走的是"规则认不出动作"那条分支。）
+    """
+    result = run_order("那能退吗", chat_history=_history_with_the_order())
+    assert result["insufficient"] is True
+    assert COMPLETE_ORDER in result["answer"]
+    assert get_returns(COMPLETE_ORDER, wired) == []
+
+
+def test_a_model_that_calls_the_followup_a_return_still_names_the_order(wired, monkeypatch):
+    """**上一条测不到的那条路，这条专门守。**
+
+    真模型（实测）会把「那能退吗」判成 `create_return`——不是认不出动作，是
+    直接认成了写操作。那时候"写操作不许用猜来的号"这道闸如果卡在入口，就会把
+    澄清问句里的号也一起清掉，答案退化成"如果要为**某一笔订单**提交退货申请"，
+    等于白做了指代消解。
+
+    所以闸卡在**真正落库前那一行**：这条路上答案要点名 52644，而且库仍然不变。
+    """
+    from tests.orchestrator.conftest import FakeLLM
+
+    monkeypatch.setattr(
+        "ecom.orchestrator.workers.order.get_llm",
+        lambda *a, **k: FakeLLM('{"action": "create_return", "order_id": "", "reason_text": "问退货"}'),
+    )
+    result = run_order("那能退吗", chat_history=_history_with_the_order())
+    assert COMPLETE_ORDER in result["answer"]
+    assert result["insufficient"] is True
+    assert get_returns(COMPLETE_ORDER, wired) == []

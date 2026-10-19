@@ -65,20 +65,25 @@ graph LR
 
 ## 三、router 节点的三层优先级
 
-代码在 [router.py:142-215](ecom/orchestrator/core/router.py#L142-L215)。顺序就是优先级，**从"聪明"到"兜底"**：
+代码在 [router.py:146-286](ecom/orchestrator/core/router.py#L146-L286)。顺序就是优先级，**从"聪明"到"兜底"**：
 
 ```
-route(question, tried)
+route(question, tried, chat_history)
   │
   ├─ ① LLM 分类          ── 成功 → source="llm"
+  │     · 提示词里带一段**有界**的「上文」（最近 2 轮 + 几条记忆），
+  │       否则「那能退吗」在分类器眼里是一句没主语的话
   │     └─ 失败（超时/没key/解析不出）→ 落到 ②
   │       · max_retries=0（重试权收回来）
   │       · ROUTER_TIMEOUT=8s 单次，ROUTER_BUDGET=20s 总时长
   │
   ├─ ② 关键词规则        ── 命中 → source="rule"
-  │     订单号(6位数字)/物流/退货… → order
+  │     订单号(5位以上数字)/物流/退货… → order
   │     销量/排名/趋势/占比…       → analytics
   │     政策/保修/发票/流程…       → knowledge
+  │     · 另外：这句若是**指代上一轮的追问**（"那能退吗"），
+  │       用 utils/entities.carried_order_id 携带回订单号 → 补一个 order
+  │       （是"接着上一轮说"，**不是**往关键词表里加词）
   │     └─ 一个都没命中 → 落到 ③
   │
   └─ ③ 最小默认计划      ── source="fallback"，plan=["knowledge"]
@@ -91,6 +96,10 @@ route(question, tried)
 **`router_source` 必须记进 trace**：它是判断路由健康度的关键指标——"rule / fallback 的比例一涨，说明 LLM 那边在坏"。
 
 低置信度（< 0.6）时会往计划里**补一个 knowledge**。这是**故意的不对称**：漏调一个 worker = 少答一半（用户看得出来），多调一个 = 多花一次调用（用户看不出来）。
+
+**为什么路由也要看上一轮**：「那能退吗」「那它的金额是多少」这类追问，光看当轮那句字符串判断不了——它既没有订单号，也没有"订单"两个字。上一轮提到的那笔订单就是这句话的主语。所以 `route` 收一个 `chat_history`，**LLM 层**拿到一段有界的上文（最近 `_CONTEXT_TURNS=2` 轮，各截断到 160 字），**规则层**走 `carried_order_id`。
+
+**门槛管的是"接着上一轮说"，不是"上一轮说过订单"**：没有指代词（那/它/这笔…）就不携带。少了这条，「退货政策是什么」会因为在订单问题后面出现而顺带带上 order——一个纯政策问题被拉去查订单，正是"往关键词表里加词做指代消解"的典型翻车。携带到的号**只读操作能用**（见 §四 与 [workers/order.py](ecom/orchestrator/workers/order.py) 开头的边界）。
 
 ---
 
@@ -203,12 +212,13 @@ worker_analytics ──► subprocess        python -m ecom.analytics.cli.analyz
 | 入口 | 给谁用 | 为什么是它 |
 |---|---|---|
 | [main.py](main.py) | **排查问题** | 决策链摊在眼前；界面会把它藏起来 |
-| [app.py](app.py) | 演示 | 四个 Tab = 四个面，共用一份进程 |
+| [app.py](app.py) | 演示 | 主区是对话，另外三个面收在侧边栏；四个视图共用一份进程 |
 | [admin.py](admin.py) | **下结论** | 三个页面里只有一个能写；口令不配就拒绝启动 |
 | [api.py](api.py) | 被别的程序调 | `def` 不是 `async def`——图里全是阻塞调用 |
 | `python -m ecom.analytics.cli.analyze` | **给编排层当子进程** | stdout 只吐一行 JSON；契约写在名字里 |
 | `python -m ecom.orchestrator.cli.returns` | 容器里排障 / 写脚本 | 和 `admin.py` 调**同一份** `admin.returns`，不是两套逻辑 |
 | `python -m ecom.orchestrator.cli.session` | 会话的 list / show / delete / purge | 长驻进程不自清，清理由这条命令承担 |
+| `python -m ecom.orchestrator.cli.memory` | 记忆的 distill / list / recall | 蒸馏要调模型，**刻意不放在问答路径上**（见第八节后半） |
 
 `admin.py` 和 `app.py` **并列而不是合成一个**：`app.py` 是"面向客户、clone 下来点开就能用"，加一个密码框会毁掉这个定位。
 
@@ -222,21 +232,52 @@ worker_analytics ──► subprocess        python -m ecom.analytics.cli.analyz
 sequenceDiagram
     participant C as 客户端 / 界面
     participant S as session.py
+    participant M as memory.py
     participant A as supervisor.answer
     participant G as 图
 
     C->>S: load_history(session_id, max_turns=6)
     Note over S: 取**最近** 6 轮：ORDER BY id DESC LIMIT n，再 reversed<br>（截错方向不会报错，只会让模型拿到很旧的上文）
     S-->>C: [{"role","content"}, ...]
-    C->>A: answer(question, chat_history=历史)
-    Note over A: make_initial_state 把它塞进去<br>只在 aggregate 那一步读一次
+    C->>M: augmented_history(session_id, question, history)
+    Note over M: 按语义召回该会话沉淀的摘要<br>池子为空就一次 embedding 都不调<br>拼在真历史**前面**，role="memory"
+    M-->>C: [{"role":"memory",...}, *真历史]
+    C->>A: answer(question, chat_history=上面那份)
+    Note over A: make_initial_state 把它塞进去<br>图从不往回写；router 和各 worker 读它，aggregate 刻意不读
     A->>G: invoke
     G-->>A: answer
     A-->>C: answer + sources
     C->>S: save_turn(session_id, question, answer)
 ```
 
-两个旋钮分开：`HISTORY_TURNS=6` 管**成本**（喂多少），`SESSION_TTL_DAYS=30` 管**合规**（留多久）。合并成一个开关，会在有人想省钱的时候顺手把合规期限也改掉。
+**注入在调用方做，图里没有"记忆"这个字段**——省下十几个文件的改动不是主要理由，
+**多一条要与 `chat_history` 长期保持同步的平行管道才是**。代价是调用方得守一条规矩：
+**每轮现拼、不落盘、不累积**（拿到返回值直接传给 `answer()`，不要再存回去）。
+记忆不进 `messages` 表，所以它不会出现在 `cli.session show` 里，也不会被 `history()` 截断。
+
+三个旋钮分开：`HISTORY_TURNS=6` 管**成本**（喂多少原文），`SESSION_TTL_DAYS=30` 管**合规**（留多久），`MEMORY_TOP_K=3` 管**成本**（带几条摘要）——但后两者是**两条独立的通道**（原文精确但贵，摘要便宜但有损），不给它们一个共同的倍率。合并成一个开关，会在有人想省钱的时候顺手把合规期限也改掉。
+
+### 八之二、记忆是**离线**长出来的
+
+```mermaid
+sequenceDiagram
+    participant Cron as cron（或人）
+    participant M as memory.py
+    participant S as session.py
+
+    Cron->>M: distill --all
+    M->>S: out_of_window_messages(sid, limit)
+    Note over S: 下界：id > 已蒸馏到的最大 id（不重复喂）<br>上界：id <= 最大 id - 窗口宽度（**窗口内的不蒸馏**）
+    S-->>M: 滑出窗口那一段
+    M->>M: 模型压成一条摘要（可执行的事实）<br>+ embedding
+    M->>S: add_memory(..., through_message_id)
+    Note over S: UNIQUE(session_id, through_message_id) + INSERT OR IGNORE<br>**幂等由数据库保证，不是由锁保证**（_lock 是进程内的，而这是个独立进程）
+```
+
+**为什么不顺手在问答路径上蒸**：那意味着用户每问一句都可能多一次模型调用，而且不可控
+（第一次问就触发全量蒸馏）。收成显式命令之后，模型调用只在有人敲它的时候发生。
+**代价说清：记忆不是实时的** —— 要有人跑 `distill` 才更新，所以它也要外挂 cron，
+和 `purge` 同一个立场。
 
 **`session_id` 是凭证不是账号**（客户身份是 `_guess_customer` 从话里猜的、未认证的），所以界面不把它放进 URL、只显示前 12 位。这条"没做的能力"由测试钉着。
 

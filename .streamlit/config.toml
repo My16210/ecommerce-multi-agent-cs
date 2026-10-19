@@ -1,0 +1,53 @@
+# 界面主题。**整个仓库里唯一一处"样式"就在这个文件。**
+#
+# 【为什么是 config.toml 而不是 CSS】
+# 原生主题令牌是官方支持的入口：它作用在每一个组件上、跟着 Streamlit 版本走。
+# 而 CSS 选择器指向的是内部类名，升级一次就可能静默失效——不是崩，是某天
+# 发现某块样式没了。这个项目没有前端构建链，也就不该有需要维护的 CSS。
+#
+# 【为什么这里一个 [server] 段都没有】
+# 容器里的监听地址是 Dockerfile 的 CMD 用命令行参数给死的
+# （`--server.address=0.0.0.0` 是容器外能连上的唯一原因）。那份配置**只对容器
+# 成立**，而 host 上跑 `uv run streamlit run app.py` 时那个 0.0.0.0 是错的。
+# 所以 server 走命令行、theme 走这个文件，两边不重叠——这里再写一份 [server]
+# 会把宿主的本地开发一起改掉。
+#
+# 【为什么 light 和 dark 两个段都写】
+# 同时定义 [theme.light] 和 [theme.dark]，Streamlit 右上角设置菜单里才会出现
+# Light / Dark / System 三档。只写一个 [theme] 会把界面**锁死**在单模式——
+# 换句话说，"右上角能切深浅"这件事不需要在 app.py 里写任何控件。
+#
+# 【为什么不引 Google Fonts】
+# `font = "Inter:https://fonts.googleapis.com/..."` 那一路看着更精致，但：
+#   ① 中文字形 Inter 本来就没有，中文照样走系统字体；
+#   ② 加载不到时是**静默回退**，症状是"字体怎么没变"，很难联想到是网络；
+#   ③ 给一个"clone 下来离线也能跑"的演示加一个网络依赖，方向是反的。
+# 默认字体在这台机器的中文环境下本来就不难看，不值得为它换三个代价。
+
+[theme]
+# DeepSeek / 豆包那种观感：圆角偏大、按钮是胶囊、链接不带下划线。
+baseRadius = "large"
+buttonRadius = "full"
+showWidgetBorder = true
+showSidebarBorder = true
+linkUnderline = false
+baseFontSize = 15
+
+[theme.light]
+primaryColor = "#4D6BFE"
+backgroundColor = "#FFFFFF"
+# secondary 必须比 background **更深**，反了就分不出层次（代码块、聊天气泡都用它）。
+secondaryBackgroundColor = "#F4F5F7"
+textColor = "#1B1B1F"
+borderColor = "#E3E5E8"
+codeBackgroundColor = "#F4F5F7"
+
+[theme.dark]
+# 深色下 primary 要提亮：同一个 #4D6BFE 放在 #1A1B1E 上，按钮上的白字对比度
+# 掉到 AA 以下。这不是审美偏好，是"深色模式别把按钮写得看不清"。
+primaryColor = "#7C93FF"
+backgroundColor = "#1A1B1E"
+secondaryBackgroundColor = "#26272B"
+textColor = "#E8E9EC"
+borderColor = "#35373B"
+codeBackgroundColor = "#26272B"

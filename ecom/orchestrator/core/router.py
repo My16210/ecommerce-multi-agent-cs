@@ -18,6 +18,17 @@ Supervisor 的路由：这句话该交给谁处理。
 【为什么排除 tried】
 回环重路由时必须排除已经试过的 worker，否则"没答上来 → 再路由 → 还是它"
 就是个死循环。所有权的约束在 supervisor 那层用 MAX_ROUNDS 兜底，这里负责不原地打转。
+
+【为什么路由也要看上一轮】
+「那能退吗」「那它的金额是多少」这类追问，**光看当轮那句字符串是判断不了的**——
+它既没有订单号，也没有"订单"两个字。上一轮提到的那笔订单就是这句话的主语。
+所以 route 收一个 chat_history（由 `_router_node` 从 state 传进来）：LLM 层拿到
+一段**有界**的「上文」（见 `_context_block`），规则层走 `utils/entities` 的
+`carried_order_id`——**那是"携带上一轮提到的实体"，不是往关键词表里加词**。
+
+这条同时纠正了仓库里一处说反了的文档：`state.py` / README / 技术文档一直写着
+"历史只在汇总那一步用一次"，但汇总节点（`core/aggregate.py`）**一次都没读过**
+`chat_history`；真正读它的是 knowledge worker，和（从这一版起）router。
 """
 import re
 import time
@@ -28,6 +39,7 @@ from ecom.orchestrator.settings import (
     ROUTER_TEMPERATURE,
     ROUTER_TIMEOUT,
 )
+from ecom.orchestrator.utils.entities import carried_order_id
 from ecom.orchestrator.utils.ids import ORDER_ID_RE
 from ecom.orchestrator.utils.json_utils import loads_or_none
 from ecom.orchestrator.utils.llm import get_llm
@@ -62,6 +74,11 @@ ROUTER_PROMPT = """你是电商客服系统的调度中心。理解用户这句�
 - 只有一处需求就只返回一个。
 - 拿不准时返回 knowledge。
 - workers 只能从上面这几个名字里选，不要造新名字。
+- 若用户这句话里有指代（"它""那笔订单""刚才那个"），指的是【上文】里的东西，
+  按【上文】说的是哪件事来判断交给谁。
+
+【上文】
+{context}
 
 【用户的话】
 {question}"""
@@ -92,12 +109,57 @@ _RULES = [
 ]
 
 
-def _rule_route(question: str) -> list:
-    """规则兜底：命中的都返回（可能多意图），一个都没命中返回空。"""
+# 「上文」给多少：轮数和每轮的字数都封顶。这是**成本参数**，不是随手取的——
+# 路由每一轮都跑，喂进去的每一个字都要付钱，而且喂多了还有副作用（见 _context_block）。
+_CONTEXT_TURNS = 2
+_CONTEXT_CHARS = 160
+# 更早的对话摘要（记忆，见 ecom/orchestrator/memory.py）最多带几条进路由提示词。
+_MAX_MEMORY_LINES = 3
+_ROLE_LABEL = {"user": "用户", "assistant": "客服", "memory": "更早的对话摘要"}
+
+
+def _context_block(chat_history: list) -> str:
+    """
+    把最近几轮压成一段有界的「上文」，给 LLM 层做指代消解用。
+
+    **只给最近 `_CONTEXT_TURNS` 轮，不给整段历史**，两个理由：
+    1. 这一层是 `temperature=0` 的分类任务，而 assistant 的历史回答里 5 位以上的
+       数字最多（销售额、总条数、退货率），整段塞进去会把路由往 order 带。
+    2. 路由每轮都跑，整段历史每轮都要付一次 token。
+
+    记忆（`role="memory"`）单独排在前面——它们本来就是"更早的对话"，位置上也该在上。
+    """
+    history = list(chat_history or [])
+    memories = [t for t in history if str(t.get("role") or "") == "memory"]
+    turns = [t for t in history if str(t.get("role") or "") != "memory"]
+
+    lines = []
+    for turn in memories[:_MAX_MEMORY_LINES] + turns[-_CONTEXT_TURNS * 2:]:
+        content = str(turn.get("content") or "").strip()
+        if not content:
+            continue
+        who = _ROLE_LABEL.get(str(turn.get("role") or ""), "上文")
+        lines.append(f"{who}：{content[:_CONTEXT_CHARS]}")
+    return "\n".join(lines) if lines else "（无）"
+
+
+def _rule_route(question: str, carried_id: str = "") -> list:
+    """
+    规则兜底：命中的都返回（可能多意图），一个都没命中返回空。
+
+    `carried_id` 非空 = "上一轮提过的那笔订单，而且这一轮用了指代词没再说订单号"
+    （判定在 `utils/entities.carried_order_id`，这里不重复判）。这时补一个 order。
+
+    **这不是往 `_RULES` 里加词**：加词是"看到某个字就路由到某个 worker"，
+    携带实体是"接着上一轮说"。两者形状不同，所以走独立入口，不混进关键词表
+    （README 的「已知限制」点名了不要用加词的办法做这件事）。
+    """
     plan = []
     for pattern, worker in _RULES:
         if pattern.search(question) and worker not in plan:
             plan.append(worker)
+    if carried_id and "order" not in plan:
+        plan.append("order")
     return plan
 
 
@@ -144,7 +206,7 @@ def parse_route(content: str) -> dict:
     return out
 
 
-def route(question: str, tried: list = None, llm=None) -> dict:
+def route(question: str, tried: list = None, llm=None, chat_history: list = None) -> dict:
     """
     决定这一轮调用哪些 worker。
 
@@ -152,11 +214,14 @@ def route(question: str, tried: list = None, llm=None) -> dict:
     source ∈ {"llm", "rule", "fallback"}——一定要记录它是谁给的结论，
     因为"规则兜底的比例"是判断路由健康度的关键指标：它一涨，说明 LLM 那边在坏。
 
+    chat_history：上一轮的对话，指代消解要用（见模块开头）。不传就是单轮。
     llm：可注入（测试用假模型）。默认按配置取。
     """
     tried = list(tried or [])
     workers_block = "\n".join(f"- {n}：{d}" for n, d in WORKER_DESCRIPTIONS.items())
-    prompt = ROUTER_PROMPT.format(workers=workers_block, question=question)
+    prompt = ROUTER_PROMPT.format(
+        workers=workers_block, context=_context_block(chat_history), question=question
+    )
 
     total = dict(EMPTY)
     parsed = None
@@ -190,7 +255,7 @@ def route(question: str, tried: list = None, llm=None) -> dict:
     if parsed["parse_error"]:
         # 走到这里说明 LLM 这路没给出可用结论，退回规则。
         source = "rule"
-        plan = _rule_route(question)
+        plan = _rule_route(question, carried_order_id(question, chat_history))
         reason = "LLM 路由输出不可用，退回关键词规则"
         confidence = 0.0
         if not plan:

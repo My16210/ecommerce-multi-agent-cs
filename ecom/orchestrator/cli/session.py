@@ -77,9 +77,11 @@ def cmd_delete(args) -> int:
 def cmd_purge(args) -> int:
     days = args.days
     result = session.purge(older_than_days=days)
+    # 记忆也一起报：它是这段对话的摘要，**也是用户说过的话**。只报消息数的话，
+    # "记忆有没有被删掉"这件事在输出里看不见——而它恰恰是最该被看见的那部分。
     print(
-        f"已清理 {result['sessions']} 个会话 / {result['messages']} 条消息"
-        f"（{days} 天没动静的）"
+        f"已清理 {result['sessions']} 个会话 / {result['messages']} 条消息 / "
+        f"{result['memories']} 条记忆（{days} 天没动静的）"
     )
     return 0
 
@@ -125,8 +127,8 @@ def main() -> int:
         info = session.stats()
         print(f"\n会话库：{info['db_path']}")
         print(
-            f"共 {info['sessions']} 个会话 / {info['messages']} 条消息，"
-            f"保留 {info['ttl_days']} 天"
+            f"共 {info['sessions']} 个会话 / {info['messages']} 条消息 / "
+            f"{info['memories']} 条记忆，保留 {info['ttl_days']} 天"
         )
         if info["newest"]:
             print(f"最早 {info['oldest']}　最新 {info['newest']}")

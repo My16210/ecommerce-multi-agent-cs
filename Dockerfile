@@ -151,8 +151,13 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
 
 # --server.address=0.0.0.0 是这里最容易漏的一条：Streamlit 默认只监听
 # 127.0.0.1，容器外**连不上**，而症状是"端口映射明明对了却打不开"。
-# 用命令行参数而不是 .streamlit/config.toml，是为了不影响宿主上的本地开发
-# （那份配置会同时作用于 `uv run streamlit run app.py`）。
+#
+# 下面这几个 --server.* 走命令行、而不是 .streamlit/config.toml：
+# 它们是**只在容器里成立**的配置（宿主上 `uv run streamlit run app.py`
+# 就不该被强制监听 0.0.0.0）。而**主题**在 .streamlit/config.toml 里——
+# 那是"两边都该长得一样"的配置。两者的边界是"这条配置是不是容器独有"，
+# 所以不会打架：这个文件里**没有**任何 --theme.*，config.toml 里
+# **没有**任何 [server] 段。
 CMD ["streamlit", "run", "app.py", \
      "--server.address=0.0.0.0", \
      "--server.port=8501", \

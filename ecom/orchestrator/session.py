@@ -7,9 +7,13 @@
 四条理由，从硬到软：
 
 1. **`chat_history` 在 supervisor 里是"节点输入"，不是"图状态"。**
-   `supervisor.answer()` 把它塞进 `make_initial_state`，图只在 aggregate 节点
-   读一次。要让 checkpointer "接管"历史，得先往图里加一个累积节点或给这个
-   通道配 reducer——那是在改图的语义，不是在加一个存储。
+   `supervisor.answer()` 把它塞进 `make_initial_state`，图**从不往它里面写**：
+   没有 reducer、没有累积节点，每一轮都是调用方给一份新的。要让 checkpointer
+   "接管"历史，得先往图里加一个累积节点或给这个通道配 reducer——那是在改图的
+   语义，不是在加一个存储。
+   （读它的是 router（指代消解）、order worker（抽实体）和 knowledge worker
+   （生成答案）；**aggregate 刻意不读**。这里原来写的是"图只在 aggregate 节点
+   读一次"，**说反了**——完整的更正见 core/state.py 的 `CSState` 注释。）
 2. **`state.py` 已经警告过那条路有坑**：`results` 是 `Annotated[list, operator.add]`，
    注释写着「往 add-型通道写 `[]` 等于没写、跨轮累加、清不掉」。给 `chat_history`
    配同样的 reducer，会得到一条**只增不减、没法在开头裁剪**的通道——而多轮历史
@@ -81,6 +85,17 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
+CREATE TABLE IF NOT EXISTS memories (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id         TEXT NOT NULL,
+    summary            TEXT NOT NULL,
+    keywords           TEXT NOT NULL,
+    embedding          BLOB,
+    through_message_id INTEGER NOT NULL,
+    created_at         TEXT NOT NULL,
+    UNIQUE(session_id, through_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id, id);
 """
 
 _conn = None
@@ -209,6 +224,95 @@ def history(session_id: str, max_turns: int = None) -> list:
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
+# ---------------------------------------------------------------------------
+# 会话内长期记忆的水位线切分（蒸馏/召回在 ecom/orchestrator/memory.py）
+# ---------------------------------------------------------------------------
+def _window_size() -> int:
+    """
+    "窗口"是多少条消息。`history()` 取回的就是这个范围，`out_of_window_messages()`
+    取回的是它**之前**那一段——两者互补且不重叠，中间没有缝。
+
+    抽成函数、不把 `HISTORY_TURNS * 2` 散在 SQL 里：这个算式一处分叉，就会出现
+    "记忆覆盖了窗口内的消息"或"有一批消息永远蒸馏不到"，**两种都不报错**。
+    """
+    return HISTORY_TURNS * 2
+
+
+def out_of_window_messages(session_id: str, limit: int) -> list:
+    """
+    已经滑出 `history()` 窗口、且还没被蒸馏过的消息，**从旧到新**，最多 `limit` 条。
+
+    返回的行含 `id`——水位线（`through_message_id`）要取这一批最后一条的 id。
+
+    两道界，方向相反：
+      · 下界 `id > 已蒸馏到的最大 id`：蒸馏过的消息不再重复喂给模型。
+      · 上界 `id <= 会话最大 id - 窗口宽度`：**还在窗口里的不蒸馏**。它们下一轮
+        就会由 `history()` 原样喂给模型，再蒸馏一遍是重复付费，而且模型会读到
+        一段自己有完整原文的删节版。
+    """
+    sid = (session_id or "").strip()
+    if not sid or limit <= 0:
+        return []
+    with _lock:
+        rows = connect().execute(
+            """
+            SELECT id, role, content FROM messages
+            WHERE session_id = ?
+              AND id > COALESCE(
+                    (SELECT MAX(through_message_id) FROM memories WHERE session_id = ?), 0)
+              AND id <= COALESCE(
+                    (SELECT MAX(id) FROM messages WHERE session_id = ?), 0) - ?
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (sid, sid, sid, _window_size(), limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_memory(session_id: str, summary: str, keywords: str,
+               embedding: bytes, through_message_id: int) -> bool:
+    """
+    写一条记忆。返回**这条是不是新写进去的**（False = 已有一条覆盖到同一处，跳过）。
+
+    `INSERT OR IGNORE` + `UNIQUE(session_id, through_message_id)` **不是装饰**：
+    上面那把 `_lock` 是**进程内**的，而蒸馏是独立进程的 CLI。两个蒸馏同时跑
+    （cron 撞上手动执行）时，两边读到同一个水位线、蒸馏同一批消息、各插一条
+    ——**WAL 解决的是 DB 锁，解决不了这种逻辑上的双重蒸馏**。这个约束让第二次
+    插入变成 no-op。所以幂等由**数据库**保证，不是由锁保证。
+    """
+    with _lock:
+        conn = connect()
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO memories "
+            "(session_id, summary, keywords, embedding, through_message_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, summary, keywords, embedding, through_message_id, _now()),
+        )
+        conn.commit()
+    return cursor.rowcount > 0
+
+
+def memories_for(session_id: str, limit: int = None) -> list:
+    """
+    取这个会话沉淀下来的记忆，**按时间正序**（读起来像一段经历）。
+
+    返回的行含 `embedding`（BLOB），形状由调用方解释——`session.py` 是
+    "只有 SQLite 的笨存储"，它不认识向量（边界见模块开头）。
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return []
+    sql = "SELECT * FROM memories WHERE session_id = ? ORDER BY id ASC"
+    args: list = [sid]
+    if limit is not None:
+        sql += " LIMIT ?"
+        args.append(limit)
+    with _lock:
+        rows = connect().execute(sql, args).fetchall()
+    return [dict(r) for r in rows]
+
+
 def list_sessions(limit: int = 50) -> list:
     """会话列表，最近更新的在前。带轮数，供 CLI / 界面概览用。"""
     with _lock:
@@ -240,9 +344,13 @@ def delete_session(session_id: str) -> int:
     """
     删一个会话连同它的消息。返回删掉的**消息**条数（0 表示这个会话本来就不存在）。
 
-    两条 DELETE 在同一个连接、同一次提交里——不靠外键级联，因为 SQLite
+    三条 DELETE 在同一个连接、同一次提交里——不靠外键级联，因为 SQLite
     默认不开 `PRAGMA foreign_keys`，写了 `ON DELETE CASCADE` 也不生效。
     依赖一个默认关闭的开关，是那种"今天对、换个环境就静默留垃圾"的写法。
+
+    **memories 必须一起删**：记忆是这段对话的摘要，里面同样有用户说过的话。
+    "删了会话却留着它的摘要"不是漏删一行——它是**隐私上的假动作**：用户以为
+    删干净了，而摘要还躺在库里。返回契约仍然是**消息条数**（调用方在用它）。
     """
     sid = (session_id or "").strip()
     if not sid:
@@ -251,6 +359,7 @@ def delete_session(session_id: str) -> int:
         conn = connect()
         cursor = conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
         removed = cursor.rowcount
+        conn.execute("DELETE FROM memories WHERE session_id = ?", (sid,))
         conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
         conn.commit()
     return removed
@@ -258,7 +367,12 @@ def delete_session(session_id: str) -> int:
 
 def purge(older_than_days: int = None) -> dict:
     """
-    删掉太久没动静的会话。返回 `{"sessions": n, "messages": m}`。
+    删掉太久没动静的会话。返回 `{"sessions": n, "messages": m, "memories": k}`。
+
+    **memories 一起删、一起报**：它是这段对话的摘要，里面同样有用户说过的话。
+    只删消息留着摘要，等于"用户以为删干净了，而摘要还躺在库里"。计数单列出来，
+    是因为**没被报出来的删除，等于没发生**——CLI 只报消息数的话，这件事在
+    输出里根本看不见。
 
     按 `updated_at`（最后一次说话的时间）算，不是 `created_at`——一个持续
     聊了 40 天的会话不该在第 31 天被删掉。
@@ -272,6 +386,13 @@ def purge(older_than_days: int = None) -> dict:
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     with _lock:
         conn = connect()
+        # 顺序不能换：memories 和 messages 都要在删 sessions 之前删，因为
+        # 它们的子查询依据的就是 sessions 里那批过期的 id。
+        memories = conn.execute(
+            "DELETE FROM memories WHERE session_id IN "
+            "(SELECT session_id FROM sessions WHERE updated_at < ?)",
+            (cutoff,),
+        ).rowcount
         removed = conn.execute(
             "DELETE FROM messages WHERE session_id IN "
             "(SELECT session_id FROM sessions WHERE updated_at < ?)",
@@ -282,21 +403,31 @@ def purge(older_than_days: int = None) -> dict:
         ).rowcount
         conn.commit()
     if sessions:
-        logger.info("会话清理：删掉 %s 个会话 / %s 条消息（早于 %s）", sessions, removed, cutoff)
-    return {"sessions": sessions, "messages": removed}
+        logger.info(
+            "会话清理：删掉 %s 个会话 / %s 条消息 / %s 条记忆（早于 %s）",
+            sessions, removed, memories, cutoff,
+        )
+    return {"sessions": sessions, "messages": removed, "memories": memories}
 
 
 def stats() -> dict:
-    """会话总数、消息总数、以及最老/最新的会话时间。CLI 概览用。"""
+    """会话总数、消息总数、记忆条数、以及最老/最新的会话时间。CLI 概览用。
+
+    `memories` 单列出来，是因为它和 messages 是**两条独立增长曲线**：
+    messages 随对话线性长，memories 只在有人跑 `distill` 时才长。两个数字
+    放在一起看，就能一眼判断"蒸馏有没有在跑"。
+    """
     with _lock:
         conn = connect()
         sessions = conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"]
         messages = conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()["n"]
+        memories = conn.execute("SELECT COUNT(*) AS n FROM memories").fetchone()["n"]
         oldest = conn.execute("SELECT MIN(created_at) AS t FROM sessions").fetchone()["t"]
         newest = conn.execute("SELECT MAX(updated_at) AS t FROM sessions").fetchone()["t"]
     return {
         "sessions": sessions,
         "messages": messages,
+        "memories": memories,
         "oldest": oldest,
         "newest": newest,
         "ttl_days": SESSION_TTL_DAYS,

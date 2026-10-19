@@ -4,13 +4,14 @@
 模块**不校验参数名、不校验布局、不校验 `session_state` 的真实语义**——它守的是
 "调用写得对不对"。这个文件补的是它够不着的那一段：
 
-    真的 Streamlit 会不会在渲染到一半时抛出来？`st.tabs` 到底认不认这几个
-    标签？`st.code(..., language=None)` 这个签名对不对？`st.chat_input` 在
-    没有输入时返回的是什么？假模块对这些都是"照收不误"。
+    真的 Streamlit 会不会在渲染到一半时抛出来？`st.pills` 认不认那个
+    `format_func`？`st.status(type="compact")` 这个 `type` 真的存在吗？
+    `st.code(..., language=None)` 这个签名对不对？假模块对这些都是"照收不误"。
 
 【它证明了什么】
   · 两个入口在真运行时里**能跑完**（`at.exception` 为空）
-  · 四个 Tab 真的渲染出来了，侧边栏那几行环境信息真的画出来了
+  · 主区域是对话（**没有 Tab**），四个视图的入口真的画在侧边栏上，
+    侧边栏那几行环境信息真的画出来了
   · 后台**没配口令时确实停在门前**：报告一个 error，且一个 Tab 都没有
 
 【它不证明什么】**这条要写进 README，不然它会被当成"界面验过了"**
@@ -120,21 +121,34 @@ def app_test(monkeypatch, tmp_path):
     reason="本机没灌过数据（data/orders.sqlite 或向量库不在），界面接线这条测试跳过",
 )
 def test_app_renders_in_a_real_streamlit_runtime(app_test):
-    """客户界面在真运行时里跑完，四个 Tab 和环境信息都在。
+    """客户界面在真运行时里跑完：**主区是对话，四个视图的入口在侧边栏**。
 
-    这里抓的是假 streamlit 抓不到的那类错：接口签名改了、`st.tabs` 的返回值
-    用法不对、某个 `st.*` 在真版本里拼写不同。表现是渲染中断 + `at.exception`。
+    这里抓的是假 streamlit 抓不到的那类错：接口签名改了、某个 `st.*` 在真版本里
+    拼写不同（`st.status(type="compact")` / `st.pills(format_func=...)` /
+    `st.container(border=True)` 这些新调用一个都没被假模块校验过）、
+    `st.pills` 的返回值用法不对。表现是渲染中断 + `at.exception`。
     """
     at = app_test("app.py")
 
     assert not at.exception, f"app.py 在真 streamlit 里抛了：{at.exception}"
 
-    assert [t.label for t in at.tabs] == ["💬 智能客服", "📦 订单", "📊 数据看板", "📚 知识库"]
+    # **不该再有 Tab。** 主区域只显示一个视图，切视图靠侧边栏那组 pills——
+    # 这条断言同时钉住了"结构确实换掉了"和"没顺手留下旧的 tabs"。
+    assert at.tabs == [], "app.py 还在画 Tab"
+
+    nav = at.sidebar.pills
+    assert nav, "侧边栏没有直连视图的入口"
+    # `.value` 是**原始键**，`.options` 是 format_func 处理过的显示串——两个都要看：
+    # 只看 options 会漏掉"键改了但显示没改"，只看 value 会漏掉"图标没渲染出来"。
+    assert nav[0].value == "chat", f"默认没落在对话视图，落在 {nav[0].value}"
+    joined = " ".join(nav[0].options)
+    for name in ("对话", "订单", "数据看板", "知识库"):
+        assert name in joined, f"侧边栏少了「{name}」这个视图入口：{nav[0].options}"
 
     sidebar = " ".join(m.value for m in at.sidebar.markdown)
     assert "向量库后端" in sidebar
     assert "订单库" in sidebar
-    assert "每轮回读历史" in sidebar, "侧边栏少了会话那一块"
+    assert "每轮回读历史" in sidebar, "侧边栏少了环境那一块"
 
 
 def test_the_sidebar_shows_a_truncated_session_credential(app_test):

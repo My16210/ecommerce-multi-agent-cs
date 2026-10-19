@@ -80,7 +80,10 @@ def _install_fake_streamlit():
 
     for _name in (
         "caption markdown warning info error success title header subheader "
-        "divider metric dataframe image code write text expander chat_message"
+        "divider metric dataframe image code write text expander chat_message "
+        # 界面重做后新增的：决策链是 status(compact) 外套 expander(type=step)，
+        # 侧边栏的导航块是 container(border=True)，间距用 space。
+        "status container space badge"
     ).split():
         setattr(st, _name, _recorder(_name))
 
@@ -95,6 +98,12 @@ def _install_fake_streamlit():
     # ——这几个决定了"不会走进需要用户操作的那条路"——
     st.button = lambda *args, **kwargs: False
     st.chat_input = lambda *args, **kwargs: None
+    # st.pills **必须返回固定的 None，不能进上面那个 _recorder 名单**。
+    # `_Element` 没有定义 `__bool__`（而 dunder 查找也不走 `__getattr__`），
+    # 所以 `bool(_Element())` 恒为 True——一旦它返回 _Element，空态里那句
+    # `if picked:` 就会把一张"元素"当成"用户点了建议卡"，跑进一条根本不该
+    # 走的分支（会去调模型）。返回 None = 这一轮没人点。
+    st.pills = lambda *args, **kwargs: None
     st.text_input = lambda *args, **kwargs: ""
     st.toggle = lambda label, value=False, **kwargs: value
     st.selectbox = lambda label, options, **kwargs: (options[0] if options else None)
@@ -141,27 +150,29 @@ def app(monkeypatch, tmp_path):
     module.session.reset_connection()
 
 
-def _render_all_tabs(module):
-    module.render_agent_tab()
-    module.render_order_tab()
-    module.render_analytics_tab()
-    module.render_knowledge_tab()
+def _render_all_views(module):
+    """四个视图各画一遍。**名字叫 view 不叫 tab**——主区域已经不是一个 Tab 集合了，
+    留着旧名字会让人以为结构没变。"""
+    module.render_agent_view()
+    module.render_order_view()
+    module.render_analytics_view()
+    module.render_knowledge_view()
 
 
 def _calls_named(name):
     return [c for c in CALLS if c[0] == name]
 
 
-def test_the_module_imports_and_every_tab_renders(app):
-    """四个 Tab 在**空状态**下都能渲染完，不抛异常。
+def test_the_module_imports_and_every_view_renders(app):
+    """四个视图在**空状态**下都能渲染完，不抛异常。
 
-    这一条抓的是最普通也最容易犯的错：Tab 之间互不认识、某个共享辅助函数
+    这一条抓的是最普通也最容易犯的错：视图之间互不认识、某个共享辅助函数
     签名改了而调用点没改、`st.session_state` 的键名打错（第一次跑是 KeyError，
     第二次跑才对——所以这里连跑两遍）。
     """
-    _render_all_tabs(app)          # 第一遍：什么都没有
-    app.main()                     # 第二遍：四个 Tab 一起画（走的是真入口）
-    _render_all_tabs(app)          # 第三遍：session_state 已经有东西了
+    _render_all_views(app)         # 第一遍：什么都没有
+    app.main()                     # 第二遍：侧边栏 + 当前视图（走的是真入口）
+    _render_all_views(app)         # 第三遍：session_state 已经有东西了
 
     assert _calls_named("title"), "连标题都没画出来，main() 大概没跑完"
 
@@ -198,7 +209,7 @@ def test_the_decision_chain_renders_a_failed_worker(app):
             },
         }
     ]
-    app.render_agent_tab()
+    app.render_agent_view()
 
     # worker 那一行走 markdown（带加粗），错误原文走 caption。断言时不分流派，
     # 全捞进来看——这里要验的是"这些信息到底有没有被显示"，不是"用了哪个接口"。
@@ -222,7 +233,7 @@ def test_the_order_tab_handles_an_empty_market(app, monkeypatch):
             return []
 
     monkeypatch.setattr(app, "_db", lambda: _EmptyDB())
-    app.render_order_tab()
+    app.render_order_view()
 
     assert _calls_named("warning"), "空库时应当给出提示"
     assert not _calls_named("dataframe"), "空库时不该画表格"
@@ -240,7 +251,7 @@ def test_the_knowledge_tab_says_so_when_there_is_nothing_indexed(app, monkeypatc
             return 0
 
     monkeypatch.setattr(app, "_store", lambda: _EmptyStore())
-    app.render_knowledge_tab()
+    app.render_knowledge_view()
 
     assert _calls_named("warning"), "空向量库时应当给出提示"
 
@@ -264,7 +275,7 @@ def test_a_new_browser_session_starts_a_new_conversation(app):
     # 新标签页：session_state 是空的（假 streamlit 里就是个 dict，直接清掉）
     app.st.session_state.clear()
     CALLS.clear()
-    app.render_agent_tab()
+    app.render_agent_view()
 
     assert app.st.session_state["agent_session_id"] != old
     assert app.st.session_state["agent_turns"] == []
@@ -294,7 +305,7 @@ def test_the_model_gets_history_from_the_store_not_from_the_screen(app):
     app.answer = _fake_answer
     app.st.chat_input = lambda *a, **k: "这一轮的问题"
 
-    app.render_agent_tab()
+    app.render_agent_view()
 
     assert [m["content"] for m in seen["history"]] == ["上一轮的问题", "上一轮的回答"]
     # 这一轮也要落盘（否则下一轮就接不上了）

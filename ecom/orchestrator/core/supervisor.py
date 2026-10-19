@@ -52,7 +52,13 @@ def _node_name(worker: str) -> str:
 
 
 def _router_node(state: dict, llm=None) -> dict:
-    result = route(state.get("question") or "", tried=state.get("tried") or [], llm=llm)
+    # 把上一轮也给它：没有它，"那能退吗"这类追问在这一层就没有主语（见 router 模块开头）。
+    result = route(
+        state.get("question") or "",
+        tried=state.get("tried") or [],
+        llm=llm,
+        chat_history=state.get("chat_history") or [],
+    )
     plan = result["plan"]
     round_no = int(state.get("round") or 0) + 1
 

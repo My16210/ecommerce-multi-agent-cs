@@ -120,6 +120,24 @@ SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
 # token 越贵。它和上面的保留期是两件事，所以是两个独立配置。
 HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "6"))
 
+# —— 会话内长期记忆（memories 表 + memory.py + cli/memory.py）——
+# 上面那个 HISTORY_TURNS 管的是"最近 N 轮"，它解决不了"第 3 轮说过的话在第 20 轮
+# 已经滑出窗口"。补的办法是把**滑出窗口的那一段**蒸馏成一条摘要存起来，需要时
+# 再按语义召回。下面两个参数各管一段，别混：
+#
+#   蒸馏**什么时候**发生：只在 CLI（`python -m ecom.orchestrator.cli.memory distill`），
+#   问答路径上**不新增任何模型调用**。代价说清：记忆**不是实时的**，要有人跑 distill
+#   才更新——这是拿"不拖慢问答"换来的，和 `purge` 不自清是同一个立场。
+#
+# 一次蒸馏最多喂给模型多少条消息。不封顶的话，一个聊了很久的会话第一次蒸馏会把
+# 全部滑出的消息塞进一个 prompt 里——那条命令就永远跑不完了。超出的部分留给
+# 下一次蒸馏（水位线会往前推）。
+MEMORY_DISTILL_MAX_MESSAGES = int(os.getenv("MEMORY_DISTILL_MAX_MESSAGES", "40"))
+
+# 一轮问答最多带几条记忆进 prompt。它和 HISTORY_TURNS 是两条独立通道：
+# 前者是"真实轮次"，这个是"压缩过的更早信息"，不互相挤占。
+MEMORY_TOP_K = int(os.getenv("MEMORY_TOP_K", "3"))
+
 # ---------------------------------------------------------------------------
 # HTTP 接口的鉴权（api.py）
 # ---------------------------------------------------------------------------

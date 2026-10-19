@@ -55,6 +55,15 @@ def _format_contexts(contexts: list, web_contexts: list) -> str:
     return "\n\n".join(sections) if sections else "（没有检索到任何资料）"
 
 
+# 角色 → 给模型看的标签。**必须显式列出三种**：以前这里是
+#   `"用户" if role == "user" else "助手"`
+# ，于是任何新角色都会被**静默当成"助手说过的话"**。多轮记忆（`memory.py`）往里
+# 塞的 `role="memory"` 就是这么被吞掉的：记忆是"更早的对话摘要"，把它标成"助手"
+# 等于告诉模型"这是你自己刚说过的话"——它不仅会信，还会当成自己的承诺。
+# 兜底用"（未知角色）"而不是"助手"：认不出来就说认不出来，别替它编一个身份。
+_ROLE_LABELS = {"user": "用户", "assistant": "助手", "memory": "较早的对话摘要"}
+
+
 def _format_history(chat_history: list) -> str:
     """把历史对话拼成文本，供模型衔接上下文"""
     if not chat_history:
@@ -62,7 +71,7 @@ def _format_history(chat_history: list) -> str:
 
     lines = ["【历史对话】"]
     for turn in chat_history:
-        role = "用户" if turn.get("role") == "user" else "助手"
+        role = _ROLE_LABELS.get(turn.get("role"), "（未知角色）")
         lines.append(f"{role}：{turn.get('content', '')}")
     return "\n".join(lines) + "\n\n"
 
@@ -128,7 +137,10 @@ def generate_answer(
 
     contexts：知识库检索（已 rerank）的结果
     web_contexts：联网搜索结果
-    chat_history：[{"role": "user"/"assistant", "content": ...}, ...]
+    chat_history：[{"role": "user"/"assistant"/"memory", "content": ...}, ...]
+                 其中 `role="memory"` 是多轮记忆（见 orchestrator/memory.py），
+                 由调用方拼在真实历史前面——这里只负责把它的标签印对（见上面
+                 `_ROLE_LABELS`），不判断它该不该来。
     """
     web_contexts = web_contexts or []
     chat_history = chat_history or []
@@ -139,9 +151,14 @@ def generate_answer(
         f"【用户问题】\n{question}"
     )
 
+    # 轮数只数**真实轮次**。原来这里是 `len(chat_history) // 2`——记忆一插进来
+    # 这个数字就错了（3 条记忆 + 12 条真消息会报成 7 轮，比 HISTORY_TURNS 还大），
+    # 而它看起来只是个日志，没人会当回事，于是它就一直错着。
+    turns = sum(1 for t in chat_history if t.get("role") in {"user", "assistant"}) // 2
+    recalled = sum(1 for t in chat_history if t.get("role") == "memory")
     logger.info(
-        "生成答案：知识库 %d 条，联网 %d 条，历史 %d 轮",
-        len(contexts), len(web_contexts), len(chat_history) // 2,
+        "生成答案：知识库 %d 条，联网 %d 条，历史 %d 轮，记忆 %d 条",
+        len(contexts), len(web_contexts), turns, recalled,
     )
 
     messages = [("system", SYSTEM_PROMPT), ("human", prompt)]
