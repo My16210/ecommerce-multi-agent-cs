@@ -43,6 +43,8 @@ import secrets
 
 import streamlit as st
 
+from ecom.auth import settings as auth_settings
+from ecom.auth import store as auth_store
 from ecom.knowledge.cli import review as kb_review
 from ecom.knowledge.review import queue as kb_queue
 from ecom.orchestrator.admin import returns
@@ -85,7 +87,35 @@ def check_password(entered: str, expected: str) -> bool:
     return secrets.compare_digest(entered.encode("utf-8"), expected.encode("utf-8"))
 
 
+def _require_token_login() -> None:
+    """身份层打开时的后台门禁：要一枚 admin 角色的 token，而不是共享口令。"""
+    if st.session_state.get("admin_principal"):
+        return
+
+    st.title("电商客服后台", icon=":material/lock:")
+    st.caption(
+        "这个后台能对花钱的操作下结论。用 admin 角色的 bearer token 进入；"
+        "token 由 `python -m ecom.auth.cli create --name 你 --role admin` 生成。"
+    )
+    token = st.text_input("管理员 token", type="password", key="admin_token")
+    if st.button("进入", key="admin_login_token", icon=":material/login:"):
+        candidate = auth_store.authenticate(token)
+        if candidate and auth_store.has_role(candidate, "admin"):
+            st.session_state["admin_principal"] = candidate
+            auth_store.audit(candidate["name"], "admin.login", "admin.py", "")
+            st.rerun()
+        else:
+            # 不区分"token 错"和"角色不够"：区分了等于告诉试 token 的人
+            # "这枚 token 有效，只是权限不够"。
+            st.error("token 无效，或这个 principal 不是 admin。")
+    st.stop()
+
+
 def require_login() -> None:
+    if auth_settings.AUTH_ENABLED:
+        _require_token_login()
+        return
+
     if not ADMIN_PASSWORD:
         st.error(
             "没有配置 ADMIN_PASSWORD，后台拒绝启动。\n\n"
@@ -154,7 +184,12 @@ def render_returns_page() -> None:
                 continue
 
             note = st.text_area("审核备注", key=f"note_{row['return_id']}", height=80)
-            reviewer = st.text_input("审核人", key=f"who_{row['return_id']}")
+            if auth_settings.AUTH_ENABLED:
+                principal = st.session_state.get("admin_principal") or {}
+                reviewer = principal.get("name") or ""
+                st.caption(f"审核人：{reviewer or '（未登录）'}")
+            else:
+                reviewer = st.text_input("审核人", key=f"who_{row['return_id']}")
             col_pass, col_reject, _ = st.columns([1, 1, 4])
             # 图标只走 icon=，**不拼进 label**：`test_admin_smoke.py` 是按精确成员
             # 断言 `"通过"` / `"拒绝"` 这两个标签的，拼个前缀进去那条就红了。

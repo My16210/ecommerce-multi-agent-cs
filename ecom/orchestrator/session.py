@@ -70,11 +70,16 @@ from ecom.orchestrator.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
+
+class SessionAccessError(Exception):
+    """这个会话不属于当前 principal。API 把它翻成 404，不暴露"存在但没权限"。"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    owner_id   TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS messages (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,6 +139,11 @@ def connect() -> sqlite3.Connection:
         # 而不是立刻抛 "database is locked"。
         conn.execute("PRAGMA busy_timeout=5000")
         conn.executescript(SCHEMA)
+        # 老库没有 owner_id：CREATE TABLE IF NOT EXISTS 不会改已存在的表。
+        # 这里做一次幂等补列，而不是要求"删库重灌"——会话库是真数据，不能丢。
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+        if "owner_id" not in columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
         conn.commit()
         _conn = conn
     return _conn
@@ -163,11 +173,18 @@ def new_session_id() -> str:
     return secrets.token_urlsafe(24)
 
 
-def ensure_session(session_id: str) -> str:
-    """会话不存在就建一个。返回 session_id 本身，方便链式写。"""
+def ensure_session(session_id: str, owner_id: str = "") -> str:
+    """
+    会话不存在就建一个。返回 session_id 本身，方便链式写。
+
+    `owner_id` 非空时做归属检查：会话已有主且不是他 → `SessionAccessError`；
+    还没有主（老库 / 未登录时建的）→ 认领。`owner_id` 为空表示"不检查"，
+    给 CLI 和本地演示用——API 在鉴权模式下永远会传。
+    """
     sid = (session_id or "").strip()
     if not sid:
         sid = new_session_id()
+    owner = str(owner_id or "").strip()
     now = _now()
     with _lock:
         conn = connect()
@@ -176,17 +193,29 @@ def ensure_session(session_id: str) -> str:
             "ON CONFLICT(session_id) DO NOTHING",
             (sid, now, now),
         )
+        if owner:
+            row = conn.execute(
+                "SELECT owner_id FROM sessions WHERE session_id = ?", (sid,)
+            ).fetchone()
+            current = (row["owner_id"] if row else "") or ""
+            if current and current != owner:
+                raise SessionAccessError(f"会话 {sid} 不属于当前 principal")
+            if not current:
+                conn.execute(
+                    "UPDATE sessions SET owner_id = ? WHERE session_id = ? AND owner_id = ''",
+                    (owner, sid),
+                )
         conn.commit()
     return sid
 
 
-def append_turn(session_id: str, question: str, answer: str) -> None:
+def append_turn(session_id: str, question: str, answer: str, owner_id: str = "") -> None:
     """
     记一轮问答。一问一答两行，**同一时刻写入**——分成两次调用的话，
     中途挂掉就会留下一个只有提问没有回答的会话，读回来喂给模型时
     它看到的是一个悬空的问题。
     """
-    sid = ensure_session(session_id)
+    sid = ensure_session(session_id, owner_id=owner_id)
     now = _now()
     with _lock:
         conn = connect()
@@ -318,7 +347,7 @@ def list_sessions(limit: int = 50) -> list:
     with _lock:
         rows = connect().execute(
             """
-            SELECT s.session_id, s.created_at, s.updated_at,
+            SELECT s.session_id, s.created_at, s.updated_at, s.owner_id,
                    COUNT(m.id) AS messages
             FROM sessions s
             LEFT JOIN messages m ON m.session_id = s.session_id

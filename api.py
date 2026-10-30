@@ -69,6 +69,7 @@ import json
 import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -78,6 +79,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ecom import demo
+from ecom.auth import settings as auth_settings
+from ecom.auth import store as auth_store
 from ecom.orchestrator import memory, session
 from ecom.orchestrator.core.supervisor import answer, answer_stream
 from ecom.orchestrator.db.engine import get_db
@@ -177,6 +180,7 @@ class HealthResponse(BaseModel):
     order_db: str = Field(description="订单库后端：`sqlite` 或 `mysql`。")
     max_rounds: int = Field(description="一次提问最多跑几轮（含首轮）。")
     demo: bool = Field(default=False, description="是否运行在只读演示模式。")
+    auth: bool = Field(default=False, description="是否启用了 bearer token 身份层。")
 
 
 class TraceItem(BaseModel):
@@ -255,6 +259,56 @@ def require_api_key(x_api_key: str = Header(default="", description="配了 API_
         )
 
 
+# 鉴权没开时的占位 principal。`id=""` 表示"不做会话归属检查"（老行为）。
+ANONYMOUS_PRINCIPAL = {"id": "", "name": "anonymous", "role": "admin"}
+
+
+def _bearer_token(authorization: str) -> str:
+    scheme, _, token = str(authorization or "").strip().partition(" ")
+    return token.strip() if scheme.lower() == "bearer" else ""
+
+
+def require_access(
+    authorization: str = Header(default="", description="`Bearer <token>`；开了 AUTH_ENABLED 才需要。"),
+    x_api_key: str = Header(default="", description="兼容旧的 X-API-Key 用法。"),
+) -> dict:
+    """
+    统一的访问入口：**开了身份层就认 token，没开就走旧的 API_KEY 语义**。
+
+    两种模式不混用：开了 AUTH_ENABLED 之后，`X-API-Key` 只作为 bearer 的
+    兼容别名，旧的共享 key 不再有特殊地位——否则"一个共享 key = 所有人"
+    会从后门回来。
+    """
+    if auth_settings.AUTH_ENABLED:
+        token = _bearer_token(authorization) or str(x_api_key or "").strip()
+        principal = auth_store.authenticate(token)
+        if principal is None:
+            raise HTTPException(
+                status_code=401,
+                detail="需要有效的 bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return principal
+
+    require_api_key(x_api_key)
+    return dict(ANONYMOUS_PRINCIPAL)
+
+
+def require_admin(principal: Annotated[dict, Depends(require_access)]) -> dict:
+    """admin 才能看 trace。没开身份层时沿用旧语义：API_KEY 对了就行。"""
+    if auth_settings.AUTH_ENABLED and not auth_store.has_role(principal, "admin"):
+        raise HTTPException(status_code=403, detail="需要 admin 角色")
+    return principal
+
+
+def _session_for(requested: str, principal: dict) -> str:
+    """开会话并做归属检查；不属于当前 principal 时按 404 处理（不暴露存在性）。"""
+    try:
+        return session.ensure_session(requested, owner_id=principal.get("id", ""))
+    except session.SessionAccessError:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期") from None
+
+
 def require_demo_access(
     x_invite_code: str = Header(
         default="", alias="X-Invite-Code", description="演示模式打开时才需要。"
@@ -314,6 +368,7 @@ def health() -> dict:
         "order_db": db.backend,
         "max_rounds": MAX_ROUNDS,
         "demo": demo.enabled(),
+        "auth": auth_settings.AUTH_ENABLED,
     }
 
 
@@ -324,19 +379,21 @@ def health() -> dict:
     summary="问一句",
     description="路由决定交给谁（知识库 / 订单 / 数据分析），worker 跑完由汇总"
                 "揉成一段话。首轮不带 `session_id`，之后带上响应里返回的那个即可多轮。",
-    dependencies=[Depends(require_api_key), Depends(require_demo_access)],
+    dependencies=[Depends(require_demo_access)],
     responses={
-        401: {"model": ErrorResponse, "description": "配了 API_KEY 但没带或带错"},
+        401: {"model": ErrorResponse, "description": "需要 bearer token（开了 AUTH_ENABLED 时）"},
         403: {"model": ErrorResponse, "description": "演示模式但邀请码不对"},
         429: {"model": ErrorResponse, "description": "请求太频繁或今日演示额度已用完"},
     },
 )
-def chat(req: ChatRequest, request: Request) -> dict:
+def chat(
+    req: ChatRequest, request: Request, principal: Annotated[dict, Depends(require_access)]
+) -> dict:
     _demo_precheck(request)
 
     # 先确保会话存在再读历史——顺序反过来的话，新会话的第一问会因为
     # "查不到这个 session_id"而拿不到空历史（这一版不会报错，只是白查一次）。
-    session_id = session.ensure_session(req.session_id)
+    session_id = _session_for(req.session_id, principal)
     history = session.history(session_id)
 
     # 记忆拼在真实历史**前面**，而且**每轮现拼、不落盘**——把 `augmented_history`
@@ -349,7 +406,9 @@ def chat(req: ChatRequest, request: Request) -> dict:
     # **先答完再落盘**。反过来的话，模型调用失败也会留下一条"问了没答"的
     # 记录。`append_turn` 内部一问一答是同一个提交，所以这里要么成对写入，
     # 要么一行都不写。
-    session.append_turn(session_id, req.question, final.get("answer") or "")
+    session.append_turn(
+        session_id, req.question, final.get("answer") or "", owner_id=principal.get("id", "")
+    )
 
     return {
         "request_id": final.get("request_id", ""),
@@ -406,14 +465,16 @@ def _sse(payload: dict) -> str:
                 "只有在**多个单元给出结论、需要汇总**时才是真逐 token；"
                 "只有一个结论时会作为一个 `delta` 整段到达——不把已完成的字符串"
                 "切成小块假装在流。",
-    dependencies=[Depends(require_api_key), Depends(require_demo_access)],
+    dependencies=[Depends(require_demo_access)],
     responses={
-        401: {"model": ErrorResponse, "description": "配了 API_KEY 但没带或带错"},
+        401: {"model": ErrorResponse, "description": "需要 bearer token（开了 AUTH_ENABLED 时）"},
         403: {"model": ErrorResponse, "description": "演示模式但邀请码不对"},
         429: {"model": ErrorResponse, "description": "请求太频繁或今日演示额度已用完"},
     },
 )
-def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
+def chat_stream(
+    req: ChatRequest, request: Request, principal: Annotated[dict, Depends(require_access)]
+) -> StreamingResponse:
     """
     同步生成器 + `StreamingResponse`。
 
@@ -425,7 +486,7 @@ def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
     # 就已经是 200 了，再把 429 塞进流里，客户端会以为"答到一半失败了"。
     _demo_precheck(request)
 
-    session_id = session.ensure_session(req.session_id)
+    session_id = _session_for(req.session_id, principal)
     history = session.history(session_id)
     # 和 /chat 一样：记忆每轮现拼，不落盘。
     augmented = memory.augmented_history(session_id, req.question, history)
@@ -477,7 +538,9 @@ def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
 
         # **拿到完整答复之后再落盘。** 中途断开的请求不写会话——半句话接进
         # 下一轮，比没答更坏。和 /chat 的"先答完再落盘"是同一条规矩。
-        session.append_turn(session_id, req.question, final.get("answer") or "")
+        session.append_turn(
+            session_id, req.question, final.get("answer") or "", owner_id=principal.get("id", "")
+        )
         demo.add_tokens(final.get("tokens") or {})
 
         yield _sse(
@@ -505,9 +568,10 @@ def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
     description="**这是给别人看「系统怎么想的」那扇窗**：一条记录里有路由、"
                 "每个 worker 的成功与否和耗时、最后的决策。界面会把这一层"
                 "藏起来（超时变成转圈、异常变成红框），要查问题就看这里。",
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_admin)],
     responses={
-        401: {"model": ErrorResponse, "description": "配了 API_KEY 但没带或带错"},
+        401: {"model": ErrorResponse, "description": "需要 bearer token（开了 AUTH_ENABLED 时）"},
+        403: {"model": ErrorResponse, "description": "需要 admin 角色"},
         404: {"model": ErrorResponse, "description": "还没有任何请求记录"},
     },
 )

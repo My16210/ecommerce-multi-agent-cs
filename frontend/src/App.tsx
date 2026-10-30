@@ -251,7 +251,7 @@ export default function App() {
               autoComplete="off"
               value={keyDraft}
               onChange={(event) => setKeyDraft(event.target.value)}
-              placeholder="服务端没配 API_KEY 就留空"
+              placeholder="服务端没配鉴权就留空；开了身份层就填 token"
             />
           </label>
           <label>

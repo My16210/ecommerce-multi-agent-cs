@@ -27,6 +27,8 @@
 """
 from datetime import datetime
 
+from ecom.auth import settings as auth_settings
+from ecom.auth import store as auth_store
 from ecom.orchestrator.db.engine import Database, get_db
 from ecom.orchestrator.tools.order_tools import (
     APPROVED_RETURN_STATUS,
@@ -187,6 +189,17 @@ def review_return(
             "message": f"就在你确认的这一刻，这个申请已经被别人审成「{latest.get('status')}」了。"
                        f"本次没有改动，请刷新看最新的结论。",
         }
+
+    if auth_settings.AUTH_ENABLED:
+        # 审计只记录"谁下了什么结论"，不重复 reviewer 字段——那个在
+        # return_reviews 里已经是证据。开关没开时不写 auth.db：本地演示
+        # 和测试不该凭空多一个凭证库。
+        auth_store.audit(
+            reviewer or "unknown",
+            "return.review",
+            current["return_id"],
+            decision,
+        )
 
     return {
         "ok": True,

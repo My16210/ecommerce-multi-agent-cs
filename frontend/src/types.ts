@@ -24,6 +24,7 @@ export interface Health {
   order_db: string;
   max_rounds: number;
   demo: boolean;
+  auth?: boolean;
 }
 
 interface StartEvent {
