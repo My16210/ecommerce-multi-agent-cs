@@ -4,8 +4,12 @@
 1. 静态校验（AST 白名单）：执行前检查语法树，禁止危险导入、dunder 属性、危险内置名。
 2. 受限执行：exec 时只注入白名单 builtins，不注入完整 builtins，断开 `__class__` 之类的逃逸链。
 
-明确的限制（见 README「安全限制」）：
+明确的限制（见 README「已知限制」）：
 - 不做子进程隔离、不做超时。模型写出的死循环仍会挂起当前进程。
+- 不做文件系统隔离。`open()` 被禁掉了，但 pandas / numpy / matplotlib
+  自带文件 I/O，所以这里按名字禁掉它们的读写入口（`read_*`、`to_csv`、
+  `savefig` 只许写 CHART_PATH……）。**这是黑名单，不是边界**：`pd.io.*`
+  之类的间接入口仍可能绕过去，真正的隔离得靠容器 / 低权用户 / 只读挂载。
 - 只是显著收窄攻击面，不是强隔离。不要用它执行不可信来源的代码。
 """
 from __future__ import annotations
@@ -39,12 +43,32 @@ _BANNED_NAMES = {
     "staticmethod", "property",
 }
 
-# 禁止的数据落盘方法：避免生成的代码把数据写到任意路径。
-# 需要输出表格文本时请用 .to_string()，它返回值、不写文件。
-_BANNED_ATTRS = {
+# 生成代码不许改写的名字。`CHART_PATH` 被换掉的话，`savefig(CHART_PATH)`
+# 这道"只许写这个路径"的检查就形同虚设。
+_PROTECTED_NAMES = {"CHART_PATH", "output_dir"}
+
+# 禁止的数据落盘 / 读取方法。
+#
+# 【为什么读取也要禁】AST 拦掉了 `open()`，但 pandas / numpy / matplotlib
+# 自己就是文件 API：2026-10-30 实测 `pd.read_csv(r"C:\Windows\win.ini")`
+# 能读到内容、`plt.savefig("任意路径")` 能写文件——**不需要逃逸，用放行的库
+# 就够了**。所以按方法名把常见读写入口逐个禁掉。
+#
+# 这是黑名单，不是边界：`pd.io.*` 之类的间接入口仍可能绕过。
+_WRITE_ATTRS = {
     "to_csv", "to_excel", "to_pickle", "to_parquet", "to_hdf", "to_feather",
-    "to_stata", "to_sql", "to_clipboard",
+    "to_stata", "to_sql", "to_clipboard", "to_json", "to_html", "to_xml",
+    "to_latex", "to_gbq", "to_orc", "tofile", "dump",
+    "save", "savez", "savez_compressed", "savetxt", "imsave",
+    "savefig", "print_png", "print_svg", "print_pdf", "print_ps",
+    "print_figure",
 }
+# 读取：按名字逐个列（前缀 read_ 在下面单独判）。
+_READ_ATTRS = {
+    "load", "loadtxt", "genfromtxt", "fromfile", "fromregex", "memmap",
+    "imread", "ExcelFile", "HDFStore", "get_handle", "urlopen", "open",
+}
+_BANNED_ATTRS = _WRITE_ATTRS | _READ_ATTRS
 
 
 def strip_fences(code: str) -> str:
@@ -61,21 +85,82 @@ class _Validator(ast.NodeVisitor):
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         # module 为 None 表示相对导入（from . import x），一律拒绝
         self._check_root(node.module or "")
+        for alias in node.names:
+            # `from pandas import read_csv` 绕开了 `pd.read_csv` 的属性检查
+            if alias.name in _BANNED_ATTRS or alias.name.startswith("read_"):
+                raise CodeSecurityError(f"禁止导入 {alias.name}（会读写文件）")
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr.startswith("__") and node.attr.endswith("__"):
             raise CodeSecurityError(f"禁止访问 dunder 属性：{node.attr}")
-        if node.attr in _BANNED_ATTRS:
+        if node.attr in _BANNED_ATTRS or node.attr.startswith("read_"):
             raise CodeSecurityError(
-                f"禁止调用 {node.attr}（会写文件）。需要输出表格文本请改用 .to_string()。"
+                f"禁止调用 {node.attr}（会读写文件）。"
+                "需要输出表格文本请改用 .to_string()；出图请用 plt.savefig(CHART_PATH)。"
             )
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
         if node.id in _BANNED_NAMES:
             raise CodeSecurityError(f"禁止使用：{node.id}")
+        # 任何改写都算（赋值 / for 目标 / with as / 海象），
+        # 否则把 CHART_PATH 换成别的路径，savefig 那道检查就白做了。
+        if node.id in _PROTECTED_NAMES and not isinstance(node.ctx, ast.Load):
+            raise CodeSecurityError(f"禁止改写 {node.id}")
         self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        """
+        `savefig` 是唯一放行的写文件入口，而且只许写 CHART_PATH。
+
+        不能直接放进 `_BANNED_ATTRS` 一刀切（出图是正路），也不能放行任意
+        路径（实测能覆盖容器里的任何文件）。所以在这里按**实参**卡；并且
+        不 `generic_visit(func)`——否则上面那条 Attribute 规则会把这次合法
+        调用也拒掉。别名（`s = plt.savefig`）仍会被 Attribute 规则拦住。
+        """
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "savefig":
+            self._check_savefig_target(node)
+            for arg in node.args:
+                self.visit(arg)
+            for keyword in node.keywords:
+                self.visit(keyword.value)
+            return
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._check_params(node.args)
+        self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._check_params(node.args)
+        self.generic_visit(node)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._check_params(node.args)
+        self.generic_visit(node)
+
+    @staticmethod
+    def _check_savefig_target(node: ast.Call) -> None:
+        target = node.args[0] if node.args else None
+        if target is None:
+            for keyword in node.keywords:
+                if keyword.arg in {"fname", "fp"}:
+                    target = keyword.value
+                    break
+        if not (isinstance(target, ast.Name) and target.id == "CHART_PATH"):
+            raise CodeSecurityError(
+                "plt.savefig 只允许写 CHART_PATH（题目给的输出路径），不允许自己拼路径。"
+            )
+
+    @staticmethod
+    def _check_params(args: ast.arguments) -> None:
+        # 参数叫 CHART_PATH 会遮住全局那个：savefig(CHART_PATH) 于是变成了
+        # "写调用方给的任意路径"，而实参检查看到的仍然是一个名字。
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+            if arg.arg in _PROTECTED_NAMES:
+                raise CodeSecurityError(f"禁止把参数命名为 {arg.arg}")
 
     @staticmethod
     def _check_root(name: str) -> None:

@@ -47,6 +47,13 @@ def df():
         "result = ().__class__.__bases__[0].__subclasses__()",
         "result = (lambda: 0).__globals__",
         "df.to_csv('leak.csv')",
+        "result = pd.read_csv('leak.csv')",
+        "result = np.load('leak.npy')",
+        "plt.savefig('leak.png')",
+        "CHART_PATH = 'leak.png'\nplt.savefig(CHART_PATH)",
+        "from pandas import read_csv",
+        "savefig = plt.savefig\nsavefig('leak.png')",
+        "result = pd.io.common.get_handle('x')",
         "from . import something",
     ],
 )
@@ -135,3 +142,36 @@ def test_infinite_loop_is_a_known_limitation():
     """已知限制：不做超时，死循环不会被拦。这条用例只是把限制写成文档，不是断言它能被拦住。"""
     code = "while True:\n    pass"
     validate_code(code)  # 静态校验通过 —— 说明超时确实没覆盖
+
+
+def test_run_code_blocks_pandas_file_reads(df, tmp_path):
+    """`pd.read_csv` 不经过 open()，必须由属性黑名单单独拦。"""
+    out = run_code("result = pd.read_csv('leak.csv')", df, tmp_path, tmp_path / "chart.png")
+    assert out["error"] is not None
+    assert "安全策略" in out["error"]
+
+
+def test_savefig_may_only_write_chart_path(df, tmp_path):
+    """出图是正路，但只许写题目给的 CHART_PATH。"""
+    pytest.importorskip("matplotlib")
+    out = run_code(
+        "plt.plot([1, 2])\nplt.savefig('escape.png')\nresult = 'ok'",
+        df,
+        tmp_path,
+        tmp_path / "chart.png",
+    )
+    assert out["error"] is not None
+    assert "安全策略" in out["error"]
+    assert not (tmp_path / "escape.png").exists()
+
+
+def test_chart_path_cannot_be_rebound(df, tmp_path):
+    """改写 CHART_PATH 后再 savefig，等于绕过"只许写这个路径"。"""
+    out = run_code(
+        "CHART_PATH = 'escape.png'\nplt.savefig(CHART_PATH)",
+        df,
+        tmp_path,
+        tmp_path / "chart.png",
+    )
+    assert out["error"] is not None
+    assert "安全策略" in out["error"]
