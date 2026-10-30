@@ -94,14 +94,11 @@ import streamlit as st
 
 from ecom import demo
 from ecom.knowledge.vector_store import get_vector_store
-from ecom.orchestrator import memory, session
+from ecom.orchestrator import session
 from ecom.orchestrator.core.supervisor import answer_stream
 from ecom.orchestrator.db.engine import get_db
 from ecom.orchestrator.settings import HISTORY_TURNS, MAX_ROUNDS, WORKER_TIMEOUT
-from ecom.orchestrator.tools.image_understander import understand_image
-from ecom.orchestrator.utils.image_intent import augment_question_with_image
-from ecom.settings import VISION_MAX_IMAGE_MB
-from ecom.ui import components, views
+from ecom.ui import chat, components, views
 from ecom.ui.views import ViewContext
 
 logger = logging.getLogger(__name__)
@@ -134,326 +131,28 @@ def _db():
     return get_db()
 
 
-# 渲染件和三个直连视图已经搬到 ecom/ui/；这里保留同名别名，调用点不用动。
+# 侧边栏还在本文件；渲染件搬到 ecom/ui/components.py。
 _clip = components.clip
 _backend_label = components.backend_label
-_render_decision_chain = components.render_decision_chain
 
 
-# ═══════════════════════════════════════════════════════════════
-# 视图一：对话——四路合一的那条路
-# ═══════════════════════════════════════════════════════════════
+# 对话视图的实现在 ecom/ui/chat.py；这里只做装配。
+# 测试 monkeypatch app.session / app.answer_stream 仍然有效：context 是调用时
+# 从本模块的全局变量现取的，不是 import 时复制的一份。
+def _chat_context() -> chat.ChatContext:
+    return chat.ChatContext(session=session, demo=demo, answer_stream=answer_stream)
+
+
 def _init_agent_session() -> None:
-    """这个浏览器会话还没会话号时，开一个。
-
-    **刻意不做"从 URL 里恢复会话"**（`st.query_params["session"] = ...`）。
-    会话号是凭证：拿到它就能读到这个会话的全部历史。塞进 URL 之后它会进
-    浏览器历史、代理访问日志、跨站请求的 Referer 头——凭证最不该待的三个地方。
-
-    代价是**新开标签页 = 新的一段对话**，上一次的接不上。要接上，会话号必须
-    由调用方自己保管在安全的地方——这是 `api.py` 那种客户端能做、浏览器里
-    没地方做的事。所以这个能力给 API 和 CLI，不给界面。
-
-    屏幕上那份 `agent_turns`（带决策链）只属于当前这段浏览器会话，不落盘：
-    决策链是"这一次请求怎么想的"，属于 trace，不属于对话内容。
-    """
-    if "agent_session_id" not in st.session_state:
-        st.session_state["agent_session_id"] = session.ensure_session("")
-    st.session_state.setdefault("agent_turns", [])
+    chat.init_agent_session(_chat_context())
 
 
 def _start_new_session() -> None:
-    """换一个会话号重新开始。
-
-    **不清空旧会话**——它还在盘上，由 `SESSION_TTL_DAYS` 那套过期和 CLI 的
-    `delete` 管。在这里顺手删掉是错的：用户点的是"我想重新开始说"，不是
-    "我想销毁记录"，两件事在界面上长得像，在语义上差很远。
-    """
-    st.session_state["agent_session_id"] = session.ensure_session("")
-    st.session_state["agent_turns"] = []
-
-
-# 空态的三张建议卡。**刻意各打一条路**：订单 / 知识库 / 数据分析各一张，
-# 点一张就走通一个 worker——这本身就是这套多 Agent 的演示，而"随便问点什么"
-# 的空输入不会演示出任何东西。
-#
-# 订单号用 52644 而不是另编一个：它是这个仓库到处在用的那个例子
-# （api.py 的 examples、技术文档和项目说明里的 CLI 示例），而且它在种子数据里
-# 有真实物流（目的地 San Salvador、「Late delivery」）。和文档对不上会让人
-# 以为数据被换过了。
-_SUGGESTIONS = {
-    ":material/local_shipping: 订单 52644 到哪了": "订单 52644 到哪了",
-    ":material/assignment_return: 退换货政策是什么": "退换货政策是什么",
-    ":material/bar_chart: 哪个地区卖得最好": "哪个地区卖得最好",
-}
-
-# 演示模式下**不能出现"哪个地区卖得最好"那张卡**：数据分析被停用了，点了
-# 只会得到知识库的"资料里没有"。换成一条知识库能真答上来的问题，既不让
-# 演示第一步就落空，也不诱导别人去问一个我们知道办不到的事。
-_DEMO_SUGGESTIONS = {
-    ":material/local_shipping: 订单 52644 到哪了": "订单 52644 到哪了",
-    ":material/assignment_return: 退换货政策是什么": "退换货政策是什么",
-    ":material/schedule: 退款一般多久到账": "退款一般多久到账",
-}
+    chat.start_new_session(_chat_context())
 
 
 def render_agent_view() -> None:
-    _init_agent_session()
-    turns = st.session_state["agent_turns"]
-
-    # 只有一条历史都没有时才画建议卡。这同时解决一个坑：pills 被点过之后会
-    # 一直"选着"，而一旦有了一轮对话它就不再被渲染——Streamlit 会把不再渲染
-    # 的 widget 状态回收掉。所以这里**不需要**手写 pop，也不会重复提交。
-    picked = _render_empty_state() if not turns else None
-
-    for turn in turns:
-        _render_turn(turn)
-
-    # 上传器放在输入框上方：先选图，再打字（或者只发图）。
-    uploaded, send_image_only = _render_image_uploader()
-
-    # chat_input 写在消息**之后**：Streamlit 自上而下渲染，只有这样它才会被
-    # 钉在底部、上面的输出往上长。
-    question = st.chat_input(
-        "问点什么…（订单 / 售后政策 / 销售数据都能问）", key="chat_agent"
-    ) or picked
-    if not question and not (uploaded is not None and send_image_only):
-        return
-
-    display_question = question or "（图片）"
-    if uploaded is not None:
-        augmented = _prepare_image_question(uploaded, question or "")
-        if augmented is None:
-            return
-        question = augmented
-        # 换一个 key，让下一次 rerun 拿到一个空的 uploader。Streamlit 的
-        # file_uploader 不能直接把 value 设成 None，只能换 key。
-        st.session_state["image_upload_nonce"] = (
-            st.session_state.get("image_upload_nonce", 0) + 1
-        )
-
-    if not question:
-        return
-    _run_turn(question, display_question=display_question)
-    if uploaded is not None:
-        st.rerun()
-
-
-def _render_empty_state() -> str | None:
-    """空态：一句引导 + 三张建议卡。**返回被点的那句问题**，不自己往下跑。
-
-    **刻意不在这里 st.rerun()。** 那样会引出一个"待处理的问题"中间态，而中间态
-    是下一轮 bug 的温床；更要紧的是先 append 再 rerun 会让一次点击**调两次模型**。
-    直接把问题交回主流程往下走，一次点击就只有一次调用。
-    """
-    st.markdown("### :material/waving_hand: 想聊点什么？")
-    if demo.enabled():
-        st.caption("这是只读演示：订单进度、售后政策都能问——直接打字，或者点一张卡试试。")
-    else:
-        st.caption("订单进度、售后政策、销售数据都能问——直接打字，或者点一张卡试试。")
-    suggestions = _DEMO_SUGGESTIONS if demo.enabled() else _SUGGESTIONS
-    picked = st.pills(
-        "试试这样问",
-        list(suggestions),
-        selection_mode="single",
-        key="chat_suggestion",
-        label_visibility="collapsed",
-    )
-    return suggestions.get(picked) if picked else None
-
-
-def _render_image_uploader():
-    """画上传器，返回 (上传的文件, 是否点了「只发送图片」)。
-
-    key 里带一个 nonce：发完一张图后把它 +1，下一次 rerun 就是一个全新的
-    uploader（`file_uploader` 不能直接把 value 设成 None，只能换 key）。
-    """
-    nonce = st.session_state.setdefault("image_upload_nonce", 0)
-    with st.expander(
-        "上传图片（可选：购物截图 / 售后凭证 / 发票 / 快递面单）",
-        icon=":material/image:",
-    ):
-        st.caption(
-            f"支持 PNG / JPG / WEBP，最大 {VISION_MAX_IMAGE_MB:g}MB。"
-            "图片只用于提取订单号、金额、商品和诉求，不会把原图写进会话。"
-        )
-        uploaded = st.file_uploader(
-            "选择图片",
-            type=["png", "jpg", "jpeg", "webp"],
-            accept_multiple_files=False,
-            key=f"chat_image_{nonce}",
-        )
-        send_image_only = (
-            st.button("只发送图片", key=f"send_image_{nonce}", icon=":material/send:")
-            if uploaded is not None
-            else False
-        )
-    return uploaded, send_image_only
-
-
-def _prepare_image_question(uploaded, question: str) -> str | None:
-    """识别上传的图片，拼成主链路能读的问题；失败时返回 None 或原始文字。
-
-    三种降级：
-      · 识别失败（没 key / 网络 / 非 JSON / 图太大）→ 提示手动输入；有文字就
-        继续用文字，没文字就停在这里。
-      · 识别成功但图里没有订单号 → 仍然把能认出的字段拼进去，同时提示用户
-        查订单/退货要手动补订单号。
-      · 识别成功但连诉求都没有、用户也没打字 → 提示再打一句话，不把空问题
-        送进主链路。
-    """
-    try:
-        data = uploaded.getvalue()
-    except Exception as exc:  # noqa: BLE001 —— 读文件失败也不该让界面崩
-        logger.warning("读取上传图片失败：%s", exc)
-        st.warning("读取图片失败，请重新选择或手动输入问题和订单号。")
-        return (question or "").strip() or None
-
-    mime = getattr(uploaded, "type", "") or "image/png"
-    with st.status(":shimmer[正在识别图片…]", type="compact", state="running") as status:
-        intent = understand_image(data, mime)
-        if intent.ok:
-            status.update(label="图片识别完成", state="complete")
-        else:
-            status.update(label="图片识别失败", state="error")
-
-    if not intent.ok:
-        # 错误原文只进日志：视觉 API 的报错里可能带请求细节，不适合直接摆在
-        # 公网页面上。用户需要知道的是"下一步做什么"。
-        logger.warning("图片识别失败：%s", intent.error)
-        st.warning("图片识别失败，请手动输入订单号或问题（详细原因已写入日志）。")
-        return (question or "").strip() or None
-
-    # 图片理解发生在主链路之前，它的 token 不进 supervisor 的账；演示模式的
-    # 每日预算按"所有实际花掉的 token"算，所以这里单独记一笔。
-    demo.add_tokens(intent.tokens)
-
-    augmented = augment_question_with_image(question or "", intent)
-    if not augmented:
-        st.warning(
-            "图片里没有识别出明确的诉求，请再打一句话，例如「订单 52644 到哪了」。"
-        )
-        return None
-
-    if intent.needs_manual_order_id:
-        st.info(
-            "图片里没有识别到订单号；如果要查订单或申请退货，"
-            "请在消息里手动补充订单号。"
-        )
-    return augmented
-
-
-def _render_turn(turn: dict) -> None:
-    """把一轮问答铺出来。**历史回放和新问答共用这一段**。
-
-    抽出来是因为它们的字段口径必须完全一致——两处显示同一件事时，措辞一致
-    才能让人相信它们是同一套东西，而不是两套各自演化的视图。
-    """
-    with st.chat_message("user"):
-        # `question` 可能是带图片块的"模型输入"，`display_question` 是用户
-        # 真正打的那句话。没有后者时退回前者（旧会话/测试里的 turn 就是这种）。
-        st.markdown(turn.get("display_question") or turn["question"])
-    with st.chat_message("assistant"):
-        st.markdown(turn["final"].get("answer") or "（没有生成答复）")
-        sources = turn["final"].get("sources") or []
-        if sources:
-            st.caption("来源：" + "、".join(str(s) for s in sources))
-        _render_decision_chain(turn["final"], turn["elapsed_ms"])
-
-
-def _run_turn(question: str, display_question: str | None = None) -> None:
-    """跑一轮问答。
-
-    `question` 是喂给模型的（可能带图片块），`display_question` 是画给用户看的。
-    两者分开，是因为图片块对模型有用、对人只是噪音；而会话里存的必须是前者
-    ——下一轮模型要靠它知道这张图说过什么。
-    """
-    sid = st.session_state["agent_session_id"]
-    turns = st.session_state["agent_turns"]
-    display_question = question if display_question is None else display_question
-
-    # 两道入口闸放在**画出用户消息之前**：先显示问题再报"太频繁"，会让人
-    # 以为这条问题已经被处理了。限流按会话号算——它挡不住换一个浏览器，
-    # 真正兜住成本的是下面那个按天记账的 token 预算（见 ecom/demo.py）。
-    if demo.enabled():
-        if not demo.allow_request(f"session:{sid}"):
-            st.warning("问得有点快，等一分钟再试。")
-            return
-        if demo.budget_exhausted():
-            st.error("今天的演示额度已经用完，明天再来。")
-            return
-
-    with st.chat_message("user"):
-        st.markdown(display_question)
-
-    with st.chat_message("assistant"):
-        started = datetime.now()
-        # **每次现读，不缓存一份在 session_state 里。** 两个地方各存一份
-        # 同一个历史，迟早会分叉（清空时忘了清另一份），而且会让
-        # HISTORY_TURNS 这个上限在界面上失效。
-        history = session.history(sid)
-        # 记忆拼在真实历史前面，**每轮现拼**——不要写回 session_state，
-        # 那份 history 是每轮现读的，写回去就跨轮重复累积了。
-        augmented = memory.augmented_history(sid, question, history)
-
-        # 状态条和正文是**两个容器**：状态条报进度，正文那块会被反复重画。
-        # 正文不放进 status 里，是因为 status 收起后正文会跟着折进去——
-        # 用户最后要读的是答复，不是那张进度条。
-        status = st.status(":shimmer[正在路由与汇总…]", type="compact", state="running")
-        answer_box = st.empty()
-        pieces: list[str] = []
-        final = None
-
-        try:
-            for event in answer_stream(question, augmented):
-                kind = event.get("type")
-                if kind == "delta":
-                    # 只在**第一块**改一次状态文案：每块都 update 等于每块都
-                    # 往浏览器发一次组件更新，token 越多白白越慢。
-                    if not pieces:
-                        status.update(label=":shimmer[正在生成答复…]", state="running")
-                    pieces.append(event.get("text") or "")
-                    # 末尾的光标只是提醒"还没完"；收到 final 就会被完整答复覆盖。
-                    answer_box.markdown("".join(pieces) + "▌")
-                elif kind == "final":
-                    final = event.get("state") or {}
-        except Exception:
-            # **异常原文只进日志。** 模型/数据库的报错里可能带内部路径，而用户
-            # 需要知道的是"这次没成，接下来怎么办"。
-            logger.exception("对话流式请求失败")
-            status.update(label="答复失败", state="error")
-            st.error("这次请求失败了，请稍后再试或换一种问法。")
-            return
-
-        elapsed_ms = int((datetime.now() - started).total_seconds() * 1000)
-        status.update(label=f"已完成（{elapsed_ms} ms）", state="complete")
-        if final is None:
-            status.update(label="答复失败", state="error")
-            st.error("这次请求没有正常结束，请重试。")
-            return
-
-        # 记账放在"确认真的答完"之后：中途失败的请求没拿到完整用量，
-        # 漏记的那部分由预算余量吸收；宁可少记，也不要在失败收尾时再抛一次。
-        demo.add_tokens(final.get("tokens") or {})
-
-        # **以 final 为准**，不用拼出来的 pieces：汇总中途失败时服务端会退回
-        # 拼接，两者可能不一致（见模块开头）。
-        answer_box.markdown(final.get("answer") or "（没有生成答复）")
-        sources = final.get("sources") or []
-        if sources:
-            st.caption("来源：" + "、".join(str(s) for s in sources))
-        _render_decision_chain(final, elapsed_ms)
-
-    # 先答完再落盘：模型调用失败时不会留下一条"问了没答"的记录。
-    session.append_turn(sid, question, final.get("answer") or "")
-    turns.append(
-        {
-            "question": question,
-            "display_question": display_question,
-            "final": final,
-            "elapsed_ms": elapsed_ms,
-        }
-    )
+    chat.render_agent_view(_chat_context())
 
 
 # 三个直连视图：实现在 ecom/ui/views.py。这里只做装配，所以测试继续

@@ -89,7 +89,7 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 │   ├── analytics/               数据分析：agents / core（graph + sandbox）/ utils / cli
 │   ├── mcp/                     MCP 工具服务：tools.py（纯函数契约）/ server.py（stdio 接线）
 │   ├── auth/                    身份层：principal / 角色 / token 哈希 / 审计（可选）
-│   └── ui/                      Streamlit 渲染件与三个直连视图（app.py 只做装配）
+│   └── ui/                      对话链路 / 三个直连视图 / 渲染件（app.py 只做装配）
 │
 ├── data/                        三个子系统的数据按目录分开
 │   ├── knowledge/               documents/（「法规原文」10 篇 + 「电商客服示例」7 篇）、
