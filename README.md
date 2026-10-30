@@ -637,11 +637,15 @@ URL；回答按纯文本渲染，不走 `innerHTML`。细节和限制见
 
 ```bash
 # 长期 API token（可设过期天数；0 = 不过期）
-uv run python -m ecom.auth.cli create --name alice --role admin --ttl-days 30
+# --customer 把 principal 绑定到客户号：之后订单只查这个客户名下的，不再从话里猜
+uv run python -m ecom.auth.cli create --name alice --role admin --ttl-days 30 --customer C20755
 # → 打印 p_xxx / alice / admin，以及一行 TOKEN（只显示一次）
 
 # 给 alice 设登录密码（交互输入，不回显）
 uv run python -m ecom.auth.cli set-password alice
+
+# 绑定/解绑客户号（空字符串 = 解绑）
+uv run python -m ecom.auth.cli set-customer alice C20755
 
 # 轮换 API token：旧 token 和所有登录会话立即失效
 uv run python -m ecom.auth.cli rotate alice --ttl-days 30
@@ -678,6 +682,8 @@ curl -H "Authorization: Bearer $TOKEN" \
   而不是隐藏资源存在性）。
 - `/auth/login`：`AUTH_ENABLED=1` 时才存在；密码存 scrypt 哈希，按 IP 限流
   （10 次/分钟），失败不区分"用户不存在"和"密码错"。
+- 客户绑定：principal 上的 `customer_id` 会一路传到订单 worker（`answer(...,
+  customer_id=...)`）；查询/写别人的订单会被拒绝，`list_orders` 直接按绑定客户查。
 - 会话：`sessions.owner_id` 记录 principal；别人的 `session_id` 一律 404。
   老库里 `owner_id=''` 的会话会被第一个拿它的 principal 认领（迁移用）。
 - 后台：`admin.py` 改成输入 admin token（登录会话 token 也可以），审核人自动取
@@ -689,8 +695,9 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 - 没有**浏览器登录页** / OIDC / MFA / 忘记密码：密码登录目前是 API 端点，
   两个界面仍然靠粘贴 token；
-- 没有**客户身份**：token 证明"谁在调 API"，不证明"这笔订单属于谁"，
-  `_guess_customer` 仍在；
+- **客户身份是"可选绑定"**：`--customer` / `set-customer` 把 principal 锁到一个
+  客户号，订单 worker 只查这个客户名下的单，查/写别人的单一律拒绝；**没绑定**
+  （匿名、本地演示）时仍会退回 `_guess_customer` 猜客户号；
 - 没有组织 / 多租户；`agent` 目前和 `customer` 同权；
 - MCP 仍只走 stdio，信任模型是"能拉起本进程的人"，不走这套 HTTP 身份。
 
@@ -809,7 +816,7 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 
 ### 会话 id 是**凭证**，不是账号
 
-> `_guess_customer`（`workers/order.py`）意味着**"客户"是从话里猜出来的、未认证的**。所以拿到 `session_id` 就能读到这个会话的全部历史。**别把它当账号**；要谈归属，前提是先有登录态——那是另一个项目。
+> `_guess_customer`（`workers/order.py`）意味着**未绑定客户号时"客户"是从话里猜的、未认证的**；绑定 principal 之后订单层只查该客户名下的单。`session_id` 仍是会话凭证：拿到它就能读到这个会话的全部历史，**别把它当账号**。
 
 推论有三条，全是有意的：
 
@@ -885,7 +892,7 @@ exact   41/50（82.0%）　covered 42/50（84.0%）
 ## 测试
 
 ```bash
-uv run pytest        # 757 条（--all-extras 实测：755 passed / 2 skipped；条数以当次输出为准）
+uv run pytest        # 762 条（--all-extras 实测：760 passed / 2 skipped；条数以当次输出为准）
 uv run ruff check .
 ```
 
@@ -956,7 +963,7 @@ CI 现在有两个 job：`lint-and-test`（ruff + pytest）和 `frontend`（`npm
 | ✅ | **真实 Streamlit 运行时** | 真跑：`streamlit.testing.v1.AppTest` 把两个入口跑完，6 条全绿。**这补上了原来那一栏 ❌** |
 | ✅ | **合并后的 `API`（FastAPI）真起服务** | 容器内真起 uvicorn：`/health` 200（含 workers + order_db）、`/openapi.json` 元数据齐、空问题 422、`/trace/不存在` 404、真提问 200（257+29 token / 1.2s）。**这一条走了网络、花了 token**，不属于"测试不联网"那一栏 |
 | ✅ | **Milvus 那条代码路径** | 真跑：连宿主常驻的 v2.5.5，`ecom_verify_<随机>` 临时集合走完 add / count / search / delete / drop，**零残留**（另有一条专门查残留）。⚠️ 见下面的版本错位 |
-| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 10 条**，现在宿主 `.venv`（`--all-extras`）上是 **757 条 / 755 passed / 2 skipped**，`ruff` 干净（这批的 GitHub CI 还没跑过；workflow 里已经加了前端构建 job） |
+| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 10 条**，现在宿主 `.venv`（`--all-extras`）上是 **762 条 / 760 passed / 2 skipped**，`ruff` 干净（这批的 GitHub CI 还没跑过；workflow 里已经加了前端构建 job） |
 | ✅ | **L1 只读 / 邀请码 / 预算闸门** | 真跑：32 条测试覆盖 fail closed 的邀请码、每客户端限流、跨重连的 token 账本、损坏账本拒绝花钱、路由不选 analytics、退货在落库前被挡、API 429 与 trace 404、界面门禁与建议语。**只验证了代码层**；下面那栏是部署文件 |
 | ✅ | **公网演示编排能解析** | 真跑：`docker compose --env-file .env.prod -f docker-compose.prod.yml config --quiet` 退出 0（临时 `.env.prod` 校验后已删）；Caddyfile 用 `caddy:2.10-alpine caddy validate` 通过（健康检查那条 `context canceled` 是校验时没有 app 容器，属预期）。**没有真部署**：没有域名和公网服务器，HTTPS 证书签发、Caddy→app 转发、公网可达都**没验过** |
 | ✅ | **CI 本身真跑绿了** | 真跑：[run #38132662970](https://github.com/My16210/ecommerce-multi-agent-cs/actions/runs/38132662970)（2026-10-11）——`ruff: All checks passed!`，`pytest: 517 passed, 3 skipped, 15.06s`，和本机干净 checkout 预演的数字一致。**这一栏原来是 ❌**：工作流写过、命令本地验过，但没推上去就一次都没真跑过。<br>真跑还多抓到两处**本地永远看不出来**的东西：① `python-version-file` 这个输入名**不存在**，setup-uv 只打一条 warning 就忽略它，workflow 照样绿、看着像钉住了版本；② `astral-sh/setup-uv` **没有 `v10` 这个大版本 tag**（它的可移动大版本 tag 只发到 v7），钉 `@v10` 会让 job 在 "Set up job" 阶段就红，得钉精确的 `@v10.3.0`。两处都改成实测过的写法 |
@@ -979,7 +986,7 @@ CI 现在有两个 job：`lint-and-test`（ruff + pytest）和 `frontend`（`npm
 
   **会话内那层摘要（`memories` 表）同一条边界，也要说死**：它是按 `session_id` 键的，**不是"开始做画像"的先例**。删会话连它一起删（`delete_session` / `purge` 都级联到 `memories`）——删了会话却留着它的摘要，是**隐私上的假动作**：用户以为删干净了，而摘要还躺在库里。
 
-  **仍然不做用户画像**：跨会话的用户级记忆需要"这个人是谁"稳定可信，而这里客户身份是从话里猜的（`_guess_customer`），没有登录态，做出来的画像会挂在错误的身份上。**先有身份，才谈得上画像** —— 这是顺序问题，不是工作量问题。
+  **仍然不做用户画像**：跨会话的用户级记忆需要"这个人是谁"稳定可信。现在 principal 可以绑定一个 `customer_id`，订单层能判断"这单是不是他的"；但那还是一个客户号，不是一套跨会话的用户画像（偏好、生命周期、跨渠道身份合并），而且绑定靠管理员手工完成。**先有可信身份，才谈得上画像** —— 这是顺序问题，不是工作量问题。
 - **不把 `session_id` 当账号。** 它是 bearer token（拿到就能读到整段历史），所以：界面不把它放进 URL、侧边栏只显示前 12 位、默认 30 天过期。**没做的能力写成测试钉住**（`test_a_new_browser_session_starts_a_new_conversation`），因为最容易被下一个人当成 bug 顺手补上——而补法（`st.query_params`）正好是那个不该做的。
 - **不执行退款、不改 `orders.status`。** 后台的"批准退货"只做两件事：改 `return_requests.status` + 插一行 `return_reviews` 痕迹，**在同一个事务里**。没有支付网关可调，**假装退款比不做更坏**；而 `orders.status` 是数据源原值，改它就是在编造数据。
 - **不给 `return_requests` 加列，也不引入 schema 迁移机制。** 审核痕迹放**新表** `return_reviews`，用 `CREATE TABLE IF NOT EXISTS` 天然兼容老库。理由两条：这个项目里"删库重灌"一直是免费的（全是派生数据），为了加三列而引入第一个迁移机制，收益和分量不匹配；以及**一旦这套被演示过，库里就会有人下的结论**，那时再重灌就等于抹掉人的决定——**在一个只有派生数据的库上引入"删除即无损失"的隐含假设，是最容易留下的技术债**。
@@ -994,7 +1001,7 @@ CI 现在有两个 job：`lint-and-test`（ruff + pytest）和 `frontend`（`npm
 
 - **进程内 worker 的"超时"只是不再等它**。Python 杀不掉正在跑的线程，被放弃的线程会自己跑完再被回收。它保护的是响应时间，**不是资源占用**。真要让进程内 worker 也能强杀，得把它们也挪进子进程——当前规模下不值得，但别把这件事说成"所有 worker 都能超时中断"。
 - **`KB_MIN_SCORE = 0.5` 是启发式，不是判据——而且换语料后它更弱了**。当初标定它依据的是旧语料的评测：真·不可答的余弦 0.53~0.64，可答的在 0.66 以上，两段只是轻微重叠。换成法规原文后重新实测（同一套 40 条快照）：**可答 0.523~0.781、不可答 0.431~0.707**，30 条可答题里有 15 条落在 0.66 以下，10 条不可答题里有 2 条在 0.66 以上——两段基本糊在一起，**没有任何阈值能把它们分开**。原因是语料变同质了：十篇都是法律中文，问任何法律问题都能捞到一段"看着挺像"的条文（旧语料是 LangGraph / RAG / RAGFlow 三份相对独立的文档，所以拉得开）。**但这不构成把阈值调高的理由**：调高会一次性误伤那 15 条可答题。取 0.5 依旧是"宁可漏报"——它现在只挡得住 0.431 那一条，等于这道闸门在新语料上基本常开。这是语料同质化的代价，如实记下，不拿它去反推一个更"好看"的阈值。
-- **`_guess_customer` 是从自然语言里猜客户号的 demo 将就**。真系统里客户身份来自登录态，绝不从话里猜——那等于让任何人问出别人的订单。这一点在代码里也标了警告。
+- **`_guess_customer` 只在未绑定客户号时兜底**。绑定 principal 的 `customer_id` 之后，订单查询/写操作只认这个客户，别人的单一律拒绝；但**没有客户表、注册、自助绑定**——客户号是管理员用 `--customer` / `set-customer` 手工挂上去的，未绑定的匿名/本地演示仍会猜。
 - **一条依赖装不上就少一条腿**。数据分析是核心能力，但它依赖 matplotlib 出图——缺了它整个 worker 会走"自动重试 3 次后放弃"的路径，报告里说"分析未能完成"，而不是崩掉。这是设计里的降级，但它意味着**环境不全时这个项目看起来是"三分之二可用"的**。
 - **会话过期要有外挂的 cron，长驻进程不会自我清理。** 过期只在两处触发：进程启动时一次、CLI 显式调用。**不做**懒加载式的"读的时候顺手删"——那会让读操作产生写副作用，出问题时极难定位。这个代价是**换来的**，不是漏掉的。同一台机器跑三个副本的话，各自清各自的。
 - **跨轮指代消解只做"订单号"这一种实体，而且只在指代词出现时才触发。** 这条原来叫"路由不解析代词回指"（真跑 `/chat` 时发现的，不是推测）：带历史追问「那它的金额是多少」，历史**确实进了 prompt**（token 从 257 涨到 387），但路由第一层是关键词规则，`plan` 是空的，于是答了"没听明白"。**现在修了**，判定集中在 [`utils/entities.py`](ecom/orchestrator/utils/entities.py)，router 的规则层和 order worker 走同一个函数（细节见上面「会话持久化」一节）。三条边界，都是有意的：**（1）只有订单号**会被携带，金额 / 商品名没做；**（2）读操作可以回退到携带来的号，写操作 `create_return` 不可以**（所以它永远**不会**替用户对一笔猜出来的订单提交退货）；**（3）携带只覆盖最近 `HISTORY_TURNS` 条用户发言**。它**不解决**"聊久了早期信息滑出窗口"——那是会话内长期记忆，见上面「会话内长期记忆：蒸馏 + 按需召回」一节。
