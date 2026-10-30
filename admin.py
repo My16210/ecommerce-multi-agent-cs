@@ -89,8 +89,15 @@ def check_password(entered: str, expected: str) -> bool:
 
 def _require_token_login() -> None:
     """身份层打开时的后台门禁：要一枚 admin 角色的 token，而不是共享口令。"""
-    if st.session_state.get("admin_principal"):
-        return
+    principal = st.session_state.get("admin_principal")
+    if principal:
+        # **每次 rerun 都重新验一遍**：token 可能已经被 revoke / 轮换 / 过期，
+        # 而 Streamlit 的 session_state 不会自动知道。只信"当前这枚 token"。
+        fresh = auth_store.authenticate(st.session_state.get("admin_token", ""))
+        if fresh and fresh["id"] == principal["id"] and auth_store.has_role(fresh, "admin"):
+            return
+        st.session_state.pop("admin_principal", None)
+        st.session_state.pop("admin_token", None)
 
     st.title("电商客服后台", icon=":material/lock:")
     st.caption(
