@@ -4,11 +4,12 @@
 #
 # 这个文件是**重写的**，不是从另外两个仓库搬来的：原来那份是围着 RAG 那个
 # 仓库自己的 app.py 转的（只跑知识库那一路、只装它要的 extra），而这个项目
-# 的入口是统一的 app.py，四个 Tab 要同时可用。
+# 的入口是统一的 app.py，四个视图要同时可用。
 #
 # 多阶段构建：
-#   builder —— 用 uv 装依赖，装进 /app/.venv
-#   runtime —— 只搬 .venv + 源码，不带 uv、不带编译工具、不带 dev 依赖
+#   builder  —— 用 uv 装依赖，装进 /app/.venv
+#   frontend —— 用 node 构建 React 界面，产物在 /frontend/dist
+#   runtime  —— 只搬 .venv + 源码 + 前端产物，不带 uv、编译工具、dev 依赖
 #
 # 三个必须说清的决定，都写在对应位置旁边：
 #   1. 为什么这次**用** --frozen（uv.lock 是怎么来的）
@@ -75,7 +76,25 @@ RUN --mount=type=cache,target=/root/.cache/uv \
             --extra ui --extra api --extra milvus --extra mysql --extra search --extra mcp
 
 # ---------------------------------------------------------------------------
-# 阶段二：运行时
+# 阶段二：前端（可选界面，但由镜像自己构建）
+#
+# 为什么不 `COPY frontend/dist` 了事：dist 在 .gitignore 里，干净 clone 上不存在。
+# 以前的做法是"宿主先 npm run build，再 docker build"，镜像内容取决于构建者的
+# 本机状态——同一份 commit 能构建出两个不同的镜像。这一步把前端变成镜像的一部分。
+# ---------------------------------------------------------------------------
+FROM node:22-slim AS frontend
+
+WORKDIR /frontend
+
+# 先只拷锁和清单，让 npm ci 这一层能独立命中缓存；改 src 不会重装依赖。
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+
+COPY frontend/ ./
+RUN npm run build
+
+# ---------------------------------------------------------------------------
+# 阶段三：运行时
 # ---------------------------------------------------------------------------
 FROM python:3.11-slim AS runtime
 
@@ -126,6 +145,10 @@ COPY --from=builder /app/.venv /app/.venv
 # 源码。触发上下文里有什么由 .dockerignore 决定——
 # 那里挡掉了 .env、.venv、data/knowledge/vector_store、*.db、logs、tests。
 COPY . /app
+
+# 前端产物：由 frontend 阶段构建，覆盖宿主上可能残留的旧 dist。
+# api.py 启动时看到 frontend/dist/index.html 就挂到 /ui；没有就跳过。
+COPY --from=frontend /frontend/dist /app/frontend/dist
 
 # 这几个目录代码会用到，都得可写（路径都锚在 /app，也就是 ecom/settings.py 里的 ROOT）：
 #   data/knowledge/documents/reviewed —— 人审通过的知识落盘处

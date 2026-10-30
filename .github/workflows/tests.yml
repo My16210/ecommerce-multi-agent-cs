@@ -1,4 +1,4 @@
-# 最小 CI：装依赖 → ruff → pytest。
+# 最小 CI：装依赖 → ruff → pytest；前端单独一个 job 做 `tsc + vite build`。
 #
 # 【为什么是"最小"而不是一套完整的流水线】
 # 这个仓库此前**一条 CI 都没有**。加 CI 的价值在于"测试绿"从**本机的一次性
@@ -98,3 +98,34 @@ jobs:
       # 【runner 上没有中文字体】出图那条测试会打几行 findfont warning，
       # 但它只断言"文件存在"、不校验像素，**不会红**（图确实是豆腐块）。
       # 不为此装 fonts-noto-cjk：会让 CI 变重，而它修的是一个没人看的差异。
+
+  # 【为什么前端要单独一个 job】
+  # 这条以前不存在：前端只靠 tests/test_frontend.py 的静态字符串断言，
+  # `tsc` / `vite build` 从没在 CI 跑过——结果是 **TS 编译失败也能绿**。
+  # 单独成 job 是为了不和 Python 那套抢 runner 时间，红的时候也一眼知道是哪边。
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Node 版本钉在 22：和 package.json 里 vite 8 / react 19 的要求对齐。
+      # cache 用 package-lock.json，`npm ci` 才会真正按锁装。
+      - name: 装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 装依赖
+        run: npm ci
+
+      # build 脚本本身就是 `tsc --noEmit && vite build`：
+      # 类型错误和"能通过 tsc 但构建不出来"都会在这一步红。
+      - name: 类型检查 + 构建
+        run: npm run build

@@ -44,6 +44,10 @@ uv run uvicorn api:app --port 8000
 **页面能打开、但白屏**——静态资源请求的是 `/assets/...` 而实际在
 `/ui/assets/...`，只有浏览器控制台里能看到 404。
 
+Docker 镜像会自己跑这一套（`Dockerfile` 的 `frontend` 阶段），所以
+`docker compose build` 不要求宿主机先 `npm run build`；直接在宿主机跑
+`uvicorn` 时才需要上面这一步。
+
 ## 安全约定
 
 - **API Key / 邀请码只放 `sessionStorage`**，关掉标签页就没；不进 URL、

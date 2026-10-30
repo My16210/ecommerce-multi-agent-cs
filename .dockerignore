@@ -64,9 +64,11 @@ volumes/
 # tests/ 也挡掉：镜像里那份源码是为了"能跑"，不是为了"能改"。
 tests/
 
-# React 前端的依赖目录：平台相关、几十 MB，而且只在构建时需要。
-# `frontend/dist/` **不挡**——它在宿主上构建好之后会进镜像，api.py 会挂到 /ui。
+# React 前端：依赖目录和构建产物都不进上下文。
+# dist 由 Dockerfile 的 frontend 阶段自己构建——镜像不依赖宿主先跑 npm run build，
+# 干净 clone 上直接 `docker compose build` 也能拿到 /ui。
 frontend/node_modules/
+frontend/dist/
 
 # ——— 别挡住这几类 ———
 #   data/knowledge/documents/    语料本体（含「电商客服示例」）
