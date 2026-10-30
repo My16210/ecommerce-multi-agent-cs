@@ -1,5 +1,7 @@
 """整张图：并行分派 / 结果合并 / 回环有界 / 全链路不联网也能跑通。"""
-from ecom.orchestrator.core.supervisor import answer
+import json
+
+from ecom.orchestrator.core.supervisor import answer, answer_stream
 from ecom.orchestrator.settings import MAX_ROUNDS
 from ecom.orchestrator.utils.trace import summarize_workers
 from tests.orchestrator.conftest import ExplodingLLM, FakeLLM
@@ -168,8 +170,6 @@ def test_tokens_cover_router_workers_and_synthesis():
 
 
 def test_one_request_writes_exactly_one_trace_line():
-    import json
-
     # 必须从 ecom.orchestrator.utils.trace 取**它自己那个** LOGS_DIR：
     # conftest 把它换到了 tmp_path，而 ecom.settings.LOGS_DIR 还指着仓库里真实的
     # logs/。两个模块各有一份名字相同的绑定，取错了就会去读线上那份。
@@ -188,6 +188,98 @@ def test_one_request_writes_exactly_one_trace_line():
     assert entry["decision"] == "answer"
     assert entry["router_source"] == "llm"
     assert entry["workers"]["order"]["calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 流式：同一份图、同一份收尾，只多了增量
+# ---------------------------------------------------------------------------
+def _two_worker_kwargs():
+    # 每次新建模型：FakeLLM 按调用次数往下取，跨两次运行复用会让断言失去意义。
+    return {
+        "workers": workers(),
+        "router_llm": FakeLLM('{"workers": ["order", "knowledge"], "confidence": 1.0}'),
+        "synth_llm": FakeLLM("合并后的答复"),
+    }
+
+
+def test_streaming_ends_with_the_same_state_as_invoke():
+    """**这是流式那条路唯一真正要守的契约**：和 `answer()` 跑出来一模一样。
+
+    内容、来源、决策、token 汇总、request_id 全部对齐。流式不是"另一条回答
+    路径"，只是同一条路径多了一个出口。
+    """
+    plain = answer("订单 52644 到哪了，顺便问下退货政策", record=False, **_two_worker_kwargs())
+    events = list(
+        answer_stream("订单 52644 到哪了，顺便问下退货政策", record=False, **_two_worker_kwargs())
+    )
+    final = events[-1]["state"]
+
+    assert events[0]["type"] == "start"
+    assert events[0]["request_id"] == final["request_id"]
+    assert events[-1]["type"] == "final"
+    assert final["answer"] == plain["answer"]
+    assert final["sources"] == plain["sources"]
+    assert final["decision"] == plain["decision"]
+    assert final["tokens"] == plain["tokens"]
+    assert "elapsed_ms" in events[-1]
+
+
+def test_streamed_deltas_rebuild_the_final_answer():
+    events = list(
+        answer_stream("订单 52644 到哪了，顺便问下退货政策", record=False, **_two_worker_kwargs())
+    )
+    deltas = [e for e in events if e["type"] == "delta"]
+
+    assert len(deltas) > 1, "两个结论要走汇总模型，应当收到多块"
+    assert "".join(d["text"] for d in deltas) == events[-1]["state"]["answer"]
+
+
+def test_a_single_conclusion_arrives_as_exactly_one_delta():
+    """没有汇总可做时**不切段**：一整段（假流式是在演延迟，不是在优化体验）。"""
+    events = list(
+        answer_stream(
+            "订单 52644 到哪了",
+            workers=workers(),
+            router_llm=FakeLLM('{"workers": ["order"], "confidence": 1.0}'),
+            record=False,
+        )
+    )
+    deltas = [e for e in events if e["type"] == "delta"]
+    assert [d["text"] for d in deltas] == ["订单结论"]
+
+
+def test_streaming_records_exactly_one_trace_line(monkeypatch):
+    from ecom.orchestrator.core import supervisor
+
+    recorded = []
+    monkeypatch.setattr(supervisor.trace, "record", recorded.append)
+
+    events = list(
+        answer_stream("订单 52644 到哪了，顺便问下退货政策", record=True, **_two_worker_kwargs())
+    )
+
+    assert len(recorded) == 1, "流式和非流式共用 _finalize，不该写两条 trace"
+    assert recorded[0]["request_id"] == events[-1]["state"]["request_id"]
+    assert recorded[0]["tokens"] == events[-1]["state"]["tokens"]
+
+
+def test_a_dead_synth_model_still_yields_a_complete_answer():
+    """汇总挂了 → 退回拼接。流式这条路也必须给出完整答复，而不是半句。"""
+    events = list(
+        answer_stream(
+            "订单 52644 到哪了，顺便问下退货政策",
+            workers=workers(),
+            router_llm=FakeLLM('{"workers": ["order", "knowledge"], "confidence": 1.0}'),
+            synth_llm=ExplodingLLM(),
+            record=False,
+        )
+    )
+    final = events[-1]["state"]
+
+    assert final["decision"] == "answer"
+    assert "【订单】" in final["answer"]
+    deltas = "".join(e["text"] for e in events if e["type"] == "delta")
+    assert deltas.strip() == final["answer"], "降级路径也要把完整答复交出去"
 
 
 def test_summarize_workers_aggregates_per_worker():

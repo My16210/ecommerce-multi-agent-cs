@@ -24,6 +24,16 @@ insufficient=True 才是**有信息量的失败**：它看过了，这个单元�
 没有东西可合并时调模型，只会把一段本来忠实的话改写成可能不忠实的另一段话——
 **凭空多一次幻觉机会，换来零信息增益**。所以 len(usable) == 1 时原样返回。
 
+【流式输出只从这里出去】
+整条链路上**唯一一处"最终答复正在被生成"**就是汇总这次模型调用。worker 的
+回答不是最终答复（多路时会再被汇总改写一遍），所以它们不适合往用户眼前一
+段段送。`synthesize()` 因此接一个可选的 `emit`：有它就用 `llm.stream()` 逐段
+吐，没有就走原来的 `invoke()`。**两条路返回的文本必须一样**——这一点由测试钉住。
+
+一个必须说清的窗口：如果已经吐了一半、模型随后失败，汇总会退回 `_concat`，
+最终答复与前面吐出的增量不一致。消费方（界面 / CLI）必须以 `final` 事件里
+的 `answer` 为准；流式中途的可变性是这个功能天生带来的，不是 bug。
+
 【汇总输出为什么是自由文本，不是 JSON】
 早先版本要求汇总也返回 {"answer": ...}，结果模型经常把整段正文塞进 JSON 字符串里，
 换行和引号全被转义，反而更容易崩、更难读。**人要读的正文就让它直接是正文。**
@@ -39,6 +49,7 @@ insufficient=True 才是**有信息量的失败**：它看过了，这个单元�
 上一轮说过什么。所以"历史只在汇总时用一次"那句老话是**说反了**：它一次都没用过，
 真正用的是 router、order worker 和 knowledge worker。
 """
+from ecom import demo
 from ecom.orchestrator.settings import MAX_ROUNDS, SYNTH_TEMPERATURE, SYNTH_TIMEOUT
 from ecom.orchestrator.utils.llm import get_llm
 from ecom.orchestrator.utils.logger import setup_logger
@@ -138,11 +149,42 @@ def _concat(rows: list) -> str:
     return "\n\n".join(parts)
 
 
-def synthesize(question: str, usable: list, llm=None) -> dict:
+def _emit_text(emit, text: str) -> None:
+    """把一个增量交给调用方。没有 `emit`（普通 `answer()`）时什么都不做。"""
+    if emit is not None and text:
+        emit({"type": "delta", "text": text})
+
+
+def _stream_call(llm, messages: list, emit) -> tuple[str, dict]:
+    """
+    流式调模型：边收边交，最后把正文和用量一起返回。
+
+    用量只在**最后一个**带 `usage_metadata` 的块上取（和 provider 的实际形状
+    一致：前面的块只有正文，最后一块把整次调用的用量一起报上来）。取不到就
+    按 0 计——`usage_of` 的容错约定，不在这里另立一套。
+    """
+    pieces: list[str] = []
+    tokens = dict(EMPTY)
+    for chunk in llm.stream(messages):
+        piece = str(getattr(chunk, "content", "") or "")
+        if piece:
+            pieces.append(piece)
+            _emit_text(emit, piece)
+        chunk_tokens = usage_of(chunk)
+        if chunk_tokens["in"] or chunk_tokens["out"]:
+            tokens = chunk_tokens
+    return "".join(pieces).strip(), tokens
+
+
+def synthesize(question: str, usable: list, llm=None, emit=None) -> dict:
     """
     合并多个结论。返回 {"answer", "source", "tokens"}，source ∈ {"llm","concat"}。
 
-    只有一个结论时**直接返回，不调模型**（见模块开头那段）。
+    只有一个结论时**直接返回，不调模型**（见模块开头那段）——那种情况下没有
+    token 可流，调用方（`answer_stream`）会把最终答复作为**一个**增量交出去。
+
+    emit：可选回调，收 `{"type": "delta", "text": ...}`。只有汇总模型这次
+    调用会走它；中途失败退回拼接时，最终答复以返回值里的 `answer` 为准。
     """
     if not usable:
         return {"answer": "", "source": "concat", "tokens": dict(EMPTY)}
@@ -154,14 +196,20 @@ def synthesize(question: str, usable: list, llm=None) -> dict:
         }
 
     prompt = SYNTH_PROMPT.format(question=question, blocks=_blocks(usable))
+    messages = [("system", "你是客服答复汇总器，不许引入任何新事实。"), ("human", prompt)]
     try:
         llm = llm or get_llm(SYNTH_TEMPERATURE, SYNTH_TIMEOUT)
-        response = llm.invoke(
-            [("system", "你是客服答复汇总器，不许引入任何新事实。"), ("human", prompt)]
-        )
-        text = str(response.content or "").strip()
+        if emit is not None and hasattr(llm, "stream"):
+            text, tokens = _stream_call(llm, messages, emit)
+        else:
+            response = llm.invoke(messages)
+            text = str(response.content or "").strip()
+            tokens = usage_of(response)
+            # 模型客户端没有 stream（或调用方不要流）时，整段作为**一个**增量。
+            # 这样消费方的事件契约保持一致，不需要额外判断"这次到底流没流"。
+            _emit_text(emit, text)
         if text:
-            return {"answer": text, "source": "llm", "tokens": usage_of(response)}
+            return {"answer": text, "source": "llm", "tokens": tokens}
         logger.warning("汇总模型返回了空正文，改用直接拼接")
     except Exception as exc:  # noqa: BLE001 —— 汇总失败不该让整次请求失败
         logger.warning("汇总模型不可用，改用直接拼接：%s: %s", type(exc).__name__, exc)
@@ -184,11 +232,12 @@ def _join(parts: list) -> str:
     return "\n\n".join(p for p in parts if p and p.strip()).strip()
 
 
-def aggregate(state: dict, llm=None) -> dict:
+def aggregate(state: dict, llm=None, emit=None) -> dict:
     """
     汇总节点。返回 state 的更新片段。
 
     llm：可注入（测试用假模型）。默认按配置取。
+    emit：可选的增量回调（流式问答用），只转给 `synthesize()`。
     """
     plan = state.get("plan") or []
     tried = state.get("tried") or []
@@ -209,7 +258,7 @@ def aggregate(state: dict, llm=None) -> dict:
 
     # ① 有真结论 —— 合并后答复
     if usable:
-        synth = synthesize(state.get("question") or "", usable, llm=llm)
+        synth = synthesize(state.get("question") or "", usable, llm=llm, emit=emit)
         tail = [_FAIL_NOTE.get(r.get("worker"), _FAIL_NOTE_DEFAULT) for r in failed]
         tail += [str(r.get("answer") or "").strip() for r in thin if str(r.get("answer") or "").strip()]
         # 上一轮攒下的澄清话术不能丢：它可能正是用户需要的那句"请提供订单号"
@@ -226,7 +275,9 @@ def aggregate(state: dict, llm=None) -> dict:
         }
 
     # ② 没有结论，看还能不能再试一轮
-    untried = [n for n in worker_names() if n not in tried]
+    # 演示模式下禁用的单元不算"还没试过"：否则回环会把数据分析重新拉回来，
+    # 路由层那道过滤就被绕开了——而它执行的正是模型生成的代码。
+    untried = [n for n in demo.filter_workers(worker_names()) if n not in tried]
     # round 由 router 自增、从 1 起，所以 `round_no < MAX_ROUNDS` 就是
     # "还没跑满 MAX_ROUNDS 轮，可以再来一轮"。
     can_retry = (

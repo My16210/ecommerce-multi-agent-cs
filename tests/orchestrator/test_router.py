@@ -1,6 +1,7 @@
 """路由：解析守卫 / 规则兜底 / 置信度补位 / 排除已试 / token 记账。"""
 import pytest
 
+from ecom import demo
 from ecom.orchestrator.core.router import CONFIDENCE_FLOOR, _rule_route, parse_route, route
 from tests.orchestrator.conftest import ExplodingLLM, FakeLLM
 
@@ -189,3 +190,69 @@ def test_routing_without_history_stays_single_turn():
     # 「那能退吗」没有上文就不该冒出 order。
     result = route("那能退吗", llm=FakeLLM("不是 JSON"))
     assert "order" not in result["plan"]
+
+
+# ---------------------------------------------------------------------------
+# 演示模式：数据分析连"被选中"都不该发生
+# ---------------------------------------------------------------------------
+def test_demo_mode_drops_analytics_from_an_llm_plan_and_falls_back(monkeypatch):
+    """只从计划里删名字不够：删空了要退回知识库，否则用户只得到一句"转人工"。
+
+    这里刻意让 LLM 给高置信度——如果过滤写在置信度补位之前，它会把 analytics
+    删掉之后什么都不补，计划为空。
+    """
+    monkeypatch.setattr(demo, "DEMO_MODE", True)
+
+    result = route(
+        "哪个地区卖得最好",
+        llm=FakeLLM('{"workers": ["analytics"], "confidence": 0.95}'),
+    )
+
+    assert result["plan"] == ["knowledge"]
+    assert "演示环境" in result["reason"]
+
+
+def test_demo_mode_filters_the_rule_layer_too(monkeypatch):
+    """LLM 挂了走规则层——规则层同样会命中 analytics，过滤必须在最终出口。"""
+    monkeypatch.setattr(demo, "DEMO_MODE", True)
+
+    result = route("哪个地区卖得最好", llm=ExplodingLLM())
+
+    assert result["plan"] == ["knowledge"]
+    assert result["source"] == "rule"
+
+
+def test_demo_mode_does_not_offer_analytics_in_the_prompt(monkeypatch):
+    """提示词里不列一个已经关掉的单元：让模型去选它只会白跑一次。"""
+    monkeypatch.setattr(demo, "DEMO_MODE", True)
+    fake = FakeLLM('{"workers": ["knowledge"], "confidence": 0.9}')
+
+    route("随便聊聊", llm=fake)
+
+    prompt = fake.calls[0][1][1]
+    assert "analytics" not in prompt
+    assert "knowledge" in prompt
+
+
+def test_demo_mode_keeps_all_workers_in_the_plan_when_they_are_allowed(monkeypatch):
+    monkeypatch.setattr(demo, "DEMO_MODE", True)
+
+    result = route(
+        "订单 52644 到哪了，顺便问下退货政策",
+        llm=FakeLLM('{"workers": ["order", "knowledge"], "confidence": 0.9}'),
+    )
+
+    assert result["plan"] == ["order", "knowledge"]
+
+
+def test_demo_mode_does_not_readd_an_already_tried_knowledge(monkeypatch):
+    """回环时不能为了"补位"把已经试过的知识库再拉一遍——那就是原地打转。"""
+    monkeypatch.setattr(demo, "DEMO_MODE", True)
+
+    result = route(
+        "哪个地区卖得最好",
+        tried=["knowledge"],
+        llm=FakeLLM('{"workers": ["analytics"], "confidence": 0.95}'),
+    )
+
+    assert result["plan"] == []

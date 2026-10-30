@@ -40,6 +40,20 @@ class FakeLLM:
         index = min(len(self.calls) - 1, len(self.contents) - 1)
         return FakeMessage(self.contents[index], self.usage)
 
+    def stream(self, messages):
+        """冒充 LangChain 的流式接口：正文切块吐，**最后一块只带用量**。
+
+        切块不是为了"看起来像流"——真 provider 就是这么回事：前面的块只有
+        正文，最后一块把整次调用的 usage 一起报上来。测试里切成 2 个字一块，
+        这样"多块拼回来等于原文"才有意义（一整块的话拼不拼都一样）。
+        """
+        self.calls.append(messages)
+        index = min(len(self.calls) - 1, len(self.contents) - 1)
+        text = self.contents[index]
+        for start in range(0, len(text), 2):
+            yield FakeMessage(text[start:start + 2], usage={})
+        yield FakeMessage("", self.usage)
+
     @property
     def call_count(self) -> int:
         return len(self.calls)

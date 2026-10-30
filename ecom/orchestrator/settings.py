@@ -154,3 +154,37 @@ MEMORY_TOP_K = int(os.getenv("MEMORY_TOP_K", "3"))
 # 和后台（admin.py）的密码策略**故意相反**：那边不配就拒绝启动。理由见
 # admin.py 的 docstring——读可以默认开放，写必须默认关闭。
 API_KEY = os.getenv("API_KEY", "")
+
+# ---------------------------------------------------------------------------
+# 公网演示模式（L1 上线）
+# ---------------------------------------------------------------------------
+# 这一组开关解决的是"把系统挂到公网上给人看"时最要命的四件事：
+#   · 谁可以进           → DEMO_INVITE_CODE
+#   · 一次能问多快       → DEMO_RATE_LIMIT_PER_MINUTE
+#   · 一天最多花多少     → DEMO_DAILY_TOKEN_BUDGET
+#   · 能做什么           → 只读（见 ecom/demo.py 与 workers/order.py 的写闸）
+#
+# **默认关闭**。本地跑、CI 跑、面试演示都不该被邀请码挡在门外；只有部署到
+# 公网的那份 .env.prod 里才把它打开。这也意味着"忘了配"的默认结果不是裸奔，
+# 而是"演示模式没开"——但那时仍然要靠反向代理/防火墙挡住后台，不能只靠它。
+DEMO_MODE = os.getenv("DEMO_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+# 邀请码。**演示模式打开却没配它时，所有请求都会被拒绝**（fail closed）——
+# 这是刻意的：一个没有邀请码的公网入口，和一个没有门的门卫是同一种东西。
+DEMO_INVITE_CODE = os.getenv("DEMO_INVITE_CODE", "")
+
+# 每个客户端每分钟最多几次请求。默认 12 次：够一个人正常问几轮，又不足以
+# 拿来刷。**它只是第一道闸**，真正兜住成本的是下面的每日 token 预算——限流
+# 可以被"多开几个会话/换 IP"绕开，预算绕不开。
+DEMO_RATE_LIMIT_PER_MINUTE = int(os.getenv("DEMO_RATE_LIMIT_PER_MINUTE", "12"))
+
+# 每天所有请求加起来的 token 上限（in+out）。<= 0 表示不限额。
+# 默认 20 万：按 qwen-plus 的公开价格，一天的上限是几块钱级别；
+# 这个数字是**成本闸**，不是性能参数，按自己的预算改。
+DEMO_DAILY_TOKEN_BUDGET = int(os.getenv("DEMO_DAILY_TOKEN_BUDGET", "200000"))
+
+# 预算账本。放 sqlite 是为了**跨进程、重启后仍然算数**：界面的 Streamlit
+# 进程和 API 的工作进程各算各的话，预算会变成"每个进程一份"，等于没设。
+DEMO_USAGE_DB_PATH = Path(
+    os.getenv("DEMO_USAGE_DB_PATH", str(DATA_DIR / "orchestrator" / "demo_usage.sqlite"))
+)

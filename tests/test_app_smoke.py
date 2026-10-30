@@ -98,12 +98,20 @@ def _install_fake_streamlit():
     # ——这几个决定了"不会走进需要用户操作的那条路"——
     st.button = lambda *args, **kwargs: False
     st.chat_input = lambda *args, **kwargs: None
+    # 图片上传器：这一套测试不验上传路径（那需要真模型），恒返回"没选文件"。
+    st.file_uploader = lambda *args, **kwargs: None
     # st.pills **必须返回固定的 None，不能进上面那个 _recorder 名单**。
     # `_Element` 没有定义 `__bool__`（而 dunder 查找也不走 `__getattr__`），
     # 所以 `bool(_Element())` 恒为 True——一旦它返回 _Element，空态里那句
     # `if picked:` 就会把一张"元素"当成"用户点了建议卡"，跑进一条根本不该
     # 走的分支（会去调模型）。返回 None = 这一轮没人点。
-    st.pills = lambda *args, **kwargs: None
+    def _pills(*args, **kwargs):
+        # 记录下来但**仍然返回 None**：现有测试要能看见"传了哪些选项"，
+        # 而返回一个元素会让空态误以为用户点了卡（见上面那段注释）。
+        CALLS.append(("pills", args))
+        return None
+
+    st.pills = _pills
     st.text_input = lambda *args, **kwargs: ""
     st.toggle = lambda label, value=False, **kwargs: value
     st.selectbox = lambda label, options, **kwargs: (options[0] if options else None)
@@ -298,11 +306,13 @@ def test_the_model_gets_history_from_the_store_not_from_the_screen(app):
 
     seen = {}
 
-    def _fake_answer(question, history):  # noqa: ANN001
+    def _fake_answer_stream(question, history):  # noqa: ANN001
         seen["history"] = history
-        return {"answer": "（假答复）"}
+        yield {"type": "start", "request_id": "req-test"}
+        yield {"type": "delta", "text": "（假答复）"}
+        yield {"type": "final", "state": {"answer": "（假答复）"}, "elapsed_ms": 1}
 
-    app.answer = _fake_answer
+    app.answer_stream = _fake_answer_stream
     app.st.chat_input = lambda *a, **k: "这一轮的问题"
 
     app.render_agent_view()
@@ -330,3 +340,74 @@ def test_a_new_session_starts_blank_but_does_not_delete_the_old_one(app):
     assert app.st.session_state["agent_turns"] == []
     assert app.session.get_session(old) is not None, "旧会话被顺手删掉了"
     assert len(app.session.history(old)) == 2
+
+
+# ——— 公网演示：入口门禁 / 隐藏后台视图 / 不诱导去问已停用的能力 ———
+
+def _enable_demo(app, monkeypatch, code="let-me-in"):
+    monkeypatch.setattr(app.demo, "DEMO_MODE", True)
+    monkeypatch.setattr(app.demo, "DEMO_INVITE_CODE", code)
+
+
+def test_demo_mode_shows_the_invite_gate_before_anything_else(app, monkeypatch):
+    _enable_demo(app, monkeypatch)
+    app.st.session_state.clear()
+    CALLS.clear()
+
+    app.main()
+
+    shown = " ".join(str(c[1]) for c in CALLS)
+    assert "只读演示环境" in shown
+    assert not _calls_named("chat_input"), "没进邀请码就渲染了对话入口"
+
+
+def test_demo_mode_without_a_configured_code_says_why(app, monkeypatch):
+    _enable_demo(app, monkeypatch, code="")
+    app.st.session_state.clear()
+    CALLS.clear()
+
+    app.main()
+
+    shown = " ".join(str(c[1]) for c in CALLS)
+    assert "DEMO_INVITE_CODE" in shown
+    assert not _calls_named("chat_input")
+
+
+def test_demo_mode_does_not_render_the_analytics_view(app, monkeypatch):
+    """侧边栏已经不显示它了，但视图函数本身也要挡——那才是真正执行代码的地方。"""
+    _enable_demo(app, monkeypatch)
+    CALLS.clear()
+
+    app.render_analytics_view()
+
+    assert _calls_named("warning")
+    assert not _calls_named("text_input"), "分析输入框不该被画出来"
+
+
+def test_demo_sidebar_hides_the_direct_views_and_the_session_id(app, monkeypatch):
+    """公网演示只留对话；会话号是凭证，不该挂在一个可截图的地方。"""
+    _enable_demo(app, monkeypatch)
+    app.st.session_state.clear()
+    CALLS.clear()
+
+    view = app.render_sidebar()
+
+    assert view == app.DEFAULT_VIEW
+    assert not _calls_named("pills"), "演示模式不该画视图选择器"
+    assert not _calls_named("code"), "演示模式不该显示会话号"
+    shown = " ".join(str(c[1]) for c in CALLS)
+    assert "只读演示" in shown
+
+
+def test_demo_suggestions_do_not_offer_sales_analytics(app, monkeypatch):
+    """点了必然办不到的建议卡，比没有建议卡更糟——它让演示第一步就落空。"""
+    _enable_demo(app, monkeypatch)
+    app.st.session_state.clear()
+    app.st.session_state["agent_turns"] = []
+    CALLS.clear()
+
+    app.render_agent_view()
+
+    shown = " ".join(str(c[1]) for c in CALLS)
+    assert "哪个地区卖得最好" not in shown
+    assert "退款一般多久到账" in shown

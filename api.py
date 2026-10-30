@@ -13,8 +13,9 @@ HTTP 接口（FastAPI）。
     界面     app.py          Streamlit，给人看的
     命令行   main.py         CLI，排查用的
     接口     api.py          这个文件
-三者调的是同一个 `supervisor.answer()`。所以"改一处逻辑要改三处"这件事
-在这里不成立——这一条比任何一处接口设计都重要。
+三者调的是同一套编排逻辑（`supervisor.answer()` / `answer_stream()`，两者
+共用同一份收尾与记账）。所以"改一处逻辑要改三处"这件事在这里不成立——
+这一条比任何一处接口设计都重要。
 
 【为什么入口是 `def` 不是 `async def`】
 图里全是**阻塞**调用（同步的 HTTP 请求、sqlite、subprocess）。写成 `async def`
@@ -64,17 +65,19 @@ FastAPI 会把它丢进线程池，这才是这类代码该待的地方。要真
 request_id，出问题时拿这个 id 去 `logs/` 里对——错误体的用途是"让客户端知道
 该怎么办"，不是"让人隔空读源码"。
 """
+import json
 import secrets
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from ecom import demo
 from ecom.orchestrator import memory, session
-from ecom.orchestrator.core.supervisor import answer
+from ecom.orchestrator.core.supervisor import answer, answer_stream
 from ecom.orchestrator.db.engine import get_db
 from ecom.orchestrator.settings import API_KEY, MAX_QUESTION_CHARS, MAX_ROUNDS
 from ecom.orchestrator.utils import trace
@@ -85,7 +88,7 @@ logger = setup_logger(__name__)
 
 TAGS = [
     {"name": "health", "description": "存活与组件概览。**永远不需要凭证**——探针和监控走这里。"},
-    {"name": "chat", "description": "一次提问：路由 → worker → 汇总。多轮由 `session_id` 串起来。"},
+    {"name": "chat", "description": "一次提问：路由 → worker → 汇总。多轮由 `session_id` 串起来。`/chat` 一次返回完整 JSON，`/chat/stream` 走 SSE。"},
     {"name": "trace", "description": "回看历史请求的决策链（路由、每个 worker 的成功与否和耗时）。"},
 ]
 
@@ -121,7 +124,8 @@ app = FastAPI(
         "一个 Supervisor 带多个 worker 的电商客服服务：路由决定交给谁"
         "（知识库 / 订单 / 数据分析），汇总把结论揉成一段话。\n\n"
         "**这是三个入口之一**——`app.py`（界面）、`main.py`（命令行）、"
-        "`api.py`（这里）调的是同一个 `supervisor.answer()`，不是三份实现。\n\n"
+        "`api.py`（这里）调的是同一套编排逻辑（`/chat` → `answer()`，"
+        "`/chat/stream` → `answer_stream()`），不是三份实现。\n\n"
         "**多轮对话**：第一次请求不带 `session_id`，服务端会生成一个并放在响应里；"
         "下一次带上它就能接上上下文。会话落在磁盘上，默认 30 天没动静就清掉。\n\n"
         "⚠️ `session_id` **是凭证不是账号**——拿到它就能读到这个会话的全部历史。"
@@ -166,9 +170,10 @@ class ChatResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str = Field(description="恒定 `ok`——这里只报「组件在不在」，不报「组件好不好」。")
-    workers: list[str] = Field(description="已注册的 worker 名字。")
+    workers: list[str] = Field(description="已注册的 worker 名字（演示模式下不含被停用的）。")
     order_db: str = Field(description="订单库后端：`sqlite` 或 `mysql`。")
     max_rounds: int = Field(description="一次提问最多跑几轮（含首轮）。")
+    demo: bool = Field(default=False, description="是否运行在只读演示模式。")
 
 
 class TraceItem(BaseModel):
@@ -247,6 +252,42 @@ def require_api_key(x_api_key: str = Header(default="", description="配了 API_
         )
 
 
+def require_demo_access(
+    x_invite_code: str = Header(
+        default="", alias="X-Invite-Code", description="演示模式打开时才需要。"
+    ),
+) -> None:
+    """
+    演示模式的邀请码。**没开演示模式就放行**（和 API_KEY 的"不配就放行"同向，
+    但语义不同：这里是"没启用这个功能"，不是"选择不鉴权"）。
+
+    它和 API_KEY 是两道独立的门，可以同时开：API_KEY 管"谁能调接口"，
+    邀请码管"公网演示给谁看"。只开一个也能工作，但公网演示建议两个都开。
+    """
+    if not demo.enabled():
+        return
+    if not demo.check_invite(x_invite_code):
+        raise HTTPException(status_code=403, detail="演示环境需要正确的 X-Invite-Code")
+
+
+def _demo_precheck(request: Request) -> None:
+    """
+    每次问答前的两道闸：限流、每日预算。**都在真正调模型之前**——拦在调用
+    之后等于钱已经花了。演示模式没开时它是空操作。
+    """
+    if not demo.enabled():
+        return
+    client = request.client.host if request.client else "unknown"
+    if not demo.allow_request(f"ip:{client}"):
+        raise HTTPException(
+            status_code=429,
+            detail="请求过于频繁，请稍后再试",
+            headers={"Retry-After": "60"},
+        )
+    if demo.budget_exhausted():
+        raise HTTPException(status_code=429, detail="今天的演示额度已经用完")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 端点
 # ═══════════════════════════════════════════════════════════════════════════
@@ -264,9 +305,12 @@ def health() -> dict:
     db = get_db()
     return {
         "status": "ok",
-        "workers": worker_names(),
+        # 演示模式下不报告被停用的单元：健康检查也在公网上，报一个"存在但
+        # 不可用"的 worker 会让人以为只是这一次没路由到它。
+        "workers": demo.filter_workers(worker_names()),
         "order_db": db.backend,
         "max_rounds": MAX_ROUNDS,
+        "demo": demo.enabled(),
     }
 
 
@@ -277,10 +321,16 @@ def health() -> dict:
     summary="问一句",
     description="路由决定交给谁（知识库 / 订单 / 数据分析），worker 跑完由汇总"
                 "揉成一段话。首轮不带 `session_id`，之后带上响应里返回的那个即可多轮。",
-    dependencies=[Depends(require_api_key)],
-    responses={401: {"model": ErrorResponse, "description": "配了 API_KEY 但没带或带错"}},
+    dependencies=[Depends(require_api_key), Depends(require_demo_access)],
+    responses={
+        401: {"model": ErrorResponse, "description": "配了 API_KEY 但没带或带错"},
+        403: {"model": ErrorResponse, "description": "演示模式但邀请码不对"},
+        429: {"model": ErrorResponse, "description": "请求太频繁或今日演示额度已用完"},
+    },
 )
-def chat(req: ChatRequest) -> dict:
+def chat(req: ChatRequest, request: Request) -> dict:
+    _demo_precheck(request)
+
     # 先确保会话存在再读历史——顺序反过来的话，新会话的第一问会因为
     # "查不到这个 session_id"而拿不到空历史（这一版不会报错，只是白查一次）。
     session_id = session.ensure_session(req.session_id)
@@ -291,6 +341,7 @@ def chat(req: ChatRequest) -> dict:
     # 会话还没跑过 `distill`（库是空的）时它原样返回，**一次 embedding 都不调**，
     # 所以没有记忆的会话在这条路上是零额外开销。
     final = answer(req.question, memory.augmented_history(session_id, req.question, history))
+    demo.add_tokens(final.get("tokens") or {})
 
     # **先答完再落盘**。反过来的话，模型调用失败也会留下一条"问了没答"的
     # 记录。`append_turn` 内部一问一答是同一个提交，所以这里要么成对写入，
@@ -308,6 +359,141 @@ def chat(req: ChatRequest) -> dict:
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 流式：SSE
+#
+# 事件只有四种，客户端按 `type` 分派即可：
+#
+#     {"type":"start", "request_id":"...", "session_id":"..."}
+#     {"type":"delta", "text":"..."}
+#     {"type":"final", "request_id":"...", "session_id":"...", "answer":"...",
+#      "sources":[...], "decision":"...", "plan":[...], "tokens":{...},
+#      "elapsed_ms":123}
+#     {"type":"error", "error":"...", "request_id":"..."}
+#
+# **`final.answer` 是权威版本。** 汇总流到一半失败时服务端会退回拼接，
+# 前面收到的 delta 拼起来可能和它不一致——流式天生带这个窗口，不是 bug。
+#
+# 为什么另开一个端点，不改 `/chat`：非流式那个是"一步拿到完整 JSON"的契约，
+# 几十个调用方（包括测试）按它写的。让同一个路径按请求头切换返回 body 类型，
+# 是那种"curl 一下看起来正常、客户端里悄悄坏掉"的改法。
+# ═══════════════════════════════════════════════════════════════════════════
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    # nginx / Caddy 默认会缓冲响应，缓冲之后 token 就不是"逐字到达"了——
+    # 现象是"流式写完了、浏览器一次性显示"。这个头让代理别攒。
+    "X-Accel-Buffering": "no",
+}
+
+
+def _sse(payload: dict) -> str:
+    """一条 SSE 帧。`ensure_ascii=False`：中文按原样发，省字节也好读日志。"""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@app.post(
+    "/chat/stream",
+    tags=["chat"],
+    summary="问一句（流式，SSE）",
+    description="和 `/chat` 是同一套流程、同一份会话存储，区别只在于答复"
+                "边生成边以 `text/event-stream` 推回来。事件类型见接口说明："
+                "`start` / `delta` / `final` / `error`。\n\n"
+                "**`final.answer` 是权威版本**：汇总中途失败时会退回拼接，"
+                "前面 `delta` 拼起来可能和它不一致。\n\n"
+                "只有在**多个单元给出结论、需要汇总**时才是真逐 token；"
+                "只有一个结论时会作为一个 `delta` 整段到达——不把已完成的字符串"
+                "切成小块假装在流。",
+    dependencies=[Depends(require_api_key), Depends(require_demo_access)],
+    responses={
+        401: {"model": ErrorResponse, "description": "配了 API_KEY 但没带或带错"},
+        403: {"model": ErrorResponse, "description": "演示模式但邀请码不对"},
+        429: {"model": ErrorResponse, "description": "请求太频繁或今日演示额度已用完"},
+    },
+)
+def chat_stream(req: ChatRequest, request: Request) -> StreamingResponse:
+    """
+    同步生成器 + `StreamingResponse`。
+
+    `answer_stream()` 是**阻塞**生成器（模型调用、sqlite 都是同步的），
+    StreamingResponse 会把它放进线程池迭代——和 `/chat` 写 `def` 是同一个理由，
+    不给事件循环塞阻塞代码。
+    """
+    # 闸必须在**开始发 SSE 之前**：一旦返回了 StreamingResponse，HTTP 状态码
+    # 就已经是 200 了，再把 429 塞进流里，客户端会以为"答到一半失败了"。
+    _demo_precheck(request)
+
+    session_id = session.ensure_session(req.session_id)
+    history = session.history(session_id)
+    # 和 /chat 一样：记忆每轮现拼，不落盘。
+    augmented = memory.augmented_history(session_id, req.question, history)
+
+    def events():
+        request_id = ""
+        final = None
+        elapsed_ms = None
+        try:
+            for event in answer_stream(req.question, augmented):
+                kind = event.get("type")
+                if kind == "start":
+                    request_id = event.get("request_id") or ""
+                    yield _sse(
+                        {
+                            "type": "start",
+                            "request_id": request_id,
+                            "session_id": session_id,
+                        }
+                    )
+                elif kind == "delta":
+                    yield _sse({"type": "delta", "text": event.get("text") or ""})
+                elif kind == "final":
+                    final = event.get("state") or {}
+                    request_id = final.get("request_id") or request_id
+                    elapsed_ms = event.get("elapsed_ms")
+        except Exception:
+            # **异常原文只进日志。** 错误体里给一句人话 + request_id，
+            # 和 /chat 那条兜底同一个口径。
+            logger.exception("流式请求失败 request_id=%s", request_id)
+            yield _sse(
+                {
+                    "type": "error",
+                    "error": "服务内部错误。把这个 request_id 提供给维护者，日志里有完整原因。",
+                    "request_id": request_id or trace.new_request_id(),
+                }
+            )
+            return
+
+        if final is None:
+            yield _sse(
+                {
+                    "type": "error",
+                    "error": "这次请求没有正常结束。",
+                    "request_id": request_id or trace.new_request_id(),
+                }
+            )
+            return
+
+        # **拿到完整答复之后再落盘。** 中途断开的请求不写会话——半句话接进
+        # 下一轮，比没答更坏。和 /chat 的"先答完再落盘"是同一条规矩。
+        session.append_turn(session_id, req.question, final.get("answer") or "")
+        demo.add_tokens(final.get("tokens") or {})
+
+        yield _sse(
+            {
+                "type": "final",
+                "request_id": request_id,
+                "session_id": session_id,
+                "answer": final.get("answer") or "",
+                "sources": final.get("sources") or [],
+                "decision": final.get("decision") or "",
+                "plan": final.get("plan") or [],
+                "tokens": final.get("tokens") or {},
+                "elapsed_ms": elapsed_ms,
+            }
+        )
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
 @app.get(
     "/trace",
     response_model=TraceResponse,
@@ -323,6 +509,10 @@ def chat(req: ChatRequest) -> dict:
     },
 )
 def traces(limit: int = 20) -> dict:
+    # 公网演示不开放 trace：里面有用户问过的话、路由理由和内部耗时。
+    # **返回 404 而不是 403**——403 等于告诉对方"这里有东西，只是不给你"。
+    if demo.enabled():
+        raise HTTPException(status_code=404, detail="演示环境不提供请求记录")
     rows = _read_traces(limit)
     if not rows:
         raise HTTPException(status_code=404, detail="还没有请求记录")
@@ -332,17 +522,20 @@ def traces(limit: int = 20) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 # 错误：三种失败路径收敛到同一个形状
 # ═══════════════════════════════════════════════════════════════════════════
-def _error(status: int, message: str) -> JSONResponse:
+def _error(status: int, message: str, headers: dict | None = None) -> JSONResponse:
     return JSONResponse(
         status_code=status,
         content=ErrorResponse(error=message, request_id=trace.new_request_id()).model_dump(),
+        # 401 的 `WWW-Authenticate` 和 429 的 `Retry-After` 都靠这里带出去：
+        # 统一错误体不能顺手把协议要求的头也统一掉。
+        headers=headers,
     )
 
 
 @app.exception_handler(StarletteHTTPException)
 async def _on_http_error(_, exc: StarletteHTTPException) -> JSONResponse:
-    """`HTTPException`（我们主动抛的 404/401）。"""
-    return _error(exc.status_code, str(exc.detail))
+    """`HTTPException`（我们主动抛的 401/403/404/429）。"""
+    return _error(exc.status_code, str(exc.detail), headers=dict(exc.headers or {}))
 
 
 @app.exception_handler(RequestValidationError)
@@ -368,8 +561,6 @@ async def _on_unhandled(_, exc: Exception) -> JSONResponse:
 
 
 def _read_traces(limit: int) -> list:
-    import json
-
     path = trace.LOGS_DIR / "requests.jsonl"
     if not path.exists():
         return []

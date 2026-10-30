@@ -74,6 +74,24 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 SILICONFLOW_API_KEY = os.getenv("SILICONFLOW_API_KEY", "")
 SILICONFLOW_BASE_URL = "https://api.siliconflow.cn/v1"
 
+# ——————————————————————————————————————————————————————————————
+# 图片理解（多模态）：走硅基流动的视觉模型
+# ——————————————————————————————————————————————————————————————
+# 默认复用上面的 SILICONFLOW_API_KEY / BASE_URL；想换供应商或模型时只改
+# 这几个变量，不动代码。模型名会随平台上下架变化，跑不通时先看控制台的
+# 模型列表——这类错误在运行时表现为一次可读的识别失败，不会崩。
+VISION_API_KEY = os.getenv("VISION_API_KEY", SILICONFLOW_API_KEY)
+VISION_BASE_URL = os.getenv("VISION_BASE_URL", SILICONFLOW_BASE_URL)
+VISION_MODEL = os.getenv("VISION_MODEL", "Qwen/Qwen3-VL-30B-A3B-Instruct")
+
+# 单次识别的超时。图片理解在用户点发送之后、进入主链路之前，它慢只会让
+# 这一步多转一会儿；但**不能无限等**——超时就降级成"请手动输入"。
+VISION_TIMEOUT = int(os.getenv("VISION_TIMEOUT", "30"))
+
+# 图片大小上限（MB）。超过就拒绝，不发出去：既保护成本，也避免把一张
+# 几十 MB 的图 base64 之后撑爆请求体。5MB 对截图/发票/面单足够。
+VISION_MAX_IMAGE_MB = float(os.getenv("VISION_MAX_IMAGE_MB", "5"))
+
 # 联网搜索（可选）。配了 Tavily key 就优先用它，否则退回免 key 的 ddgs。
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 

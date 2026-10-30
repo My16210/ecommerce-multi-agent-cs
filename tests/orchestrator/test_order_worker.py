@@ -17,6 +17,7 @@
 """
 import pytest
 
+from ecom import demo
 from ecom.orchestrator.tools.order_tools import (
     OrderNotFound,
     ReturnNotAllowed,
@@ -24,6 +25,11 @@ from ecom.orchestrator.tools.order_tools import (
     get_returns,
     list_customer_orders,
     query_order,
+)
+from ecom.orchestrator.utils.image_intent import (
+    ImageIntent,
+    augment_question_with_image,
+    format_image_context,
 )
 from ecom.orchestrator.workers.order import _rule_extract, extract_intent, run_order
 from tests.orchestrator.conftest import ExplodingLLM
@@ -295,6 +301,50 @@ def test_a_successful_return_is_only_registered_not_approved(wired):
 
 
 # ---------------------------------------------------------------------------
+# 公网演示：只读闸卡在落库之前
+# ---------------------------------------------------------------------------
+def test_demo_mode_refuses_a_clear_return_request(wired, monkeypatch):
+    """**库里必须没多出东西。** 这是只读闸唯一有意义的断言。
+
+    界面藏掉按钮挡不住 API/CLI；所以这条测试直接调 worker，验证写操作在
+    **落库那一层**被拦住，而不是靠调用方自觉。
+    """
+    monkeypatch.setattr(demo, "DEMO_MODE", True)
+
+    result = run_order(f"订单 {COMPLETE_ORDER} 我要退货")
+
+    assert result["insufficient"] is False
+    assert "只读演示" in result["answer"]
+    assert get_returns(COMPLETE_ORDER, wired) == []
+
+
+def test_demo_mode_does_not_ask_for_confirmation_before_refusing(wired, monkeypatch):
+    """演示模式下不该引导用户"再说一次确认"——确认了也办不了。
+
+    问规则时返回 insufficient=True，让汇总把这句话交给知识库去答；
+    但不能出现「回一句确认申请退货」这种下一步必然失败的话术。
+    """
+    monkeypatch.setattr(demo, "DEMO_MODE", True)
+
+    result = run_order(f"订单 {COMPLETE_ORDER} 能不能退")
+
+    assert result["insufficient"] is True
+    assert "只读演示" in result["answer"]
+    assert "确认申请退货" not in result["answer"]
+    assert get_returns(COMPLETE_ORDER, wired) == []
+
+
+def test_demo_mode_still_allows_reads(wired, monkeypatch):
+    """只读闸不能闸过界：查物流是演示最该能用的那条路。"""
+    monkeypatch.setattr(demo, "DEMO_MODE", True)
+
+    result = run_order(f"订单 {COMPLETE_ORDER} 到哪了")
+
+    assert result["insufficient"] is False
+    assert "San Salvador" in result["answer"]
+
+
+# ---------------------------------------------------------------------------
 # 跨轮指代：**读可以携带，写不可以**（见 order.py 模块 docstring）
 # ---------------------------------------------------------------------------
 def _history_with_the_order() -> list:
@@ -382,3 +432,70 @@ def test_a_model_that_calls_the_followup_a_return_still_names_the_order(wired, m
     assert COMPLETE_ORDER in result["answer"]
     assert result["insufficient"] is True
     assert get_returns(COMPLETE_ORDER, wired) == []
+
+
+# ---------------------------------------------------------------------------
+# 图片里的订单号：**读可以用，写不可以**（和跨轮指代同理）
+# ---------------------------------------------------------------------------
+def _image_question(
+    text: str,
+    *,
+    order_id: str = COMPLETE_ORDER,
+    request: str = "查物流",
+) -> str:
+    return augment_question_with_image(
+        text, ImageIntent(ok=True, order_id=order_id, request=request)
+    )
+
+
+def test_an_image_order_id_is_used_for_a_read(wired):
+    # 用户只打了「到哪了」，订单号在图片里。这是图片输入最有用的一条路。
+    result = run_order(_image_question("到哪了"))
+    assert result["insufficient"] is False
+    assert COMPLETE_ORDER in result["answer"]
+    assert "San Salvador" in result["answer"]
+
+
+def test_an_image_order_id_is_tagged_with_its_source():
+    intent = extract_intent(_image_question("到哪了"))
+    assert intent["order_id"] == COMPLETE_ORDER
+    assert intent["order_id_source"] == "image"
+
+
+def test_an_image_order_id_is_never_used_to_file_a_return(wired):
+    """**这一组里最重要的一条。**
+
+    图片里明明有 52644，用户也说「我要退货」；但那个号是模型从像素里认的，
+    不是用户在这句话里打的。拿它去提交退货，和拿"上一轮猜的号"去提交是同一类
+    错误——而且已经落库了。所以必须退回"请提供订单号"。
+    """
+    result = run_order(_image_question("我要退货", request="退货"))
+    assert result["insufficient"] is True
+    assert "订单号" in result["answer"]
+    assert get_returns(COMPLETE_ORDER, wired) == []
+
+
+def test_a_typed_order_id_wins_over_the_image_order_id(wired):
+    """用户手动打了 51592，图片里是 52644：以用户打的为准，退货照办。
+
+    闸门只挡"不是用户当轮打的号"，不该挡用户明确输入的那一个。
+    """
+    result = run_order(
+        _image_question(
+            f"订单 {COMPLETE_ORDER_2} 我要退货",
+            order_id=COMPLETE_ORDER,
+            request="退货",
+        )
+    )
+    assert "待审核" in result["answer"]
+    assert len(get_returns(COMPLETE_ORDER_2, wired)) == 1
+    assert get_returns(COMPLETE_ORDER, wired) == []
+
+
+def test_an_image_block_without_a_request_does_not_invent_an_action(wired):
+    """图里只有订单号、没有诉求，用户也没打字：不要替用户猜"他想干什么"。"""
+    result = run_order(
+        format_image_context(ImageIntent(ok=True, order_id=COMPLETE_ORDER))
+    )
+    assert result["insufficient"] is True
+    assert "没有明确的订单操作" in result["answer"]

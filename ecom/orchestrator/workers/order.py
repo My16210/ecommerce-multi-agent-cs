@@ -32,10 +32,18 @@
 把号说出来用户才知道系统认成了哪一笔，猜错当场就能纠正——这恰恰是消解要的
 效果。所以闸门卡在**真正落库前那一行**，不是卡在这条路径的入口。
 
-`intent["order_id_source"]` ∈ {"question", "context", ""} 就是为这道闸留的。
+【图片里的订单号：和"从上一轮猜的"同级】
+`app.py` 的图片输入会先经 `tools/image_understander` 把图提取成一段带标记的
+文本（订单号/金额/商品/诉求），再拼进用户消息。那块里的订单号是**模型从像素里
+认的**，不是用户在这句话里打的；所以它和 `carried` 一样：**读可以用，写不行**。
+`extract_intent` 会先把图片块摘掉再做规则/模型提取，避免它被标成
+`source="question"`；块里的号最后单独以 `source="image"` 补回来。
+
+`intent["order_id_source"]` ∈ {"question", "context", "image", ""} 就是为这道闸留的。
 """
 import re
 
+from ecom import demo
 from ecom.orchestrator.db.seed import seed
 from ecom.orchestrator.tools.order_tools import (
     OrderNotFound,
@@ -48,6 +56,12 @@ from ecom.orchestrator.tools.order_tools import (
 )
 from ecom.orchestrator.utils.entities import carried_order_id
 from ecom.orchestrator.utils.ids import ORDER_ID_RE
+from ecom.orchestrator.utils.image_intent import (
+    image_order_id,
+    image_request,
+    sanitize_image_text,
+    strip_image_block,
+)
 from ecom.orchestrator.utils.json_utils import loads_or_none
 from ecom.orchestrator.utils.llm import get_llm
 from ecom.orchestrator.utils.logger import setup_logger
@@ -158,17 +172,20 @@ def _llm_extract(question: str, llm) -> dict:
     }
 
 
-def _apply_carry(intent: dict, carried: str) -> dict:
+def _apply_carry(intent: dict, carried: str, image_id: str = "") -> dict:
     """
-    当轮没抽出订单号时，把"上一轮提过的那一笔"补进来，**并标明它是从哪来的**。
+    当轮没抽出订单号时，按顺序补：上一轮提过的 → 图片块里的，**并标明来源**。
 
     `order_id_source` 是给写操作守门用的（见 `run_order`）：从 `chat_history`
-    来的订单号是**猜的**，只读操作能用。不标来源，那一层就分不开这两者。
+    来的号是**猜的**，从图片块来的号是**模型从像素里认的**，两者都只读操作能用。
+    不标来源，那一层就分不开"用户当轮打的"和这两种。
     """
     if intent.get("order_id"):
         return {**intent, "order_id_source": "question"}
     if carried:
         return {**intent, "order_id": carried, "order_id_source": "context"}
+    if image_id:
+        return {**intent, "order_id": image_id, "order_id_source": "image"}
     return {**intent, "order_id_source": ""}
 
 
@@ -183,23 +200,34 @@ def extract_intent(question: str, llm=None, chat_history: list = None) -> dict:
     chat_history：指代消解的来源（判定在 `utils/entities`）。**规则这条路和
     LLM 那条路都要补**——只在规则那条路上补的话，「它到哪了」这种被 LLM 认出
     action、却吐不出订单号的情况，会把携带来的号丢掉。
+
+    **图片块先摘掉**：块里的订单号不能以"用户当轮说的"身份进入提取（否则会
+    绕过写操作那道闸）。块里的"诉求"可以拼回去帮规则认动作，但拼之前要把其中
+    的订单号替换掉——模型完全可能在 request 里复述订单号。
     """
-    carried = carried_order_id(question, chat_history)
-    rule = _apply_carry(_rule_extract(question), carried)
+    visible = strip_image_block(question)
+    image_id = image_order_id(question)
+    request = sanitize_image_text(image_request(question)).strip()
+    visible_for_extraction = (
+        f"{visible}\n图片中的诉求：{request}".strip() if request else visible
+    )
+
+    carried = carried_order_id(visible, chat_history)
+    rule = _apply_carry(_rule_extract(visible_for_extraction), carried, image_id)
     needs_id = rule["action"] in {"tracking", "status", "create_return"}
     if rule["action"] and (not needs_id or rule["order_id"]):
         return {**rule, "source": "rule", "tokens": dict(EMPTY)}
 
     try:
         llm = llm or get_llm(0)
-        llm_result = _llm_extract(question, llm)
+        llm_result = _llm_extract(visible_for_extraction, llm)
     except Exception as exc:  # noqa: BLE001 —— LLM 挂了不该拖垮规则能处理的那些
         logger.warning("LLM 意图提取不可用，退回规则结果：%s", exc)
         return {**rule, "source": "rule", "tokens": dict(EMPTY)}
 
     # LLM 若给出更完整的结论就用它；否则保留规则结果
     if llm_result["action"]:
-        return {**_apply_carry(llm_result, carried), "source": "llm"}
+        return {**_apply_carry(llm_result, carried, image_id), "source": "llm"}
     return {**rule, "source": "rule", "tokens": llm_result.get("tokens", dict(EMPTY))}
 
 
@@ -316,8 +344,31 @@ def run_order(question: str, chat_history: list = None) -> dict:
     intent = extract_intent(question, chat_history=chat_history)
     action, order_id = intent["action"], intent["order_id"]
     tokens = intent.get("tokens") or dict(EMPTY)
-    # 这个号是不是"从上一轮猜来的"（判定见 utils/entities）。下面那道闸的开关。
-    carried = intent.get("order_id_source") == "context"
+    # 这个号是不是"猜来的"或"从图片里认的"。下面那道闸的开关。
+    # 两者都不是用户在当前消息里打的，所以都只能读、不能写。
+    guessed = intent.get("order_id_source") in {"context", "image"}
+
+    # 公网演示的只读闸：**在判断出"要写"之后、任何落库之前**。
+    # 它不依赖界面藏按钮——API、CLI 和重路由都会走到这个函数。
+    # 问的是"规则"时返回 insufficient=True，让 aggregate 有机会把这句交给
+    # 知识库答；明确要求办理时直接说"办不了"，不再重路由（没有别的单元能办）。
+    if not demo.writes_allowed() and (
+        action == "create_return" or (not action and policy_question(question) and "退" in question)
+    ):
+        if policy_question(question):
+            return {
+                "answer": "这是只读演示环境，不能提交退货申请。",
+                "insufficient": True,
+                "data": {"intent": intent, "demo_readonly": True},
+                "tokens": tokens,
+            }
+        return {
+            "answer": "这是只读演示环境，不能提交退货申请。"
+                      "可以问我退货政策，或查询订单状态和物流。",
+            "insufficient": False,
+            "data": {"intent": intent, "demo_readonly": True},
+            "tokens": tokens,
+        }
 
     # 写操作的第二道闸（第一道在 _rule_extract）。上面那道只挡规则路径，
     # 模型也有可能把「你们的退货政策是什么」听成"要退货"——**写操作两层都要守**。
@@ -327,9 +378,9 @@ def run_order(question: str, chat_history: list = None) -> dict:
     # 「订单 52644 能不能退」用一句"没有明确的订单操作"回，等于把球扔回给用户；
     # 直接告诉他"你是想问规则，还是要办"，他下一句就能接上。
     #
-    # **这两条分支只问不做，所以允许带上"猜来的"订单号**：把号说出来，用户才
-    # 知道系统认成了哪一笔。实测真模型会把「那能退吗」判成 create_return，所以
-    # 不带上它的话，澄清问句会退化成"某一笔订单"——那和"没听明白"差不多。
+    # **这两条分支只问不做，所以允许带上"猜来的/图片里认的"订单号**：把号说出来，
+    # 用户才知道系统认成了哪一笔。实测真模型会把「那能退吗」判成 create_return，
+    # 所以不带上它的话，澄清问句会退化成"某一笔订单"——那和"没听明白"差不多。
     if action == "create_return" and policy_question(question):
         return _ask_before_writing(order_id, intent, tokens)
     if not action:
@@ -343,11 +394,11 @@ def run_order(question: str, chat_history: list = None) -> dict:
             "tokens": tokens,
         }
 
-    # 写操作的第三道闸：**"猜来的"订单号到此为止**。上面两条只问不做，可以用它；
-    # 从这一行往下会真的落库（create_return 会插一行退货申请），拿一个猜出来的
-    # 号去提交 = 替用户对**错误订单**办事。清空之后自然落到紧接着那条
-    # "请提供订单号"，让用户显式给出。
-    if action == "create_return" and carried:
+    # 写操作的第三道闸：**"猜来的"和"图片里认的"订单号到此为止**。上面两条
+    # 只问不做，可以用它；从这一行往下会真的落库（create_return 会插一行退货
+    # 申请），拿一个不是用户当轮打的号去提交 = 替用户对**错误订单**办事。
+    # 清空之后自然落到紧接着那条"请提供订单号"，让用户显式给出。
+    if action == "create_return" and guessed:
         order_id = ""
 
     if action in {"tracking", "status", "create_return"} and not order_id:

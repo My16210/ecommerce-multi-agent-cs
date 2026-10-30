@@ -1,0 +1,84 @@
+# ============================================================================
+# 公网只读演示（L1）—— 只有两个服务：app + Caddy
+#
+#     docker compose --env-file .env.prod -f docker-compose.prod.yml up -d
+#
+# 和 docker-compose.yml 的**区别就是安全边界**，不是"换了个环境"：
+#   · 没有 admin 服务。后台能批准退货，不该出现在公网上；要审核就在服务器
+#     本机 `docker compose -f docker-compose.yml up admin`，或者走 SSH 隧道。
+#   · app **不发布宿主机端口**，只让 Caddy 通过 compose 内网访问它。
+#     发布 127.0.0.1:8501 也可以，但那等于多留一个绕过 TLS/限流的口子。
+#   · 强制 DEMO_MODE=1（见下面 environment）。就算 .env.prod 里忘了写，
+#     打开的也是只读模式；没配邀请码时是"谁都进不来"，而不是"谁都能进"。
+#   · 只有 Caddy 发布 80/443，TLS 由它自动申请和续期。
+#
+# 不在这个文件里做的事（别以为它做了）：
+#   · 不做多副本。会话和预算账本都在本地 sqlite，多副本各写各的。
+#   · 不做备份。data/ 和 logs/ 是 bind mount，备份是宿主机的活（见 RUNBOOK）。
+#   · 不做账号体系。邀请码不是身份，没有审计、不能单独吊销某个人。
+# ============================================================================
+
+name: ecom-cs-prod
+
+services:
+  app:
+    build:
+      context: .
+    image: ecom-cs:prod
+
+    # 密钥、邀请码、预算都从这里进容器。**不要把这个文件提交进仓库**。
+    env_file:
+      - .env.prod
+
+    environment:
+      # 强制只读演示。env_file 里的值会被这里覆盖——这是刻意的：
+      # 公网编排文件的默认值必须是安全的那一边。
+      DEMO_MODE: "1"
+      # 向量库用嵌入式 Chroma，零外部依赖。要接宿主机上的 Milvus 就改这里，
+      # 并注意容器里的 localhost 是容器自己（用 host.docker.internal）。
+      VECTOR_BACKEND: ${VECTOR_BACKEND:-chroma}
+
+    # **不写 ports**。Caddy 通过 compose 默认网络访问 app:8501。
+    expose:
+      - "8501"
+
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+    # 资源上限。演示不是生产容量规划，这两条是"一个人把机器跑满"的兜底。
+    # （compose 非 swarm 模式用 mem_limit/cpus；deploy.resources 会被静默忽略。）
+    mem_limit: 2g
+    cpus: 2.0
+
+    restart: unless-stopped
+
+    # 健康检查继承镜像里那份（/_stcore/health，8501）。
+
+  caddy:
+    image: caddy:2.10-alpine
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"        # HTTP/3；不想要可以删，不影响 HTTPS
+    environment:
+      # 由 `--env-file .env.prod` 提供（compose 的 ${} 插值读的是
+      # --env-file，不是下面 app 的 env_file）。
+      # ACME_EMAIL 不在这里传：Caddyfile 里没有 email 指令，传了也不会生效，
+      # 反而会让人以为配了就有证书到期提醒。要就自己在 Caddyfile 全局块加。
+      DOMAIN: ${DOMAIN:?请先在 .env.prod 里设置 DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # 证书和 ACME 账号状态。**必须持久化**：丢了会重新申请，而 Let's Encrypt
+      # 对同一域名有频率限制，反复重建容器可能把自己锁在限流里。
+      - caddy_data:/data
+      - caddy_config:/config
+    mem_limit: 256m
+    cpus: 0.5
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

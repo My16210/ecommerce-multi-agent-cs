@@ -52,12 +52,35 @@ def client(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(api, "answer", _fake_answer)
+
+    streamed = []
+
+    def _fake_answer_stream(question, history):  # noqa: ANN001
+        streamed.append({"question": question, "history": list(history)})
+        yield {"type": "start", "request_id": "req-stream"}
+        yield {"type": "delta", "text": "答复："}
+        yield {"type": "delta", "text": question}
+        yield {
+            "type": "final",
+            "state": {
+                "request_id": "req-stream",
+                "answer": f"答复：{question}",
+                "sources": ["订单库"],
+                "decision": "answer",
+                "plan": ["order"],
+                "tokens": {"in": 1, "out": 2},
+            },
+            "elapsed_ms": 5,
+        }
+
+    monkeypatch.setattr(api, "answer_stream", _fake_answer_stream)
     # **默认把 API_KEY 清掉**：模块导入时会读一次 .env，本机如果真配了
     # API_KEY，下面那些"没配就能放行"的用例会以一种很难懂的方式红掉。
     monkeypatch.setattr(api, "API_KEY", "")
 
     with TestClient(api.app) as c:
         c.seen = seen
+        c.streamed = streamed
         yield c
 
     api.session.reset_connection()
@@ -129,6 +152,77 @@ def test_both_turns_are_written_to_the_store(client):
     stored = api.session.history(sid)
 
     assert [m["content"] for m in stored] == ["问", "答复：问"]
+
+
+# ——— 流式：SSE 的事件形状与会话语义 ———
+
+def _sse_events(body: str) -> list:
+    """把 SSE 正文拆回事件。只认 `data: ` 开头的行——注释/空行是协议的一部分。"""
+    return [
+        json.loads(line[len("data: "):])
+        for line in body.splitlines()
+        if line.startswith("data: ")
+    ]
+
+
+def _stream_body(client, question="你好", session_id=""):  # noqa: ANN001
+    payload = {"question": question}
+    if session_id:
+        payload["session_id"] = session_id
+    with client.stream("POST", "/chat/stream", json=payload) as r:
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/event-stream")
+        return "".join(r.iter_text())
+
+
+def test_stream_emits_start_delta_final_in_order(client):
+    events = _sse_events(_stream_body(client, "订单 52644 到哪了"))
+
+    assert [e["type"] for e in events] == ["start", "delta", "delta", "final"]
+    assert events[0]["request_id"] == "req-stream"
+    assert events[0]["session_id"] == events[-1]["session_id"]
+    assert events[-1]["answer"] == "答复：订单 52644 到哪了"
+    assert events[-1]["tokens"] == {"in": 1, "out": 2}
+    assert events[-1]["elapsed_ms"] == 5
+
+
+def test_stream_writes_the_turn_to_the_store_after_final(client):
+    events = _sse_events(_stream_body(client, "问"))
+
+    sid = events[-1]["session_id"]
+    assert [m["content"] for m in api.session.history(sid)] == ["问", "答复：问"]
+
+
+def test_stream_reuses_the_session_id_on_the_second_turn(client):
+    first = _sse_events(_stream_body(client, "第一问"))
+    sid = first[-1]["session_id"]
+
+    second = _sse_events(_stream_body(client, "第二问", sid))
+
+    assert second[-1]["session_id"] == sid
+    assert [m["content"] for m in api.session.history(sid)] == [
+        "第一问", "答复：第一问", "第二问", "答复：第二问",
+    ]
+
+
+def test_stream_reports_an_error_without_persisting_a_half_turn(client, monkeypatch):
+    """流到一半挂了：发 `error` 事件、**不落盘**、不回异常原文。
+
+    半句话接进下一轮，比没答更坏——下一轮模型会把它当成"用户已经知道的事"。
+    """
+    def _boom(question, history):  # noqa: ANN001
+        yield {"type": "start", "request_id": "req-boom"}
+        yield {"type": "delta", "text": "答了一半"}
+        raise RuntimeError("机密：/app/data/orders.sqlite 打不开")
+
+    monkeypatch.setattr(api, "answer_stream", _boom)
+
+    events = _sse_events(_stream_body(client, "随便"))
+
+    assert [e["type"] for e in events] == ["start", "delta", "error"]
+    assert events[-1]["request_id"] == "req-boom"
+    assert "orders.sqlite" not in events[-1]["error"], "内部路径被回给客户端了"
+    assert api.session.history(events[0]["session_id"]) == []
 
 
 # ——— 鉴权：配了才强制 ———
@@ -285,3 +379,95 @@ def test_the_openapi_document_carries_the_hand_written_metadata(client):
     assert spec["paths"]["/chat"]["post"]["summary"]
     # 401 的响应模型要出现在文档里，否则看文档的人不知道有无鉴权
     assert "401" in spec["paths"]["/chat"]["post"]["responses"]
+
+
+# ——— 公网演示：邀请码 / 限流 / 预算 / trace ——
+
+@pytest.fixture
+def demo_client(client, monkeypatch, tmp_path):
+    """打开演示模式，并把账本、限流都换成测试可控的。"""
+    monkeypatch.setattr(api.demo, "DEMO_MODE", True)
+    monkeypatch.setattr(api.demo, "DEMO_INVITE_CODE", "let-me-in")
+    monkeypatch.setattr(api.demo, "DEMO_USAGE_DB_PATH", tmp_path / "usage.sqlite")
+    monkeypatch.setattr(api.demo, "DEMO_DAILY_TOKEN_BUDGET", 0)      # 默认不限额
+    monkeypatch.setattr(api.demo, "DEMO_RATE_LIMIT_PER_MINUTE", 0)   # 默认不限流
+    api.demo.reset_rate_limits()
+    yield client
+    api.demo.reset_rate_limits()
+
+
+INVITE = {"X-Invite-Code": "let-me-in"}
+
+
+def test_demo_mode_requires_the_invite_code(demo_client):
+    assert demo_client.post("/chat", json={"question": "没带码"}).status_code == 403
+    assert demo_client.post(
+        "/chat", json={"question": "带错码"}, headers={"X-Invite-Code": "wrong"}
+    ).status_code == 403
+    assert demo_client.post(
+        "/chat", json={"question": "带对码"}, headers=INVITE
+    ).status_code == 200
+
+
+def test_demo_mode_requires_the_invite_code_on_the_stream_too(demo_client):
+    """流式端点不能是后门：它调的是同一套编排，也会花钱。"""
+    assert demo_client.post("/chat/stream", json={"question": "没带码"}).status_code == 403
+    with demo_client.stream(
+        "POST", "/chat/stream", json={"question": "带对码"}, headers=INVITE
+    ) as r:
+        assert r.status_code == 200
+
+
+def test_demo_mode_hides_trace(demo_client, tmp_path):
+    """公网演示不开放 trace——里面有用户问过的话和内部耗时。
+
+    返回 404 而不是 403：403 等于告诉对方"这里有东西，只是不给你看"。
+    """
+    (tmp_path / "requests.jsonl").write_text(
+        json.dumps({"request_id": "r-1"}) + "\n", encoding="utf-8"
+    )
+
+    assert demo_client.get("/trace").status_code == 404
+
+
+def test_health_reports_demo_mode_and_hides_disabled_workers(demo_client):
+    body = demo_client.get("/health").json()
+
+    assert body["demo"] is True
+    assert "analytics" not in body["workers"]
+
+
+def test_demo_rate_limit_returns_429_before_calling_the_model(demo_client, monkeypatch):
+    monkeypatch.setattr(api.demo, "DEMO_RATE_LIMIT_PER_MINUTE", 1)
+
+    assert demo_client.post("/chat", json={"question": "第一次"}, headers=INVITE).status_code == 200
+    r = demo_client.post("/chat", json={"question": "第二次"}, headers=INVITE)
+
+    assert r.status_code == 429
+    assert r.headers["retry-after"] == "60"
+    # 被限流的那次**不该**走到 answer()：否则钱已经花了才说"太频繁"
+    assert len(demo_client.seen) == 1
+
+
+def test_demo_daily_budget_blocks_further_requests(demo_client, monkeypatch):
+    monkeypatch.setattr(api.demo, "DEMO_DAILY_TOKEN_BUDGET", 3)
+
+    # 假 answer 每次报 3 个 token（in=1, out=2），刚好用满额度
+    assert demo_client.post("/chat", json={"question": "第一次"}, headers=INVITE).status_code == 200
+    assert api.demo.tokens_used_today() == 3
+
+    r = demo_client.post("/chat", json={"question": "第二次"}, headers=INVITE)
+    assert r.status_code == 429
+    assert "额度" in r.json()["error"]
+    assert len(demo_client.seen) == 1
+
+
+def test_the_stream_also_records_its_tokens(demo_client):
+    """流式的用量在 `final` 里，不记的话预算对流式用户就是失效的。"""
+    with demo_client.stream(
+        "POST", "/chat/stream", json={"question": "问"}, headers=INVITE
+    ) as r:
+        assert r.status_code == 200
+        "".join(r.iter_text())
+
+    assert api.demo.tokens_used_today() == 3

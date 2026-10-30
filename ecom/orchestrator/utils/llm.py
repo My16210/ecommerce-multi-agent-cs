@@ -33,5 +33,9 @@ def get_llm(temperature: float = 0.0, timeout: int = 60) -> ChatOpenAI:
             temperature=temperature,
             timeout=timeout,
             max_retries=0,  # 见模块开头：重试只能有一层，那一层是我们
+            # 流式调用默认**不报用量**（OpenAI 兼容协议要显式打开）。不打开的话
+            # 汇总改成走 stream() 之后，这一路的 token 会静静地记成 0——账面上
+            # 看着省钱了，实际只是没记上。非流式调用不受这个开关影响。
+            stream_usage=True,
         )
     return _clients[key]

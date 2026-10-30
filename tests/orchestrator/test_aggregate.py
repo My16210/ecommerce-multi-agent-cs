@@ -85,6 +85,61 @@ def test_sources_are_deduped_but_keep_their_order():
 
 
 # ---------------------------------------------------------------------------
+# 流式：增量拼回去必须等于最终答复
+# ---------------------------------------------------------------------------
+def test_synthesis_streams_in_chunks_that_rebuild_the_same_text():
+    """**流式最怕的不是慢，是拼回来不一样。**
+
+    这里的断言不是"有没有流"（那看块数），而是"流出来的和最终的一致"。
+    两者一旦分叉，界面上就会出现"播到一半突然换一句话"。
+    """
+    chunks = []
+    result = agg.synthesize(
+        "q",
+        [usable("order"), usable("knowledge")],
+        llm=FakeLLM("订单已签收，退货七天内。"),
+        emit=chunks.append,
+    )
+
+    assert result["answer"] == "订单已签收，退货七天内。"
+    assert result["source"] == "llm"
+    assert len(chunks) > 1, "假模型切成 2 字一块，这里应当收到多块"
+    assert all(c["type"] == "delta" for c in chunks)
+    assert "".join(c["text"] for c in chunks) == result["answer"]
+
+
+def test_a_model_client_without_stream_still_emits_one_delta():
+    """没有 `stream()` 的客户端也要遵守同一个事件契约（整段作为一块）。"""
+
+    class InvokeOnly:
+        def invoke(self, messages):
+            return FakeLLM("整段答复").invoke(messages)
+
+    chunks = []
+    result = agg.synthesize(
+        "q", [usable("order"), usable("knowledge")], llm=InvokeOnly(), emit=chunks.append
+    )
+
+    assert result["answer"] == "整段答复"
+    assert [c["text"] for c in chunks] == ["整段答复"]
+
+
+def test_a_dead_stream_falls_back_and_does_not_emit_garbage():
+    """流到一半模型挂了：不抛、不把半句话当结论，退回拼接。"""
+    chunks = []
+    result = agg.synthesize(
+        "q",
+        [usable("order"), usable("knowledge")],
+        llm=ExplodingLLM(),
+        emit=chunks.append,
+    )
+
+    assert result["source"] == "concat"
+    assert chunks == []
+    assert "【订单】" in result["answer"]
+
+
+# ---------------------------------------------------------------------------
 # 决策
 # ---------------------------------------------------------------------------
 def test_a_broken_worker_does_not_kill_the_answer():

@@ -33,6 +33,7 @@ Supervisor 的路由：这句话该交给谁处理。
 import re
 import time
 
+from ecom import demo
 from ecom.orchestrator.settings import (
     ROUTER_ATTEMPTS,
     ROUTER_BUDGET,
@@ -218,7 +219,12 @@ def route(question: str, tried: list = None, llm=None, chat_history: list = None
     llm：可注入（测试用假模型）。默认按配置取。
     """
     tried = list(tried or [])
-    workers_block = "\n".join(f"- {n}：{d}" for n, d in WORKER_DESCRIPTIONS.items())
+    # 演示模式下连提示词里都不列数据分析：让模型去选一个已经关掉的单元，
+    # 只会多一次解析失败/一次白跑。规则层和最终计划下面还会再过滤一遍——
+    # 提示词是建议，不是保证。
+    workers_block = "\n".join(
+        f"- {n}：{d}" for n, d in WORKER_DESCRIPTIONS.items() if demo.worker_allowed(n)
+    )
     prompt = ROUTER_PROMPT.format(
         workers=workers_block, context=_context_block(chat_history), question=question
     )
@@ -272,8 +278,20 @@ def route(question: str, tried: list = None, llm=None, chat_history: list = None
                     plan.append(name)
             reason = f"{reason}（置信度 {confidence:.2f} 偏低，补一个 knowledge 兜底）"
 
+    # 演示模式：把禁用的 worker 从计划里摘掉（LLM 和规则两条路都可能选到它）。
+    raw_plan = list(plan)
+    plan = demo.filter_workers(plan)
+    if plan != raw_plan:
+        reason = f"{reason}（演示环境只读：已停用数据分析）"
+
     # 排除已试过的，防止回环原地打转
     plan = [n for n in plan if n not in tried]
+
+    # 摘掉之后计划可能空了（例如用户只问了销售数据）。这时退回知识库：
+    # 它答不上来会走 insufficient，比直接甩一句"转人工"好，也不会执行代码。
+    if demo.enabled() and not plan and "knowledge" not in tried:
+        plan = _cold_plan()
+        reason = f"{reason}（原计划在演示模式下不可用，改走知识库）"
 
     logger.info("路由：%s → %s（%s，置信度 %.2f）", question[:40], plan, source, confidence)
     return {
