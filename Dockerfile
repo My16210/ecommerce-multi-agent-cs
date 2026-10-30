@@ -12,7 +12,7 @@
 #
 # 三个必须说清的决定，都写在对应位置旁边：
 #   1. 为什么这次**用** --frozen（uv.lock 是怎么来的）
-#   2. 为什么四个 extra 全装
+#   2. 为什么五个 extra 全装
 #   3. 为什么密钥在这个文件里一次都不出现
 # ============================================================================
 
@@ -63,7 +63,7 @@ COPY pyproject.toml uv.lock .python-version* ./
 # --no-dev      排除 [dependency-groups] 的 dev（pytest/ruff），运行时用不到
 # --no-install-… 本项目故意没有 [build-system]（是应用不是库），装不了自己
 #
-# **四个 extra 全装是刻意的**：项目的核心契约之一是「换后端只改配置」
+# **五个 extra 全装是刻意的**：项目的核心契约之一是「换后端只改配置」
 # （knowledge 的向量库、订单库、联网搜索都如此）。镜像里若只有默认那一套，
 # 那条契约在容器里就变成半真半假——你在 .env 里写了 VECTOR_BACKEND=milvus，
 # 容器一起来报的却是"请先装 pymilvus"。代价是镜像大一点，换来确定性。
@@ -72,7 +72,7 @@ COPY pyproject.toml uv.lock .python-version* ./
 # 数据分析是三个核心能力之一，镜像装的是内核，所以它一定在。
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project --no-dev \
-            --extra ui --extra api --extra milvus --extra mysql --extra search
+            --extra ui --extra api --extra milvus --extra mysql --extra search --extra mcp
 
 # ---------------------------------------------------------------------------
 # 阶段二：运行时

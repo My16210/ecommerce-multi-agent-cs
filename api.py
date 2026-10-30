@@ -68,10 +68,12 @@ request_id，出问题时拿这个 id 去 `logs/` 里对——错误体的用途
 import json
 import secrets
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -83,6 +85,7 @@ from ecom.orchestrator.settings import API_KEY, MAX_QUESTION_CHARS, MAX_ROUNDS
 from ecom.orchestrator.utils import trace
 from ecom.orchestrator.utils.logger import setup_logger
 from ecom.orchestrator.workers.base import worker_names
+from ecom.settings import ROOT
 
 logger = setup_logger(__name__)
 
@@ -572,6 +575,35 @@ def _read_traces(limit: int) -> list:
         except json.JSONDecodeError:
             continue  # 正在写的那一行可能是半行，跳过就好，不是故障
     return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# React 前端（可选）：构建好了就挂到 /ui
+#
+# 【为什么是"有就挂、没有就跳过"，而不是构建失败就拒绝启动】
+# 这个仓库的第一入口始终是 `main.py`，API 和界面都是可选层。前端没构建
+# （干净的 clone、只装了核心依赖的环境）不该让整个 API 起不来——那会把
+# "可选"变成"必需"。反过来，dist 存在却不挂，则是"明明构建了却打不开"，
+# 所以检查放在启动时，并且**只在没有的时候打一条 info**，不吵。
+#
+# 【为什么挂在 /ui 而不是根路径】
+# `/docs`、`/health`、`/chat` 都在根路径上，根路径留给接口。前端是同一份
+# 服务的**第二个视图**，不是它的替代品。vite.config.ts 的 `base` 必须和
+# 这里一致（`/ui/`），否则页面能打开但资源 404。
+# ═══════════════════════════════════════════════════════════════════════════
+FRONTEND_DIST = Path(ROOT) / "frontend" / "dist"
+
+
+def mount_frontend(target_app: FastAPI, dist: Path = FRONTEND_DIST) -> bool:
+    """把构建好的静态站点挂到 `/ui`。返回是否挂上。"""
+    if not (Path(dist) / "index.html").is_file():
+        return False
+    target_app.mount("/ui", StaticFiles(directory=str(dist), html=True), name="ui")
+    return True
+
+
+if not mount_frontend(app):
+    logger.info("frontend/dist 不存在：/ui 暂不提供 React 界面（cd frontend && npm run build）")
 
 
 if __name__ == "__main__":

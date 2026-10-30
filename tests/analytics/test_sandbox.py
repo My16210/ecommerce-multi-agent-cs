@@ -54,6 +54,14 @@ def df():
         "from pandas import read_csv",
         "savefig = plt.savefig\nsavefig('leak.png')",
         "result = pd.io.common.get_handle('x')",
+        # savefig 的接收者是免检区的旧漏洞：`(open(...) and plt).savefig(...)`
+        # 能借这个位置调用任意函数，而实参检查只看到 CHART_PATH。
+        "(plt.plot.__globals__['__builtins__']['open']('leak.txt', 'w') and plt).savefig(CHART_PATH)",
+        # match / except 的绑定名是字符串字段，不是 Name 节点，visit_Name 看不到。
+        "match 'leak.png':\n    case CHART_PATH:\n        plt.savefig(CHART_PATH)",
+        "def f(*CHART_PATH):\n    result = 1",
+        "def f(**CHART_PATH):\n    result = 1",
+        "result = np.lib.format.open_memmap('leak.npy', mode='w+', dtype='float32', shape=(1,))",
         "from . import something",
     ],
 )

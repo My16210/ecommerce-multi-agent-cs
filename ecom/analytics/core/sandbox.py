@@ -62,11 +62,17 @@ _WRITE_ATTRS = {
     "save", "savez", "savez_compressed", "savetxt", "imsave",
     "savefig", "print_png", "print_svg", "print_pdf", "print_ps",
     "print_figure",
+    # 直接以构造函数打开文件的写入器（绕过 to_* / save* 的名字）：
+    #   pd.ExcelWriter(path)          打开 xlsx 写句柄
+    #   matplotlib PdfPages(path)     打开 pdf 写句柄
+    #   np.lib.format.open_memmap(path, mode="w+") 打开 .npy 写句柄
+    "ExcelWriter", "PdfPages", "open_memmap",
 }
 # 读取：按名字逐个列（前缀 read_ 在下面单独判）。
 _READ_ATTRS = {
     "load", "loadtxt", "genfromtxt", "fromfile", "fromregex", "memmap",
     "imread", "ExcelFile", "HDFStore", "get_handle", "urlopen", "open",
+    "TextFileReader",
 }
 _BANNED_ATTRS = _WRITE_ATTRS | _READ_ATTRS
 
@@ -122,6 +128,10 @@ class _Validator(ast.NodeVisitor):
         func = node.func
         if isinstance(func, ast.Attribute) and func.attr == "savefig":
             self._check_savefig_target(node)
+            # 只放过 func 本身（savefig 在 _BANNED_ATTRS 里），接收者必须
+            # 照常校验：`(open(...) and plt).savefig(CHART_PATH)` 能借这个
+            # 位置塞进任意调用，跳过它等于把整段表达式变成免检区。
+            self.visit(func.value)
             for arg in node.args:
                 self.visit(arg)
             for keyword in node.keywords:
@@ -141,6 +151,29 @@ class _Validator(ast.NodeVisitor):
         self._check_params(node.args)
         self.generic_visit(node)
 
+    # 下面几种绑定名的 AST 字段是**字符串**，不是 Name 节点，visit_Name 看不到。
+    # `case CHART_PATH:` 能把 subject 绑到这个受保护名字上，随后
+    # `savefig(CHART_PATH)` 的实参检查看到的仍是一个名字，等于绕开路径限制。
+    def visit_MatchAs(self, node: ast.MatchAs) -> None:
+        if node.name in _PROTECTED_NAMES:
+            raise CodeSecurityError(f"禁止在 match 里绑定 {node.name}")
+        self.generic_visit(node)
+
+    def visit_MatchStar(self, node: ast.MatchStar) -> None:
+        if node.name in _PROTECTED_NAMES:
+            raise CodeSecurityError(f"禁止在 match 里绑定 {node.name}")
+        self.generic_visit(node)
+
+    def visit_MatchMapping(self, node: ast.MatchMapping) -> None:
+        if node.rest in _PROTECTED_NAMES:
+            raise CodeSecurityError(f"禁止在 match 里绑定 {node.rest}")
+        self.generic_visit(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name in _PROTECTED_NAMES:
+            raise CodeSecurityError(f"禁止把异常绑定为 {node.name}")
+        self.generic_visit(node)
+
     @staticmethod
     def _check_savefig_target(node: ast.Call) -> None:
         target = node.args[0] if node.args else None
@@ -158,7 +191,13 @@ class _Validator(ast.NodeVisitor):
     def _check_params(args: ast.arguments) -> None:
         # 参数叫 CHART_PATH 会遮住全局那个：savefig(CHART_PATH) 于是变成了
         # "写调用方给的任意路径"，而实参检查看到的仍然是一个名字。
-        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+        # *args / **kwargs 的名字同样是字符串，不能漏。
+        params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+        if args.vararg:
+            params.append(args.vararg)
+        if args.kwarg:
+            params.append(args.kwarg)
+        for arg in params:
             if arg.arg in _PROTECTED_NAMES:
                 raise CodeSecurityError(f"禁止把参数命名为 {arg.arg}")
 

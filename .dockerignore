@@ -64,6 +64,10 @@ volumes/
 # tests/ 也挡掉：镜像里那份源码是为了"能跑"，不是为了"能改"。
 tests/
 
+# React 前端的依赖目录：平台相关、几十 MB，而且只在构建时需要。
+# `frontend/dist/` **不挡**——它在宿主上构建好之后会进镜像，api.py 会挂到 /ui。
+frontend/node_modules/
+
 # ——— 别挡住这几类 ———
 #   data/knowledge/documents/    语料本体（含「电商客服示例」）
 #   data/knowledge/*.jsonl       评测集 / 金标准：镜像里带着，`answer_eval` 才跑得起来

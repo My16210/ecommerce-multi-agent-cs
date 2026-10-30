@@ -14,7 +14,7 @@
 
 **它不是**：一个把提示词写得花哨的单体 chatbot，也不是三个 bot 互相聊天的"群体智能"。它是一个**调度 + 隔离 + 汇总**的工程结构，每一层为什么这么切、哪些地方现在不该做，下面都写清楚了。
 
-> 四份文档，按顺序读：
+> 文档按场景读：
 >
 > 1. **[docs/项目说明.md](docs/项目说明.md)** —— 给评审看的导读，不假设你读过代码。
 >    "它是什么 / 为什么这么做 / 做到什么程度"。
@@ -25,6 +25,11 @@
 >    按"出事顺序"排，每条写清现在什么样、会怎么出事、要补什么，最后有一节**明确不做**。
 > 5. **[docs/DEMO.md](docs/DEMO.md)** / **[docs/RUNBOOK.md](docs/RUNBOOK.md)** ——
 >    公网只读演示（L1）能做什么、不能做什么，以及部署/换邀请码/查预算/排障的步骤。
+> 6. **[docs/项目拆解.md](docs/项目拆解.md)** —— **要接手或要讲清楚这个项目的人读的**。
+>    按"一次请求怎么走"纵向拆开：四条主链路、每个模块的契约与失败模式、配置矩阵、
+>    测试地图、排障症状表、扩展点的改动半径、部署形态、六个真实故障故事。
+> 7. **[docs/面试准备.md](docs/面试准备.md)** —— 问答形态的版本：30 秒/2 分钟自述、
+>    基础题、深挖题、压力题、数字卡片和白板模板，每题都能落到代码或测试上。
 
 ---
 
@@ -83,7 +88,8 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 │   │   └── memory.py            蒸馏 / 召回（要联网，所以不塞进 session.py）
 │   ├── knowledge/               知识库：retriever / vector_store / embedding / generator /
 │   │                            document_loader / review / web_search / cli（10 个脚本）
-│   └── analytics/               数据分析：agents / core（graph + sandbox）/ utils / cli
+│   ├── analytics/               数据分析：agents / core（graph + sandbox）/ utils / cli
+│   └── mcp/                     MCP 工具服务：tools.py（纯函数契约）/ server.py（stdio 接线）
 │
 ├── data/                        三个子系统的数据按目录分开
 │   ├── knowledge/               documents/（「法规原文」10 篇 + 「电商客服示例」7 篇）、
@@ -97,12 +103,16 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 │   └── orders.sqlite            订单库运行时文件（不进仓库，由 seed 重建）
 │                                会话库在 data/orchestrator/sessions.db（同样不进仓库）
 ├── logs/                        日志 + requests.jsonl（trace）
+├── frontend/                    React + Vite + TypeScript（可选界面）
+│                                `npm run build` 后由 api.py 挂到 /ui
 ├── docs/                        项目说明.md（导读）｜技术文档.md（**要改代码的人读的**）
 │                                上线清单.md（**要真上线还差什么**，含"明确不做"）
-└── tests/                       orchestrator/ knowledge/ analytics/ + 几个跨系统的不变量测试
+│                                MCP.md（工具清单、契约、安全边界）
+│                                项目拆解.md（纵向拆解）｜面试准备.md（问答版）
+└── tests/                       orchestrator/ knowledge/ analytics/ mcp/ + 跨系统的不变量测试
 ```
 
-**四个入口，各自的定位**（详见 [技术文档 §11](docs/技术文档.md)）：
+**四个入口 + 一条 MCP 出口，各自的定位**（详见 [技术文档 §11](docs/技术文档.md)）：
 
 | 入口 | 给谁 | 读/写 |
 |---|---|---|
@@ -110,6 +120,7 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 | `app.py` → 8501 | 演示 | 只读 |
 | `admin.py` → 8502 | **下结论**（退货审核） | **三个页面里只有一个能写** |
 | `api.py` → 8000 | 被别的程序调 | 读为主 |
+| `python -m ecom.mcp.server` → stdio | **别的 Agent**（MCP 客户端） | 默认只读；写操作两把钥匙 |
 
 ### 为什么是一个 `ecom` 而不是三个平级顶层包
 
@@ -124,7 +135,7 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 ```bash
 git clone <本仓库> ecom_cs && cd ecom_cs
 cp .env.example .env      # 填 QWEN_API_KEY（路由 + 生成）与 SILICONFLOW_API_KEY（向量化 + rerank）
-uv sync                   # 界面：--extra ui ｜ HTTP：--extra api ｜ Milvus：--extra milvus
+uv sync                   # 界面：--extra ui ｜ HTTP：--extra api ｜ MCP：--extra mcp ｜ Milvus：--extra milvus
 uv run python main.py --init-db                                  # 灌 65752 笔订单 + 62897 条物流
 uv run python -m ecom.knowledge.cli.ingest                       # 建向量库
 uv run python main.py "订单 52644 到哪了"
@@ -142,6 +153,7 @@ uv run streamlit run app.py                            # → 8501  客户界面
 uv run streamlit run admin.py                          # → 8502  后台（要 ADMIN_PASSWORD）
 uv run uvicorn api:app --port 8000                     # → 8000  HTTP 接口
 uv run python -m ecom.orchestrator.cli.returns stats   # 命令行版的退货审核
+uv run python -m ecom.mcp.server --list-tools          # MCP 工具列表（要先 --extra mcp）
 ```
 
 > **`admin.py` 不配 `ADMIN_PASSWORD` 会拒绝启动**（`st.error` + `st.stop`）——这是
@@ -375,6 +387,16 @@ $ uv run python main.py "订单 52644 到哪了，顺便问下你们的退货政
 
 [ecom/orchestrator/db/](ecom/orchestrator/db/) 是一个薄薄的双后端适配，SQL 全部用 `?` 占位符写，MySQL 后端在 `engine._translate` 里统一换成 `%s`。默认 SQLite 的理由不是"SQLite 更好"，而是**默认路径必须零外部依赖**，否则"别人拿到能跑"就是空话；但代码不能被 SQLite 惯坏，所以 DDL 用两边都吃的写法（`VARCHAR` 做主键而不是 `TEXT`，不用 `AUTOINCREMENT`）。
 
+### MCP：给别的 Agent 的出口
+
+[ecom/mcp/](ecom/mcp/) 把查订单、查退货、检索知识库这三个能力按 MCP 协议暴露出去，**只走 stdio**。它和对话链路是两条平行的路，共用同一批业务函数：
+
+- **不跑 Supervisor**：调用方已经知道要查订单 52644，不该再花一次模型调用做意图识别；
+- **不重复实现规则**：两边都调 `tools/order_tools.py` 和知识库检索，状态能不能退只有一份判断；
+- **默认只读**：`list_customer_orders`（按客户号查 PII）和 `create_return`（写库）默认**不注册**，要开得设 `MCP_ENABLE_PII=1` / `MCP_ENABLE_WRITES=1`；写操作即使开了也要调用方传 `confirm=true`，演示模式下无论如何都拒绝。
+
+工具清单、返回契约、错误码、客户端配置和安全边界见 [docs/MCP.md](docs/MCP.md)。
+
 ### 数据：换成真实数据之后，三件必须解释的事
 
 三个子系统的数据原来都是手写的（分析侧一份 20 行的 `sales.csv`、订单库 20 条常量、评测题的"真值"直接写在代码里）。手写数据的好处是看得懂，坏处是**它只证明了代码能处理我编出来的那种数据**——真实数据长什么样（订单号几位、状态有几种、哪几列根本不存在），手写数据一个都答不上来。
@@ -569,6 +591,26 @@ uv run streamlit run app.py
 
 主题（浅色 / 深色两套）在仓库根的 `.streamlit/config.toml` 里，两个入口共用一份。**右上角「⋮」→ Settings → Theme** 可以直接切 Light / Dark / System —— 不需要任何额外控件，这是 Streamlit 自己的设置菜单。`.streamlit/` 既不在 `.gitignore` 也不在 `.dockerignore`，而镜像是 `COPY . /app`，所以宿主和容器里用的是**同一个文件**。
 
+### React 前端（可选）
+
+`frontend/` 是第二个浏览器界面：**一个干净的流式对话页**，显示路由结果、来源、
+token 用量和健康状态。它不重复 Streamlit 版的图片输入、订单视图和数据分析看板
+——那些留在 `app.py`；这一版只把「提问 → 流式回答」这条主线做利落。
+
+```bash
+# 开发：Vite 5173 代理到 8000（不给 FastAPI 开 CORS）
+cd frontend && npm install && npm run dev     # → http://localhost:5173/ui/
+
+# 生产：构建后由 api.py 挂到 /ui（dist 不存在就跳过，不阻止 API 启动）
+npm run build
+uv run uvicorn api:app --port 8000            # → http://127.0.0.1:8000/ui/
+```
+
+`vite.config.ts` 的 `base: "/ui/"` 必须和 `mount_frontend()` 的挂载路径一致——
+不一致的症状是页面能打开但白屏。会话号和 API Key 只放 `sessionStorage`，不进
+URL；回答按纯文本渲染，不走 `innerHTML`。细节和限制见
+[frontend/README.md](frontend/README.md)。
+
 **但 CLI 才是第一入口，这个顺序不能反**：界面会把"哪一层慢、哪一层挂了"藏起来——超时变成一个转圈动画、异常变成一个红色弹框。调试期用 `main.py -v`，演示时才上界面。
 
 ---
@@ -738,7 +780,7 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 ## 测试
 
 ```bash
-uv run pytest        # 651 条（宿主 .venv 实测：649 passed / 2 skipped；条数以当次输出为准）
+uv run pytest        # 717 条（宿主 .venv 实测：715 passed / 2 skipped；条数以当次输出为准）
 uv run ruff check .
 ```
 
@@ -807,7 +849,7 @@ uv run ruff check .
 | ✅ | **真实 Streamlit 运行时** | 真跑：`streamlit.testing.v1.AppTest` 把两个入口跑完，6 条全绿。**这补上了原来那一栏 ❌** |
 | ✅ | **合并后的 `API`（FastAPI）真起服务** | 容器内真起 uvicorn：`/health` 200（含 workers + order_db）、`/openapi.json` 元数据齐、空问题 422、`/trace/不存在` 404、真提问 200（257+29 token / 1.2s）。**这一条走了网络、花了 token**，不属于"测试不联网"那一栏 |
 | ✅ | **Milvus 那条代码路径** | 真跑：连宿主常驻的 v2.5.5，`ecom_verify_<随机>` 临时集合走完 add / count / search / delete / drop，**零残留**（另有一条专门查残留）。⚠️ 见下面的版本错位 |
-| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条**，现在宿主 `.venv` 上是 **651 条 / 649 passed / 2 skipped**，`ruff` 干净（图片输入、流式和 L1 这批还没跑过 CI） |
+| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 10 条**，现在宿主 `.venv` 上是 **717 条 / 715 passed / 2 skipped**，`ruff` 干净（图片输入、流式、L1、沙箱、MCP 和 React 这批还没跑过 CI） |
 | ✅ | **L1 只读 / 邀请码 / 预算闸门** | 真跑：32 条测试覆盖 fail closed 的邀请码、每客户端限流、跨重连的 token 账本、损坏账本拒绝花钱、路由不选 analytics、退货在落库前被挡、API 429 与 trace 404、界面门禁与建议语。**只验证了代码层**；下面那栏是部署文件 |
 | ✅ | **公网演示编排能解析** | 真跑：`docker compose --env-file .env.prod -f docker-compose.prod.yml config --quiet` 退出 0（临时 `.env.prod` 校验后已删）；Caddyfile 用 `caddy:2.10-alpine caddy validate` 通过（健康检查那条 `context canceled` 是校验时没有 app 容器，属预期）。**没有真部署**：没有域名和公网服务器，HTTPS 证书签发、Caddy→app 转发、公网可达都**没验过** |
 | ✅ | **CI 本身真跑绿了** | 真跑：[run #38132662970](https://github.com/My16210/ecommerce-multi-agent-cs/actions/runs/38132662970)（2026-10-11）——`ruff: All checks passed!`，`pytest: 517 passed, 3 skipped, 15.06s`，和本机干净 checkout 预演的数字一致。**这一栏原来是 ❌**：工作流写过、命令本地验过，但没推上去就一次都没真跑过。<br>真跑还多抓到两处**本地永远看不出来**的东西：① `python-version-file` 这个输入名**不存在**，setup-uv 只打一条 warning 就忽略它，workflow 照样绿、看着像钉住了版本；② `astral-sh/setup-uv` **没有 `v10` 这个大版本 tag**（它的可移动大版本 tag 只发到 v7），钉 `@v10` 会让 job 在 "Set up job" 阶段就红，得钉精确的 `@v10.3.0`。两处都改成实测过的写法 |
