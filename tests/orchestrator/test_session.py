@@ -319,3 +319,26 @@ def test_concurrent_writes_do_not_lose_messages(store):
         t.join()
 
     assert len(store.history(sid, max_turns=1000)) == 40
+
+
+def test_session_ownership_is_exclusive(store):
+    """先认领者赢；另一个 principal 拿同一个 session_id 必须被拒。"""
+    sid = store.ensure_session("", owner_id="principal-a")
+    assert store.get_session(sid)["owner_id"] == "principal-a"
+
+    with pytest.raises(store.SessionAccessError):
+        store.ensure_session(sid, owner_id="principal-b")
+
+    # 同一个 principal 再来一次（比如下一轮）必须正常
+    assert store.ensure_session(sid, owner_id="principal-a") == sid
+
+
+def test_legacy_session_can_be_claimed_once(store):
+    """老库里 owner_id='' 的会话：第一个 principal 可以认领，之后锁死。"""
+    sid = store.ensure_session("legacy")
+    assert store.get_session(sid)["owner_id"] == ""
+
+    assert store.ensure_session(sid, owner_id="principal-a") == sid
+    assert store.get_session(sid)["owner_id"] == "principal-a"
+    with pytest.raises(store.SessionAccessError):
+        store.ensure_session(sid, owner_id="principal-b")

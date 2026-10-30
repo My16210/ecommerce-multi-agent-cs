@@ -201,10 +201,19 @@ def ensure_session(session_id: str, owner_id: str = "") -> str:
             if current and current != owner:
                 raise SessionAccessError(f"会话 {sid} 不属于当前 principal")
             if not current:
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE sessions SET owner_id = ? WHERE session_id = ? AND owner_id = ''",
                     (owner, sid),
                 )
+                # 进程内的锁挡不住另一个进程（CLI / 多 worker）同时认领：
+                # 两个 principal 都读到 ''，先写的那条赢，后手 update 命中 0 行。
+                # 这时必须再读一次确认，否则后手会以为自己认领成功。
+                if cursor.rowcount == 0:
+                    latest = conn.execute(
+                        "SELECT owner_id FROM sessions WHERE session_id = ?", (sid,)
+                    ).fetchone()
+                    if ((latest["owner_id"] if latest else "") or "") != owner:
+                        raise SessionAccessError(f"会话 {sid} 不属于当前 principal")
         conn.commit()
     return sid
 
