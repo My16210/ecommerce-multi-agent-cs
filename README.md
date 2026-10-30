@@ -23,6 +23,8 @@
 >    为什么是这个形状、改它会连带动什么，**每处配真实代码片段**。
 > 4. **[docs/上线清单.md](docs/上线清单.md)** —— 换个轴问问题：**这套东西要真上线还差什么**。
 >    按"出事顺序"排，每条写清现在什么样、会怎么出事、要补什么，最后有一节**明确不做**。
+> 5. **[docs/DEMO.md](docs/DEMO.md)** / **[docs/RUNBOOK.md](docs/RUNBOOK.md)** ——
+>    公网只读演示（L1）能做什么、不能做什么，以及部署/换邀请码/查预算/排障的步骤。
 
 ---
 
@@ -126,6 +128,7 @@ uv sync                   # 界面：--extra ui ｜ HTTP：--extra api ｜ Milvu
 uv run python main.py --init-db                                  # 灌 65752 笔订单 + 62897 条物流
 uv run python -m ecom.knowledge.cli.ingest                       # 建向量库
 uv run python main.py "订单 52644 到哪了"
+uv run python main.py "订单 52644 到哪了" --stream       # 边生成边打印（只有汇总那步是真流）
 ```
 
 **不再需要另外两个仓库**——`.env` 里那三个 `RAG_KB_ROOT` / `SALES_AGENT_ROOT` / `SALES_AGENT_PYTHON` 已经删掉了，它们的存在本身就是"没合干净"的标记。
@@ -181,6 +184,33 @@ docker compose run --rm app python -m ecom.knowledge.cli.ingest        # 建向�
 - **`admin` 服务发布的是 `127.0.0.1:${ADMIN_PORT:-8502}:8502`，不是 `8502:8502`**。这是口令之外的**第二层**，两层挡的不是同一件事：口令挡"能连到这个端口的人"，绑定挡"根本连不到这个端口的人"（同局域网的另一台机器、宿主上任何程序）。**两层都要有。** 副作用如实说：这也意味着它不能被反向代理从外面转发——真上线时该把那层代理自己接过来，而不是把这一行改回 `0.0.0.0`。另外它的 healthcheck **必须自己覆盖**：镜像里那份探的是写死的 8501，不覆盖的话 admin 容器会**永远报不健康**，而服务其实是好的。
 
 ⚠️ 两个如实说明：镜像**构建过也跑过**（见「验证到哪一步」），但**界面本身没在浏览器里打开过**（真 Streamlit 运行时跑过，见下）；另外 `docker compose config` 会把 `env_file` 解析并**打印出来**，所以别把它重定向进文件再拿去贴。
+
+### 公网只读演示（L1，可选）
+
+`docker-compose.yml` 是**本机开发**用的：没有鉴权、能跑数据分析、后台也起得来。
+要**挂到公网上给别人点开看**，用的是另一套编排：
+
+```bash
+cp .env.prod.example .env.prod      # 填 DOMAIN / DEMO_INVITE_CODE / 两个模型 Key
+chmod 600 .env.prod
+docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+```
+
+它和开发编排的差别不是"换个端口"，是**三条防线同时打开**：
+
+- **只读**：退货申请在落库前被挡住（API / CLI 走同一道闸，不是藏按钮）；
+  数据分析整条路停用（它会在服务器上执行模型生成的代码）；后台管理端不部署。
+- **邀请码**：进界面 / 调 API 都要口令。**没配就拒绝所有人**（fail closed），
+  不是"没配就放行"。
+- **成本**：每分钟限流挡突发，每日 token 预算落盘记账（重启也算数）兜成本；
+  用完当天就停服务。
+
+外加 Caddy 自动签 HTTPS、app 不发布宿主端口、容器限内存/CPU。能做什么、
+不能做什么、为什么关掉那些能力写在 [docs/DEMO.md](docs/DEMO.md)；
+部署、换邀请码、查用量、排障、备份回滚写在 [docs/RUNBOOK.md](docs/RUNBOOK.md)。
+
+**这一层没有身份、审计、监控告警、多副本**，别把它当"上线完成"——
+缺口清单见 [上线清单.md](docs/上线清单.md) 第六节。
 
 ---
 
@@ -335,7 +365,7 @@ $ uv run python main.py "订单 52644 到哪了，顺便问下你们的退货政
 
 **但边界留着，而且是故意的：**
 
-1. **它执行模型生成的代码。** 这是本系统里唯一一处"别人的文本变成我们机器上跑起来的程序"。沙箱在 [ecom/analytics/core/sandbox.py](ecom/analytics/core/sandbox.py)（AST 白名单 + 受限 builtins），但沙箱**不做超时、也不做进程隔离**——`while True: pass` 拦不住。真进程边界是补上这一层的唯一办法：`subprocess.run(timeout=…)` 到点是**真杀**，而进程内那个"超时"只是不再等它。
+1. **它执行模型生成的代码。** 这是本系统里唯一一处"别人的文本变成我们机器上跑起来的程序"。沙箱在 [ecom/analytics/core/sandbox.py](ecom/analytics/core/sandbox.py)（AST 白名单 + 受限 builtins），但沙箱**不做超时、也不做进程隔离**——`while True: pass` 拦不住；文件 I/O 也只靠一层黑名单（`read_*` / `savefig` 等入口被禁），不是隔离。真进程边界是补上这一层的唯一办法：`subprocess.run(timeout=…)` 到点是**真杀**，而进程内那个"超时"只是不再等它。
 2. **它可能跑几分钟。** 生成 → 执行 → 报错 → 改 → 再执行，循环几轮。进程内跑意味着这几分钟里 supervisor 那条线程被占着、还占着内存。
 3. 顺带，崩了炸不到 supervisor。
 
@@ -531,9 +561,11 @@ uv sync --extra ui
 uv run streamlit run app.py
 ```
 
-**主区只有对话**，另外三块收在侧边栏的「直连视图」里 —— 之所以是这个形状，是因为这四个东西里只有一个是"来回说话"：**对话**（答复 + 决策链，就是 `main.py -v` 那份内容的可视化）、**订单**（订单详情 + 物流 + 退货申请）、**数据看板**（报告 + 生成的图）、**知识库**（答复 + 引用到的段落，逐 token 流出来）。把它们并排成四个 Tab，等于说这四件事是同一层级的；收起来之后，页面本身就在说"提问是主线，另外三个是随时可以拐进去看一眼的地方"。
+**主区只有对话**，另外三块收在侧边栏的「直连视图」里 —— 之所以是这个形状，是因为这四个东西里只有一个是"来回说话"：**对话**（答复 + 决策链，就是 `main.py -v` 那份内容的可视化；汇总那一步逐 token 流出来）、**订单**（订单详情 + 物流 + 退货申请）、**数据看板**（报告 + 生成的图）、**知识库**（答复 + 引用到的段落，逐 token 流出来）。对话只有"多个结论要汇总"时是真流；只有一个结论时整段到达——不把已完成的字符串切块假装在流。把它们并排成四个 Tab，等于说这四件事是同一层级的；收起来之后，页面本身就在说"提问是主线，另外三个是随时可以拐进去看一眼的地方"。
 
 四个视图仍然是**一件事的四个面**，共用一份进程、一份配置：点进订单视图看到的就是提示词里那个 `query_order`，不是另一个项目。换个视图只是换一个渲染函数，**不重启、不换进程**。
+
+**对话视图还支持上传一张图**（购物截图 / 售后凭证 / 发票 / 快递面单）。图片不会直接喂给主链路：先经 `image_understander` 提取订单号 / 金额 / 商品 / 诉求，拼成一段带标记的文本，再走原来的 `answer()`。识别失败或图里没有订单号只会降级成"请手动输入"，不会崩。边界写死：**图片里的订单号只能查，不能用来提交退货**——退货必须在当前消息里手动输入订单号。配置和失败路径见 [技术文档 §11](docs/技术文档.md#十一多模态图片输入)。
 
 主题（浅色 / 深色两套）在仓库根的 `.streamlit/config.toml` 里，两个入口共用一份。**右上角「⋮」→ Settings → Theme** 可以直接切 Light / Dark / System —— 不需要任何额外控件，这是 Streamlit 自己的设置菜单。`.streamlit/` 既不在 `.gitignore` 也不在 `.dockerignore`，而镜像是 `COPY . /app`，所以宿主和容器里用的是**同一个文件**。
 
@@ -697,6 +729,7 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 - **日志**（`logs/<date>.log`）：给人扫的。
 - **trace**（`logs/requests.jsonl`）：一行一条请求，机器可读。记录的是**事实**（路由来源、每个 worker 的 ok / 耗时 / token、最终决策），不是结论——"这次成功了吗"由查询方判断，口径变一次不用重跑历史数据。
 - **`GET /trace`**：把最近若干条请求的决策链摊出来。这是给别人看"系统怎么想的"那扇窗。
+- **`POST /chat/stream`**：同一次问答的 SSE 版本，事件 `start` / `delta` / `final` / `error`。**`final.answer` 是权威版本**：汇总流到一半失败会退回拼接，前面的 delta 可能和它不一致。见 [技术文档 §12](docs/技术文档.md#十二流式输出)。
 
 `main.py -v` 就是 trace 的人类可读版。
 
@@ -705,16 +738,15 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 ## 测试
 
 ```bash
-uv run pytest        # 555 条（宿主 .venv 实测：553 passed / 2 skipped）
+uv run pytest        # 651 条（宿主 .venv 实测：649 passed / 2 skipped；条数以当次输出为准）
 uv run ruff check .
 ```
 
-（**这个数要在装了全部 extra 的环境里跑**才算得准。宿主上少几个包时是 505 条 /
-499 passed / **2 failed** / 4 skipped——少掉的那 15 条挂在 `importorskip` 上，
-剩下的 2 条红是**宿主没装 matplotlib** 造成的，见下面。）
+（**这个数要在装了全部 extra 的环境里跑**才算得准。宿主上少几个包时总数会小一截，
+少掉的那批挂在 `importorskip` 上；没装 matplotlib 时还会多两条红，见下面。）
 
-`CI`（[.github/workflows/tests.yml](.github/workflows/tests.yml)）上是 **517 passed / 3 skipped**，
-比容器里少一条：干净 checkout 上没有 `data/orders.sqlite` 和向量库，界面真渲染那条会 skip。
+`CI`（[.github/workflows/tests.yml](.github/workflows/tests.yml)）上的数字会随测试增减（以当次 run 为准）。
+它和本机通常差一条 skip：干净 checkout 上没有 `data/orders.sqlite` 和向量库，界面真渲染那条会 skip。
 
 **一条测试都不联网。** 不是图快——真调模型意味着测试结果随模型版本、网络、当天负载浮动，那样的测试没法规格回归，它昨天红今天绿，你只会学会忽略它。所有模型调用都用 `FakeLLM` / `ExplodingLLM` 顶掉。
 
@@ -775,7 +807,9 @@ uv run ruff check .
 | ✅ | **真实 Streamlit 运行时** | 真跑：`streamlit.testing.v1.AppTest` 把两个入口跑完，6 条全绿。**这补上了原来那一栏 ❌** |
 | ✅ | **合并后的 `API`（FastAPI）真起服务** | 容器内真起 uvicorn：`/health` 200（含 workers + order_db）、`/openapi.json` 元数据齐、空问题 422、`/trace/不存在` 404、真提问 200（257+29 token / 1.2s）。**这一条走了网络、花了 token**，不属于"测试不联网"那一栏 |
 | ✅ | **Milvus 那条代码路径** | 真跑：连宿主常驻的 v2.5.5，`ecom_verify_<随机>` 临时集合走完 add / count / search / delete / drop，**零残留**（另有一条专门查残留）。⚠️ 见下面的版本错位 |
-| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条**，现在宿主 `.venv` 上是 **555 条 / 553 passed / 2 skipped**，`ruff` 干净 |
+| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条**，现在宿主 `.venv` 上是 **651 条 / 649 passed / 2 skipped**，`ruff` 干净（图片输入、流式和 L1 这批还没跑过 CI） |
+| ✅ | **L1 只读 / 邀请码 / 预算闸门** | 真跑：32 条测试覆盖 fail closed 的邀请码、每客户端限流、跨重连的 token 账本、损坏账本拒绝花钱、路由不选 analytics、退货在落库前被挡、API 429 与 trace 404、界面门禁与建议语。**只验证了代码层**；下面那栏是部署文件 |
+| ✅ | **公网演示编排能解析** | 真跑：`docker compose --env-file .env.prod -f docker-compose.prod.yml config --quiet` 退出 0（临时 `.env.prod` 校验后已删）；Caddyfile 用 `caddy:2.10-alpine caddy validate` 通过（健康检查那条 `context canceled` 是校验时没有 app 容器，属预期）。**没有真部署**：没有域名和公网服务器，HTTPS 证书签发、Caddy→app 转发、公网可达都**没验过** |
 | ✅ | **CI 本身真跑绿了** | 真跑：[run #38132662970](https://github.com/My16210/ecommerce-multi-agent-cs/actions/runs/38132662970)（2026-10-11）——`ruff: All checks passed!`，`pytest: 517 passed, 3 skipped, 15.06s`，和本机干净 checkout 预演的数字一致。**这一栏原来是 ❌**：工作流写过、命令本地验过，但没推上去就一次都没真跑过。<br>真跑还多抓到两处**本地永远看不出来**的东西：① `python-version-file` 这个输入名**不存在**，setup-uv 只打一条 warning 就忽略它，workflow 照样绿、看着像钉住了版本；② `astral-sh/setup-uv` **没有 `v10` 这个大版本 tag**（它的可移动大版本 tag 只发到 v7），钉 `@v10` 会让 job 在 "Set up job" 阶段就红，得钉精确的 `@v10.3.0`。两处都改成实测过的写法 |
 | ✅ | **许可证** | 有了 `LICENSE`（MIT），`pyproject.toml` 里声明了同一个。之前**一个都没有**——公开仓库没有 LICENSE 等于"保留所有权利"，别人不能合法复用 |
 | ✅ | **`uv sync` 能否装成** | 真构建：镜像里解析出 **150 个包**并装成，五个 extra 全在（matplotlib / streamlit / pymilvus / pymysql / tavily-python / fastapi 逐个确认过） |

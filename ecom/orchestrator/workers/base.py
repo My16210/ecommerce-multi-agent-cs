@@ -97,9 +97,10 @@ def _registry() -> dict:
     """
     延迟取注册表。
 
-    必须在**函数里** import 三个 worker：knowledge 会 import sibling 仓库
-    rag_knowledge_base，如果放在模块顶层，那么"这台机器上没有那个仓库"就会在
-    import 本模块时直接炸掉，连不带知识库的部署都起不来。放这里是故意的。
+    **必须在函数里** import 三个 worker：knowledge 那条链会拉起 chromadb /
+    jieba / 向量库客户端，analytics 会拉起 matplotlib。放在模块顶层的话，
+    只想跑订单那一路的部署（或一个还没灌数据的环境）也会被这些重依赖拖住，
+    import supervisor 就失败。延迟到真正要跑某个 worker 时再付这个成本。
     """
     from ecom.orchestrator.workers.analytics import run_analytics
     from ecom.orchestrator.workers.knowledge import run_knowledge
