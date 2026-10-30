@@ -499,3 +499,26 @@ def test_an_image_block_without_a_request_does_not_invent_an_action(wired):
     )
     assert result["insufficient"] is True
     assert "没有明确的订单操作" in result["answer"]
+
+
+# ---------------------------------------------------------------------------
+# 已认证客户：不再猜，也不能看别人的单
+# ---------------------------------------------------------------------------
+def test_authenticated_customer_reads_own_order(wired):
+    owner = query_order(COMPLETE_ORDER, wired)["order"]["customer_id"]
+    result = run_order("订单 52644 到哪了", customer_id=owner)
+    assert "不在当前账户" not in result["answer"]
+    assert result["data"]["action"] == "tracking"
+
+
+def test_foreign_order_is_denied(wired):
+    result = run_order("订单 52644 到哪了", customer_id="C0001")
+    assert "不在当前账户" in result["answer"]
+    assert result["data"]["denied"] == "not_owner"
+
+
+def test_authenticated_customer_list_does_not_guess(wired):
+    owner = query_order(COMPLETE_ORDER, wired)["order"]["customer_id"]
+    result = run_order("我的订单", customer_id=owner)
+    assert result["data"]["customer_id"] == owner
+    assert result["data"]["customer_source"] == "auth"

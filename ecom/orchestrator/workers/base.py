@@ -20,6 +20,7 @@ worker 是"会失败的外部世界"：知识库的 embedding 服务可能挂，
   真要连进程内 worker 都能强杀，得把它们也挪进子进程或进程池——那是另一个取舍，
   当前规模下不值得。这一条别在简历里说成"所有 worker 都能超时中断"。
 """
+import inspect
 import threading
 import time
 from collections.abc import Callable
@@ -117,12 +118,30 @@ def worker_names() -> list:
     return list(_registry())
 
 
+def _invoke(fn: Callable, question: str, chat_history: list, customer_id: str):
+    """
+    按 worker 的签名决定传不传 `customer_id`。
+
+    只有订单 worker 需要它；测试里的替身大多是 `lambda q, h:` 两参数，硬塞第三个
+    参数会把一大批测试打成 TypeError。**用签名判断，而不是 try/except TypeError**
+    ——后者会把 worker 内部真正的 TypeError 也吞掉，变成"少传一个参数"的假故障。
+    """
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return fn(question, chat_history)
+    if "customer_id" in parameters:
+        return fn(question, chat_history, customer_id=customer_id)
+    return fn(question, chat_history)
+
+
 def run(
     name: str,
     question: str,
     chat_history: list = None,
     timeout: int = None,
     fn: Callable = None,
+    customer_id: str = "",
 ) -> dict:
     """
     调用一个 worker，把任何失败（异常/超时/不存在）翻成 ok=False 的结果。
@@ -138,7 +157,7 @@ def run(
 
     def target():
         try:
-            box["result"] = fn(question, chat_history or [])
+            box["result"] = _invoke(fn, question, chat_history or [], customer_id)
         except BaseException as exc:  # noqa: BLE001 —— worker 抛什么都得接住，见模块开头
             box["error"] = exc
 

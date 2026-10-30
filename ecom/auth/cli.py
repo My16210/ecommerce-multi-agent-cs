@@ -33,10 +33,15 @@ def main(argv: list = None) -> int:
     create.add_argument("--name", required=True)
     create.add_argument("--role", default="customer", choices=store.ROLES)
     create.add_argument("--ttl-days", type=float, default=0, help="token 有效期（天），0=不过期")
+    create.add_argument("--customer", default="", help="绑定客户号，如 C20755")
 
     password = sub.add_parser("set-password", help="设置/重置登录密码")
     password.add_argument("identifier")
     password.add_argument("--password", default=None, help="不给就交互输入（不回显）")
+
+    customer = sub.add_parser("set-customer", help="绑定/解绑客户号（空字符串=解绑）")
+    customer.add_argument("identifier")
+    customer.add_argument("customer_id")
 
     rotate = sub.add_parser("rotate", help="轮换 API token，旧 token 和登录会话立即失效")
     rotate.add_argument("identifier")
@@ -55,7 +60,19 @@ def main(argv: list = None) -> int:
     args = parser.parse_args(argv)
 
     if args.cmd == "create":
-        _print_token(store.create_principal(args.name, args.role, expires_days=args.ttl_days))
+        created = store.create_principal(
+            args.name, args.role, expires_days=args.ttl_days, customer_id=args.customer
+        )
+        _print_token(created)
+        return 0
+
+    if args.cmd == "set-customer":
+        try:
+            store.set_customer(args.identifier, args.customer_id)
+        except ValueError as exc:
+            print(exc)
+            return 1
+        print("客户号已更新。")
         return 0
 
     if args.cmd == "set-password":

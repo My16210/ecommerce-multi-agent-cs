@@ -53,6 +53,9 @@ class WorkerResult(TypedDict, total=False):
 class CSState(TypedDict, total=False):
     # ——— 输入 ———
     question: str
+    # 已认证的客户号（来自 principal）。空 = 匿名/本地演示，订单 worker 退回猜。
+    # **这是节点输入，不是图状态**：由调用方塞进来，图自己不写它。
+    customer_id: str
     # [{"role": "user"/"assistant"/"memory", "content": ...}]
     # **这是节点输入，不是图状态**：由调用方塞进来，图自己不累加、不修改它。
     # 读它的有三个地方：router（指代消解，见 core/router.py 开头）、order worker
@@ -94,10 +97,13 @@ class CSState(TypedDict, total=False):
     request_id: str
 
 
-def make_initial_state(question: str, chat_history: list = None, request_id: str = "") -> CSState:
+def make_initial_state(
+    question: str, chat_history: list = None, request_id: str = "", customer_id: str = ""
+) -> CSState:
     """两个入口（CLI / FastAPI）共用，避免抄多份之后漂移。"""
     return {
         "question": question,
+        "customer_id": str(customer_id or "").strip().upper(),
         "chat_history": chat_history or [],
         "plan": [],
         "plan_reason": "",

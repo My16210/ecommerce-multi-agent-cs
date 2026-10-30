@@ -336,10 +336,32 @@ def _ask_before_writing(order_id: str, intent: dict, tokens: dict) -> dict:
     }
 
 
-def run_order(question: str, chat_history: list = None) -> dict:
+def _owned_by(order: dict, customer_id: str) -> bool:
+    """已认证客户是否拥有这笔订单。`customer_id` 为空 = 不检查（本地演示）。"""
+    if not customer_id:
+        return True
+    owner = str((order or {}).get("customer_id") or "").strip().upper()
+    # 数据里没有 owner 的订单（不应该有）不阻塞；有 owner 且不同就拒绝。
+    return not owner or owner == customer_id
+
+
+def _foreign_order(action: str, intent: dict, tokens: dict) -> dict:
+    return {
+        "answer": "这笔订单不在当前账户下，无法查询或操作。请核对订单号。",
+        "insufficient": False,
+        "data": {"action": action, "intent": intent, "denied": "not_owner"},
+        "tokens": tokens,
+    }
+
+
+def run_order(question: str, chat_history: list = None, customer_id: str = "") -> dict:
     # 数据库可能还没灌数据（clone 下来第一次跑）。这里补一次幂等 seed，
     # 避免"演示第一步就报订单不存在"。
     seed()
+
+    # 已认证客户号非空时，**只允许操作这个客户名下的订单**。
+    # 空 = 本地 CLI/Streamlit 演示，退回原来的"从话里猜"。
+    auth_customer = str(customer_id or "").strip().upper()
 
     intent = extract_intent(question, chat_history=chat_history)
     action, order_id = intent["action"], intent["order_id"]
@@ -412,20 +434,33 @@ def run_order(question: str, chat_history: list = None) -> dict:
     try:
         if action == "tracking":
             data = query_order(order_id)
+            if not _owned_by(data["order"], auth_customer):
+                return _foreign_order(action, intent, tokens)
             answer = _fmt_tracking(data, order_id)
             sources = [order_id]
         elif action == "status":
             order = get_order_status(order_id)
+            if not _owned_by(order, auth_customer):
+                return _foreign_order(action, intent, tokens)
             data = {"order": order}
             answer = _fmt_status(order)
             sources = [order_id]
         elif action == "list_orders":
-            customer_id = _guess_customer(question)
+            # 已认证客户优先：**不再从话里猜**。匿名/演示才退回 _guess_customer。
+            customer_id = auth_customer or _guess_customer(question)
             rows = list_customer_orders(customer_id)
-            data = {"orders": rows, "customer_id": customer_id}
+            data = {
+                "orders": rows,
+                "customer_id": customer_id,
+                "customer_source": "auth" if auth_customer else "guessed",
+            }
             answer = _fmt_orders(rows, customer_id)
             sources = [r["order_id"] for r in rows]
         else:  # create_return
+            # 写之前先确认这笔订单属于当前客户；不属于就不落库。
+            existing = query_order(order_id)["order"]
+            if not _owned_by(existing, auth_customer):
+                return _foreign_order(action, intent, tokens)
             result = create_return(order_id, intent.get("reason") or question)
             data = {"return": result}
             answer = _fmt_return(result)

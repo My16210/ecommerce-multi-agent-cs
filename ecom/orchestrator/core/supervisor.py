@@ -89,7 +89,13 @@ def _worker_node(name: str, fn=None):
     def node(state: dict) -> dict:
         if name not in (state.get("plan") or []):
             return {}  # 不在本轮计划里：什么都不做（见模块开头第 1 条）
-        result = run(name, state.get("question") or "", state.get("chat_history") or [], fn=fn)
+        result = run(
+            name,
+            state.get("question") or "",
+            state.get("chat_history") or [],
+            fn=fn,
+            customer_id=state.get("customer_id") or "",
+        )
         return {"results": [stamp_round(result, state.get("round"))]}
 
     node.__name__ = _node_name(name)
@@ -209,22 +215,27 @@ def _finalize(final: dict, question: str, request_id: str, record: bool) -> dict
 
 
 def answer(question: str, chat_history: list = None, workers: dict = None,
-           router_llm=None, synth_llm=None, record: bool = True) -> dict:
+           router_llm=None, synth_llm=None, record: bool = True,
+           customer_id: str = "") -> dict:
     """
     跑一次完整问答，返回最终 state（外加一个 tokens 汇总）。
 
     record=False 用于测试：不往 logs/requests.jsonl 里写。
+    customer_id：已认证客户号；非空时订单 worker 只查这个客户名下的单。
     """
     question = _prepare_question(question)
     request_id = trace.new_request_id()
-    state = make_initial_state(question, chat_history, request_id=request_id)
+    state = make_initial_state(
+        question, chat_history, request_id=request_id, customer_id=customer_id
+    )
     app = build_graph(workers=workers, router_llm=router_llm, synth_llm=synth_llm)
     final = app.invoke(state, config=_recursion_limit())
     return _finalize(final, question, request_id, record)
 
 
 def answer_stream(question: str, chat_history: list = None, workers: dict = None,
-                  router_llm=None, synth_llm=None, record: bool = True):
+                  router_llm=None, synth_llm=None, record: bool = True,
+                  customer_id: str = ""):
     """
     跑一次完整问答，并把**最终答复的增量**边生成边交出来（生成器）。
 
@@ -251,7 +262,9 @@ def answer_stream(question: str, chat_history: list = None, workers: dict = None
     """
     question = _prepare_question(question)
     request_id = trace.new_request_id()
-    state = make_initial_state(question, chat_history, request_id=request_id)
+    state = make_initial_state(
+        question, chat_history, request_id=request_id, customer_id=customer_id
+    )
     app = build_graph(
         workers=workers, router_llm=router_llm, synth_llm=synth_llm, stream=True
     )

@@ -10,6 +10,7 @@
 """
 import hashlib
 import hmac
+import re
 import secrets
 import sqlite3
 from contextlib import closing
@@ -43,7 +44,8 @@ CREATE TABLE IF NOT EXISTS principals (
     created_at    TEXT NOT NULL,
     revoked_at    TEXT,
     expires_at    TEXT,
-    password_hash TEXT
+    password_hash TEXT,
+    customer_id   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_principals_token ON principals(token_hash);
 CREATE TABLE IF NOT EXISTS auth_tokens (
@@ -92,6 +94,8 @@ def _connect() -> sqlite3.Connection:
         conn.execute("ALTER TABLE principals ADD COLUMN expires_at TEXT")
     if "password_hash" not in columns:
         conn.execute("ALTER TABLE principals ADD COLUMN password_hash TEXT")
+    if "customer_id" not in columns:
+        conn.execute("ALTER TABLE principals ADD COLUMN customer_id TEXT")
     conn.commit()
     return conn
 
@@ -103,6 +107,16 @@ def _clean_name(name) -> str:
     return value
 
 
+def _clean_customer(value) -> str:
+    """客户号：`C` + 3 位以上数字。空值表示"没绑定客户身份"。"""
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    if not re.fullmatch(r"C\d{3,}", text):
+        raise ValueError("客户号应形如 C20755")
+    return text
+
+
 def _public(row: sqlite3.Row) -> dict:
     keys = set(row.keys())
     return {
@@ -112,6 +126,7 @@ def _public(row: sqlite3.Row) -> dict:
         "created_at": row["created_at"],
         "revoked_at": row["revoked_at"] if "revoked_at" in keys else None,
         "expires_at": row["expires_at"] if "expires_at" in keys else None,
+        "customer_id": row["customer_id"] if "customer_id" in keys else None,
     }
 
 
@@ -155,18 +170,25 @@ def _verify_password(password: str, stored: str) -> bool:
 
 
 def create_principal(
-    name: str, role: str = "customer", token: str = None, expires_days: float = 0
+    name: str,
+    role: str = "customer",
+    token: str = None,
+    expires_days: float = 0,
+    customer_id: str = "",
 ) -> dict:
     """
     创建一个 principal，返回**含明文 token** 的字典。
 
     `expires_days=0` 表示不过期（给本地/长期服务 token）；大于 0 就是到期时间。
     token 只在返回值里出现一次，服务端只存 SHA-256。
+    `customer_id` 非空时，这个 principal 的订单查询会**锁定到这个客户**，
+    不再从用户的话里猜客户号。
     """
     clean_name = _clean_name(name)
     clean_role = str(role or "").strip().lower()
     if clean_role not in ROLES:
         raise ValueError(f"role 只能是 {ROLES}，收到 {role!r}")
+    clean_customer = _clean_customer(customer_id)
 
     plain = str(token or "").strip() or secrets.token_urlsafe(settings.AUTH_TOKEN_BYTES)
     principal_id = "p_" + secrets.token_hex(8)
@@ -177,9 +199,17 @@ def create_principal(
         try:
             conn.execute(
                 "INSERT INTO principals "
-                "(id, name, role, token_hash, created_at, expires_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (principal_id, clean_name, clean_role, _hash(plain), now, expires_at),
+                "(id, name, role, token_hash, created_at, expires_at, customer_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    principal_id,
+                    clean_name,
+                    clean_role,
+                    _hash(plain),
+                    now,
+                    expires_at,
+                    clean_customer or None,
+                ),
             )
             conn.commit()
         except sqlite3.IntegrityError as exc:
@@ -191,8 +221,24 @@ def create_principal(
         "role": clean_role,
         "created_at": now,
         "expires_at": expires_at,
+        "customer_id": clean_customer or None,
         "token": plain,
     }
+
+
+def set_customer(identifier: str, customer_id: str) -> None:
+    """把 principal 绑定/解绑到一个客户号。绑定之后订单查询不再靠猜。"""
+    principal = get_principal(identifier)
+    if principal is None:
+        raise ValueError(f"没有这个 principal：{identifier}")
+    clean = _clean_customer(customer_id)
+    with closing(_connect()) as conn:
+        conn.execute(
+            "UPDATE principals SET customer_id = ? WHERE id = ?",
+            (clean or None, principal["id"]),
+        )
+        conn.commit()
+    audit(principal["name"], "principal.set_customer", principal["name"], clean or "unbound")
 
 
 def authenticate(token: str) -> dict:

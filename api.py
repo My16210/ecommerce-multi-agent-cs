@@ -65,6 +65,7 @@ FastAPI 会把它丢进线程池，这才是这类代码该待的地方。要真
 request_id，出问题时拿这个 id 去 `logs/` 里对——错误体的用途是"让客户端知道
 该怎么办"，不是"让人隔空读源码"。
 """
+import inspect
 import json
 import secrets
 import threading
@@ -330,6 +331,19 @@ def _session_for(requested: str, principal: dict) -> str:
         raise HTTPException(status_code=404, detail="会话不存在或已过期") from None
 
 
+def _call_answer(question: str, history: list, customer_id: str) -> dict:
+    """测试会把 `answer` 换成两参数替身；有 customer_id 形参时才传。"""
+    if "customer_id" in inspect.signature(answer).parameters:
+        return answer(question, history, customer_id=customer_id)
+    return answer(question, history)
+
+
+def _call_answer_stream(question: str, history: list, customer_id: str):
+    if "customer_id" in inspect.signature(answer_stream).parameters:
+        return answer_stream(question, history, customer_id=customer_id)
+    return answer_stream(question, history)
+
+
 def require_demo_access(
     x_invite_code: str = Header(
         default="", alias="X-Invite-Code", description="演示模式打开时才需要。"
@@ -485,7 +499,11 @@ def chat(
     # 的返回值直接交给 `answer()`，**不要存回去**（存回去会跨轮重复累积）。
     # 会话还没跑过 `distill`（库是空的）时它原样返回，**一次 embedding 都不调**，
     # 所以没有记忆的会话在这条路上是零额外开销。
-    final = answer(req.question, memory.augmented_history(session_id, req.question, history))
+    final = _call_answer(
+        req.question,
+        memory.augmented_history(session_id, req.question, history),
+        principal.get("customer_id") or "",
+    )
     demo.add_tokens(final.get("tokens") or {})
 
     # **先答完再落盘**。反过来的话，模型调用失败也会留下一条"问了没答"的
@@ -581,7 +599,9 @@ def chat_stream(
         final = None
         elapsed_ms = None
         try:
-            for event in answer_stream(req.question, augmented):
+            for event in _call_answer_stream(
+                req.question, augmented, principal.get("customer_id") or ""
+            ):
                 kind = event.get("type")
                 if kind == "start":
                     request_id = event.get("request_id") or ""

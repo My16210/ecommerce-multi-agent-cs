@@ -127,3 +127,14 @@ def test_password_is_hashed_with_scrypt():
         ).fetchone()[0]
     assert stored.startswith("scrypt$")
     assert "a-very-secret-password" not in stored
+
+
+def test_customer_binding():
+    created = store.create_principal("kim", "customer", customer_id="C20755")
+    assert store.authenticate(created["token"])["customer_id"] == "C20755"
+
+    store.set_customer("kim", "")
+    assert store.authenticate(created["token"])["customer_id"] is None
+
+    with pytest.raises(ValueError):
+        store.set_customer("kim", "not-a-customer")

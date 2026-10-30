@@ -136,3 +136,27 @@ def test_login_issues_a_token_that_can_chat(client):
         headers={"Authorization": f"Bearer {body['token']}"},
     )
     assert r.status_code == 200
+
+
+def test_customer_id_is_passed_to_the_orchestrator(client, monkeypatch):
+    """登录 principal 绑定客户号后，问答链路必须收到它——否则订单层还会猜客户。"""
+    auth_store.set_customer("bob", "C20755")
+    seen = {}
+
+    def fake_answer(question, history, customer_id=""):  # noqa: ANN001
+        seen["customer_id"] = customer_id
+        return {
+            "request_id": "req-customer",
+            "answer": "ok",
+            "sources": [],
+            "decision": "answer",
+            "plan": ["order"],
+            "tokens": {},
+        }
+
+    monkeypatch.setattr(api, "answer", fake_answer)
+    r = client.post(
+        "/chat", json={"question": "我的订单"}, headers=_auth(client.bob["token"])
+    )
+    assert r.status_code == 200
+    assert seen["customer_id"] == "C20755"
