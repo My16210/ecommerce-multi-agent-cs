@@ -28,8 +28,6 @@
 > 6. **[docs/项目拆解.md](docs/项目拆解.md)** —— **要接手或要讲清楚这个项目的人读的**。
 >    按"一次请求怎么走"纵向拆开：四条主链路、每个模块的契约与失败模式、配置矩阵、
 >    测试地图、排障症状表、扩展点的改动半径、部署形态、六个真实故障故事。
-> 7. **[docs/面试准备.md](docs/面试准备.md)** —— 问答形态的版本：30 秒/2 分钟自述、
->    基础题、深挖题、压力题、数字卡片和白板模板，每题都能落到代码或测试上。
 
 ---
 
@@ -108,7 +106,7 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 ├── docs/                        项目说明.md（导读）｜技术文档.md（**要改代码的人读的**）
 │                                上线清单.md（**要真上线还差什么**，含"明确不做"）
 │                                MCP.md（工具清单、契约、安全边界）
-│                                项目拆解.md（纵向拆解）｜面试准备.md（问答版）
+│                                项目拆解.md（纵向拆解）
 └── tests/                       orchestrator/ knowledge/ analytics/ mcp/ + 跨系统的不变量测试
 ```
 
@@ -179,6 +177,10 @@ docker compose run --rm app python -m ecom.knowledge.cli.ingest        # 建向�
 `ecom-cs:local` 镜像，一起更新）。实测踩到过 —— 镜像是 15:41 建的，代码 16:54 才修完，
 `up -d` 会静悄悄起一份旧代码，界面上、日志里都看不出来。逐步的检查和"怎么算成了"写在
 [技术文档第十一节](docs/技术文档.md#十一怎么跑)。
+
+**React 前端由镜像自己构建**：Dockerfile 里的 `frontend` 阶段跑 `npm ci && npm run build`，
+`/ui` 不再依赖宿主机先执行 `npm run build`（干净 clone 直接构建也能拿到）。本地直接
+`uv run uvicorn api:app` 时仍然需要宿主机构建一次前端。
 
 **两条都只发布到 `127.0.0.1`，不绑 `0.0.0.0`。** 用 `localhost` 访问完全不受影响；
 但同局域网的另一台机器打不开它们——这是故意的（app 那条**没有任何鉴权**，
@@ -780,7 +782,7 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 ## 测试
 
 ```bash
-uv run pytest        # 723 条（--all-extras 实测：721 passed / 2 skipped；条数以当次输出为准）
+uv run pytest        # 730 条（--all-extras 实测：728 passed / 2 skipped；条数以当次输出为准）
 uv run ruff check .
 ```
 
@@ -789,6 +791,8 @@ uv run ruff check .
 
 `CI`（[.github/workflows/tests.yml](.github/workflows/tests.yml)）上的数字会随测试增减（以当次 run 为准）。
 它和本机通常差一条 skip：干净 checkout 上没有 `data/orders.sqlite` 和向量库，界面真渲染那条会 skip。
+CI 现在有两个 job：`lint-and-test`（ruff + pytest）和 `frontend`（`npm ci` + `tsc`/`vite build`）——
+前端构建不再只靠本机。
 
 **一条测试都不联网。** 不是图快——真调模型意味着测试结果随模型版本、网络、当天负载浮动，那样的测试没法规格回归，它昨天红今天绿，你只会学会忽略它。所有模型调用都用 `FakeLLM` / `ExplodingLLM` 顶掉。
 
@@ -849,7 +853,7 @@ uv run ruff check .
 | ✅ | **真实 Streamlit 运行时** | 真跑：`streamlit.testing.v1.AppTest` 把两个入口跑完，6 条全绿。**这补上了原来那一栏 ❌** |
 | ✅ | **合并后的 `API`（FastAPI）真起服务** | 容器内真起 uvicorn：`/health` 200（含 workers + order_db）、`/openapi.json` 元数据齐、空问题 422、`/trace/不存在` 404、真提问 200（257+29 token / 1.2s）。**这一条走了网络、花了 token**，不属于"测试不联网"那一栏 |
 | ✅ | **Milvus 那条代码路径** | 真跑：连宿主常驻的 v2.5.5，`ecom_verify_<随机>` 临时集合走完 add / count / search / delete / drop，**零残留**（另有一条专门查残留）。⚠️ 见下面的版本错位 |
-| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 10 条**，现在宿主 `.venv`（`--all-extras`）上是 **723 条 / 721 passed / 2 skipped**，`ruff` 干净（图片输入、流式、L1、沙箱、MCP 和 React 这批还没跑过 CI） |
+| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 10 条**，现在宿主 `.venv`（`--all-extras`）上是 **730 条 / 728 passed / 2 skipped**，`ruff` 干净（这批的 GitHub CI 还没跑过；workflow 里已经加了前端构建 job） |
 | ✅ | **L1 只读 / 邀请码 / 预算闸门** | 真跑：32 条测试覆盖 fail closed 的邀请码、每客户端限流、跨重连的 token 账本、损坏账本拒绝花钱、路由不选 analytics、退货在落库前被挡、API 429 与 trace 404、界面门禁与建议语。**只验证了代码层**；下面那栏是部署文件 |
 | ✅ | **公网演示编排能解析** | 真跑：`docker compose --env-file .env.prod -f docker-compose.prod.yml config --quiet` 退出 0（临时 `.env.prod` 校验后已删）；Caddyfile 用 `caddy:2.10-alpine caddy validate` 通过（健康检查那条 `context canceled` 是校验时没有 app 容器，属预期）。**没有真部署**：没有域名和公网服务器，HTTPS 证书签发、Caddy→app 转发、公网可达都**没验过** |
 | ✅ | **CI 本身真跑绿了** | 真跑：[run #38132662970](https://github.com/My16210/ecommerce-multi-agent-cs/actions/runs/38132662970)（2026-10-11）——`ruff: All checks passed!`，`pytest: 517 passed, 3 skipped, 15.06s`，和本机干净 checkout 预演的数字一致。**这一栏原来是 ❌**：工作流写过、命令本地验过，但没推上去就一次都没真跑过。<br>真跑还多抓到两处**本地永远看不出来**的东西：① `python-version-file` 这个输入名**不存在**，setup-uv 只打一条 warning 就忽略它，workflow 照样绿、看着像钉住了版本；② `astral-sh/setup-uv` **没有 `v10` 这个大版本 tag**（它的可移动大版本 tag 只发到 v7），钉 `@v10` 会让 job 在 "Set up job" 阶段就红，得钉精确的 `@v10.3.0`。两处都改成实测过的写法 |
