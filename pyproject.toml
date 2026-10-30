@@ -98,6 +98,10 @@ dev = ["pytest>=8.0", "ruff>=0.6", "httpx>=0.27"]
 # 本机 PyPI 不通时用环境变量，不要把环境问题固化成项目配置：
 #     UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/ uv sync
 # （lock 里现在指向 pypi.org；改镜像不会改 lock，只是换下载入口。）
+#
+# ⚠️ 改完依赖重新生成锁时，要**显式**用 PyPI，否则本机的 UV_DEFAULT_INDEX
+# 会把 4000 多条 source 又写回镜像：
+#     UV_DEFAULT_INDEX=https://pypi.org/simple uv lock
 
 [tool.pytest.ini_options]
 # 三套测试并成一套之后，这里是**唯一**一处管 import 根的地方。
