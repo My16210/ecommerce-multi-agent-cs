@@ -67,6 +67,8 @@ request_id，出问题时拿这个 id 去 `logs/` 里对——错误体的用途
 """
 import json
 import secrets
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
@@ -94,6 +96,7 @@ logger = setup_logger(__name__)
 
 TAGS = [
     {"name": "health", "description": "存活与组件概览。**永远不需要凭证**——探针和监控走这里。"},
+    {"name": "auth", "description": "用用户名 + 密码换短期 bearer token（需要 `AUTH_ENABLED=1`）。"},
     {"name": "chat", "description": "一次提问：路由 → worker → 汇总。多轮由 `session_id` 串起来。`/chat` 一次返回完整 JSON，`/chat/stream` 走 SSE。"},
     {"name": "trace", "description": "回看历史请求的决策链（路由、每个 worker 的成功与否和耗时）。"},
 ]
@@ -109,6 +112,8 @@ async def lifespan(_: FastAPI):
     清理，所以要外挂一行 cron——这条写进 README 的已知限制。
     """
     result = session.purge()
+    # 登录会话也要清一次：它们是短期凭证，过期后留着只会让 auth.db 变大。
+    auth_store.purge_sessions()
     # 记忆也一起报：它是这段对话的摘要，**也是用户说过的话**。只报消息数的话，
     # "记忆有没有被删掉"这件事在日志里看不见——而它恰恰是最该被看见的那部分。
     logger.info(
@@ -159,6 +164,22 @@ class ChatRequest(BaseModel):
         description="上一轮响应里返回的 `session_id`。**留空表示新开一个会话**，"
                     "服务端会生成一个并通过响应返回。",
     )
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64, examples=["alice"])
+    password: str = Field(
+        min_length=1,
+        max_length=256,
+        description="明文只在这条请求里出现；服务端存的是 scrypt 哈希。",
+    )
+
+
+class LoginResponse(BaseModel):
+    token: str = Field(description="短期 bearer token，默认 12 小时；**只返回这一次**。")
+    expires_at: str = Field(description="过期时间（本地时间字符串）。")
+    name: str = Field(description="principal 名字。")
+    role: str = Field(description="customer / agent / admin。")
 
 
 class ChatResponse(BaseModel):
@@ -345,6 +366,38 @@ def _demo_precheck(request: Request) -> None:
         raise HTTPException(status_code=429, detail="今天的演示额度已经用完")
 
 
+# 登录限流：进程内滑动窗口。它挡的是"对着一台实例猜密码"，不是分布式撞库；
+# 真要跨副本，得把这本账挪到共享存储（和 demo 的预算账本同一个道理）。
+_LOGIN_MAX_ATTEMPTS = 10
+_LOGIN_WINDOW_SECONDS = 60.0
+_login_hits: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+
+
+def _login_precheck(request: Request) -> None:
+    client = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    with _login_lock:
+        recent = [
+            stamp
+            for stamp in _login_hits.get(client, [])
+            if now - stamp < _LOGIN_WINDOW_SECONDS
+        ]
+        if len(recent) >= _LOGIN_MAX_ATTEMPTS:
+            _login_hits[client] = recent
+            raise HTTPException(
+                status_code=429,
+                detail="登录尝试过于频繁，请稍后再试",
+                headers={"Retry-After": "60"},
+            )
+        recent.append(now)
+        _login_hits[client] = recent
+        if len(_login_hits) > 2048:
+            for key, hits in list(_login_hits.items()):
+                if not hits or now - hits[-1] >= _LOGIN_WINDOW_SECONDS:
+                    _login_hits.pop(key, None)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 端点
 # ═══════════════════════════════════════════════════════════════════════════
@@ -369,6 +422,38 @@ def health() -> dict:
         "max_rounds": MAX_ROUNDS,
         "demo": demo.enabled(),
         "auth": auth_settings.AUTH_ENABLED,
+    }
+
+
+@app.post(
+    "/auth/login",
+    response_model=LoginResponse,
+    tags=["auth"],
+    summary="用户名 + 密码换短期 token",
+    description="需要服务端 `AUTH_ENABLED=1` 且该 principal 已用 "
+                "`python -m ecom.auth.cli set-password` 设过密码。返回的 token "
+                "默认 12 小时有效；和长期 API token 走同一套 bearer 校验。",
+    responses={
+        401: {"model": ErrorResponse, "description": "用户名或密码不正确"},
+        404: {"model": ErrorResponse, "description": "身份层未启用"},
+        429: {"model": ErrorResponse, "description": "登录尝试过于频繁"},
+    },
+)
+def login(req: LoginRequest, request: Request) -> dict:
+    if not auth_settings.AUTH_ENABLED:
+        # 404 而不是 403：没开身份层时，这个端点"不存在"比"存在但不给用"更准确。
+        raise HTTPException(status_code=404, detail="身份层未启用（AUTH_ENABLED=0）")
+    _login_precheck(request)
+    principal = auth_store.verify_password(req.username, req.password)
+    if principal is None:
+        # 不区分"用户不存在"和"密码错"：区分了就是一个用户名枚举接口。
+        raise HTTPException(status_code=401, detail="用户名或密码不正确")
+    issued = auth_store.issue_session(principal)
+    return {
+        "token": issued["token"],
+        "expires_at": issued["expires_at"],
+        "name": principal["name"],
+        "role": principal["role"],
     }
 
 

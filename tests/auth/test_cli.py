@@ -27,3 +27,18 @@ def test_cli_list_and_revoke(tmp_path, monkeypatch, capsys):
     assert cli.main(["revoke", "bob"]) == 0
     assert store.authenticate(created["token"]) is None
     assert cli.main(["revoke", "bob"]) == 1
+
+
+def test_cli_set_password_and_rotate(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(store, "AUTH_DB_PATH", tmp_path / "auth.db")
+    created = store.create_principal("carol", "admin")
+
+    assert cli.main(["set-password", "carol", "--password", "long enough password"]) == 0
+    assert store.verify_password("carol", "long enough password")["role"] == "admin"
+
+    assert cli.main(["rotate", "carol"]) == 0
+    out = capsys.readouterr().out
+    new_token = out.strip().splitlines()[-1]
+    assert new_token != created["token"]
+    assert store.authenticate(created["token"]) is None
+    assert store.authenticate(new_token)["name"] == "carol"

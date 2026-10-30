@@ -69,3 +69,61 @@ def test_audit_is_written_and_readable():
     assert rows[0]["actor"] == "alice"
     assert rows[0]["action"] == "return.approve"
     assert rows[0]["target"] == "R0000000001"
+
+
+def test_password_login_issues_short_lived_session():
+    created = store.create_principal("frank", "agent")
+    store.set_password("frank", "correct horse battery")
+
+    assert store.verify_password("frank", "wrong") is None
+    principal = store.verify_password("frank", "correct horse battery")
+    assert principal["role"] == "agent"
+
+    issued = store.issue_session(principal, ttl_hours=1)
+    assert store.authenticate(issued["token"])["name"] == "frank"
+
+    # 0 小时 = 立即过期：登录会话必须是短期凭证，不能退化成永久的
+    expired = store.issue_session(principal, ttl_hours=0)
+    assert store.authenticate(expired["token"]) is None
+    assert created["token"]  # 长期 API token 仍然有效
+    assert store.authenticate(created["token"])["name"] == "frank"
+
+
+def test_expired_api_token_is_rejected():
+    created = store.create_principal("grace", expires_days=-1)
+    assert store.authenticate(created["token"]) is None
+
+
+def test_rotate_invalidates_the_old_token_and_sessions():
+    created = store.create_principal("heidi", "admin")
+    store.set_password("heidi", "long enough password")
+    principal = store.verify_password("heidi", "long enough password")
+    session = store.issue_session(principal, ttl_hours=1)
+
+    rotated = store.rotate_principal("heidi")
+    assert rotated["token"] != created["token"]
+    assert store.authenticate(created["token"]) is None
+    assert store.authenticate(session["token"]) is None
+    assert store.authenticate(rotated["token"])["role"] == "admin"
+
+
+def test_revoke_also_kills_sessions():
+    created = store.create_principal("ivan")
+    store.set_password("ivan", "long enough password")
+    principal = store.verify_password("ivan", "long enough password")
+    session = store.issue_session(principal, ttl_hours=1)
+
+    assert store.revoke_principal("ivan")
+    assert store.authenticate(created["token"]) is None
+    assert store.authenticate(session["token"]) is None
+
+
+def test_password_is_hashed_with_scrypt():
+    store.create_principal("judy")
+    store.set_password("judy", "a-very-secret-password")
+    with sqlite3.connect(store.AUTH_DB_PATH) as conn:
+        stored = conn.execute(
+            "SELECT password_hash FROM principals WHERE name = 'judy'"
+        ).fetchone()[0]
+    assert stored.startswith("scrypt$")
+    assert "a-very-secret-password" not in stored

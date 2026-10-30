@@ -373,12 +373,18 @@ def test_the_openapi_document_carries_the_hand_written_metadata(client):
 
     assert spec["info"]["title"]
     assert spec["info"]["description"], "顶层说明没了，/docs 首页会是一片空白"
-    assert {t["name"] for t in spec["tags"]} == {"health", "chat", "trace"}
-    for path in ("/health", "/chat", "/trace"):
+    assert {t["name"] for t in spec["tags"]} == {"health", "auth", "chat", "trace"}
+    for path in ("/health", "/auth/login", "/chat", "/trace"):
         assert spec["paths"][path]
     assert spec["paths"]["/chat"]["post"]["summary"]
     # 401 的响应模型要出现在文档里，否则看文档的人不知道有无鉴权
     assert "401" in spec["paths"]["/chat"]["post"]["responses"]
+
+
+def test_login_is_404_when_auth_is_disabled(client):
+    """没开身份层时这个端点等于不存在——不要给"存在但不给用"的暗示。"""
+    r = client.post("/auth/login", json={"username": "x", "password": "y"})
+    assert r.status_code == 404
 
 
 # ——— 公网演示：邀请码 / 限流 / 预算 / trace ——

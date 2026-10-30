@@ -114,3 +114,25 @@ def test_trace_requires_admin(client):
 def test_health_reports_auth_mode(client):
     body = client.get("/health").json()
     assert body["auth"] is True
+
+
+def test_login_issues_a_token_that_can_chat(client):
+    auth_store.set_password("bob", "a-long-enough-password")
+
+    r = client.post("/auth/login", json={"username": "bob", "password": "wrong"})
+    assert r.status_code == 401
+
+    r = client.post(
+        "/auth/login", json={"username": "bob", "password": "a-long-enough-password"}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["role"] == "customer"
+    assert body["expires_at"]
+
+    r = client.post(
+        "/chat",
+        json={"question": "hi"},
+        headers={"Authorization": f"Bearer {body['token']}"},
+    )
+    assert r.status_code == 200

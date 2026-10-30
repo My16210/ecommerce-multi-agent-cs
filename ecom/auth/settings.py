@@ -17,3 +17,6 @@ AUTH_DB_PATH = Path(
 
 # bearer token 的熵。32 字节 = 256 bit，token_urlsafe 出来约 43 个字符。
 AUTH_TOKEN_BYTES = int(os.getenv("AUTH_TOKEN_BYTES", "32"))
+
+# 登录会话的有效期（小时）。API token 可以不过期；登录会话必须有。
+AUTH_SESSION_TTL_HOURS = float(os.getenv("AUTH_SESSION_TTL_HOURS", "12"))
