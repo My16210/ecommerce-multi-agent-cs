@@ -58,7 +58,7 @@ _PROTECTED_NAMES = {"CHART_PATH", "output_dir"}
 _WRITE_ATTRS = {
     "to_csv", "to_excel", "to_pickle", "to_parquet", "to_hdf", "to_feather",
     "to_stata", "to_sql", "to_clipboard", "to_json", "to_html", "to_xml",
-    "to_latex", "to_gbq", "to_orc", "tofile", "dump",
+    "to_latex", "to_gbq", "to_orc", "tofile", "dump", "to_markdown",
     "save", "savez", "savez_compressed", "savetxt", "imsave",
     "savefig", "print_png", "print_svg", "print_pdf", "print_ps",
     "print_figure",
@@ -74,7 +74,10 @@ _READ_ATTRS = {
     "imread", "ExcelFile", "HDFStore", "get_handle", "urlopen", "open",
     "TextFileReader",
 }
-_BANNED_ATTRS = _WRITE_ATTRS | _READ_ATTRS
+# to_string 平时是"返回值、不写文件"，但它的第一个参数就是 buf：
+# `df.to_string(buf=path)` 会写任意文件。直接调用由 visit_Call 放行（并禁止 buf），
+# 取别名 / 当函数值传递则由这里拒掉——否则 `s = df.to_string; s(buf=path)` 就绕过了。
+_BANNED_ATTRS = _WRITE_ATTRS | _READ_ATTRS | {"to_string"}
 
 
 def strip_fences(code: str) -> str:
@@ -100,6 +103,10 @@ class _Validator(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if node.attr.startswith("__") and node.attr.endswith("__"):
             raise CodeSecurityError(f"禁止访问 dunder 属性：{node.attr}")
+        if node.attr == "to_string":
+            raise CodeSecurityError(
+                "to_string 只能直接调用（.to_string()）；取别名或当函数值传递会绕开参数检查。"
+            )
         if node.attr in _BANNED_ATTRS or node.attr.startswith("read_"):
             raise CodeSecurityError(
                 f"禁止调用 {node.attr}（会读写文件）。"
@@ -118,17 +125,23 @@ class _Validator(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         """
-        `savefig` 是唯一放行的写文件入口，而且只许写 CHART_PATH。
+        `savefig` 和 `to_string` 是仅有的两个"放行但要卡参数"的入口：
 
-        不能直接放进 `_BANNED_ATTRS` 一刀切（出图是正路），也不能放行任意
-        路径（实测能覆盖容器里的任何文件）。所以在这里按**实参**卡；并且
+          · savefig   只许写 CHART_PATH（出图是正路，任意路径不是）；
+          · to_string 只许不传 buf（其余格式化参数可以用），因为它默认"返回值"。
+
+        不能直接放进 `_BANNED_ATTRS` 一刀切，也不能放行任意参数（实测
+        `to_string(buf=path)` 能写任意文件）。所以在这里按**实参**卡；并且
         不 `generic_visit(func)`——否则上面那条 Attribute 规则会把这次合法
-        调用也拒掉。别名（`s = plt.savefig`）仍会被 Attribute 规则拦住。
+        调用也拒掉。别名（`s = df.to_string`）仍会被 Attribute 规则拦住。
         """
         func = node.func
-        if isinstance(func, ast.Attribute) and func.attr == "savefig":
-            self._check_savefig_target(node)
-            # 只放过 func 本身（savefig 在 _BANNED_ATTRS 里），接收者必须
+        if isinstance(func, ast.Attribute) and func.attr in {"savefig", "to_string"}:
+            if func.attr == "savefig":
+                self._check_savefig_target(node)
+            else:
+                self._check_to_string_args(node)
+            # 只放过 func 本身（两个名字都在 _BANNED_ATTRS 里），接收者必须
             # 照常校验：`(open(...) and plt).savefig(CHART_PATH)` 能借这个
             # 位置塞进任意调用，跳过它等于把整段表达式变成免检区。
             self.visit(func.value)
@@ -186,6 +199,24 @@ class _Validator(ast.NodeVisitor):
             raise CodeSecurityError(
                 "plt.savefig 只允许写 CHART_PATH（题目给的输出路径），不允许自己拼路径。"
             )
+
+    @staticmethod
+    def _check_to_string_args(node: ast.Call) -> None:
+        """
+        to_string 的第一个位置参数就是 `buf`，而 `buf` 可以是一个路径。
+
+        留其他格式化参数（`index=False` 这类很常用），只卡"会写文件"的那两个入口。
+        """
+        if node.args:
+            raise CodeSecurityError(
+                "to_string 不接受位置参数（第一个位置参数是 buf 路径）。"
+                "要表格文本就直接 .to_string()，需要格式时用关键字参数。"
+            )
+        for keyword in node.keywords:
+            if keyword.arg == "buf":
+                raise CodeSecurityError(
+                    "to_string(buf=...) 会写文件；这里只允许 .to_string() 返回字符串。"
+                )
 
     @staticmethod
     def _check_params(args: ast.arguments) -> None:

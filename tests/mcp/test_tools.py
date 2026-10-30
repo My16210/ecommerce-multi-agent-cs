@@ -144,6 +144,19 @@ def test_search_knowledge_reports_unavailable_when_retrieval_breaks(monkeypatch)
     assert "embedding" not in error["message"]
 
 
+def test_search_knowledge_closes_the_store(fake_retrieval, monkeypatch):
+    """stdio 服务长驻：每次检索新建的 store 必须收尾，不能只靠 GC。"""
+    closed = []
+
+    class Store:
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr("ecom.knowledge.vector_store.get_vector_store", lambda: Store())
+    _data(tools.search_knowledge("退货"))
+    assert closed == [True]
+
+
 # ——————————————————————————————————————————————————————————————
 # list_customer_orders（PII 闸）
 # ——————————————————————————————————————————————————————————————

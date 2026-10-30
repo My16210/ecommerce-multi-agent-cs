@@ -226,6 +226,7 @@ def search_knowledge(query: str, top_k: int = 3) -> dict:
     if k is None or not 1 <= k <= settings.MCP_MAX_TOP_K:
         return _err(INVALID_INPUT, f"top_k 应为 1~{settings.MCP_MAX_TOP_K} 的整数。", started)
 
+    store = None
     try:
         # 延迟 import：让 `ecom.mcp.tools` 在没装知识库依赖/没配 key 的环境里
         # 仍能被 import 和单测；真正调用时才付加载成本。
@@ -233,11 +234,21 @@ def search_knowledge(query: str, top_k: int = 3) -> dict:
         from ecom.knowledge.retriever.retriever import retrieve
         from ecom.knowledge.vector_store import get_vector_store
 
-        hits = retrieve(text, get_vector_store())
+        store = get_vector_store()
+        hits = retrieve(text, store)
         top = rerank(text, hits, top_k=k)
     except Exception as exc:  # noqa: BLE001 —— 检索链路的失败不往外抛
         logger.error("MCP search_knowledge 失败：%s: %s", type(exc).__name__, exc)
         return _err(UNAVAILABLE, "知识库检索暂时不可用，请稍后重试。", started)
+    finally:
+        # stdio 服务是长驻进程：每次检索新建的 store 要收尾，否则反复调用会
+        # 留下连接/句柄。close 失败不影响这次结果，只记日志。
+        close = getattr(store, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("关闭向量库失败：%s: %s", type(exc).__name__, exc)
 
     items = []
     for hit in top:

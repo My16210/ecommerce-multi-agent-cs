@@ -54,6 +54,10 @@ def df():
         "from pandas import read_csv",
         "savefig = plt.savefig\nsavefig('leak.png')",
         "result = pd.io.common.get_handle('x')",
+        "df.to_string(buf='leak.txt')",
+        "df.to_string('leak.txt')",
+        "s = df.to_string\ns(buf='leak.txt')",
+        "df.to_markdown('leak.md')",
         # savefig 的接收者是免检区的旧漏洞：`(open(...) and plt).savefig(...)`
         # 能借这个位置调用任意函数，而实参检查只看到 CHART_PATH。
         "(plt.plot.__globals__['__builtins__']['open']('leak.txt', 'w') and plt).savefig(CHART_PATH)",
@@ -82,6 +86,7 @@ def test_dangerous_code_is_rejected(code):
         "result = df.groupby('地区')['金额'].sum().sort_values(ascending=False).index[0]",
         "plt.bar(['a'], [1])\nplt.savefig(CHART_PATH)\nplt.close()\nresult = 'ok'",
         "result = df.groupby('地区')['金额'].sum().to_string()",
+        "result = df.to_string(index=False)",
     ],
 )
 def test_legit_code_passes_static_check(code):
@@ -157,6 +162,24 @@ def test_run_code_blocks_pandas_file_reads(df, tmp_path):
     out = run_code("result = pd.read_csv('leak.csv')", df, tmp_path, tmp_path / "chart.png")
     assert out["error"] is not None
     assert "安全策略" in out["error"]
+
+
+def test_run_code_blocks_to_string_buf_write(df, tmp_path):
+    """`to_string(buf=...)` 是 to_string 唯一的写文件入口，必须单独拦。
+
+    这是 2026-10-30 第二轮加固时才发现的：to_string 是项目推荐给模型的
+    "安全输出方法"，但它的第一个参数 buf 就是路径。
+    """
+    target = tmp_path / "leak.txt"
+    out = run_code(
+        f"result = df.to_string(buf=r'{target}')",
+        df,
+        tmp_path,
+        tmp_path / "chart.png",
+    )
+    assert out["error"] is not None
+    assert "安全策略" in out["error"]
+    assert not target.exists()
 
 
 def test_savefig_may_only_write_chart_path(df, tmp_path):
