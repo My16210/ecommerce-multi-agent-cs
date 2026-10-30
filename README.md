@@ -71,7 +71,7 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 ├── .streamlit/config.toml       主题（浅/深两套）—— app.py 和 admin.py **共用这一份**
 ├── main.py                      CLI —— **第一入口**，排查问题用这个
 ├── app.py                       Streamlit 界面 —— 主区只有对话，另外三个视图收在侧边栏
-├── admin.py                     Streamlit 后台 —— **要口令**，能批准退货的那一个
+├── admin.py                     Streamlit 后台 —— 口令 / admin token，能批准退货的那一个
 ├── api.py                       FastAPI    —— 可选
 │
 ├── ecom/                        ★ 唯一顶层包，三个平级的子系统
@@ -87,7 +87,9 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 │   ├── knowledge/               知识库：retriever / vector_store / embedding / generator /
 │   │                            document_loader / review / web_search / cli（10 个脚本）
 │   ├── analytics/               数据分析：agents / core（graph + sandbox）/ utils / cli
-│   └── mcp/                     MCP 工具服务：tools.py（纯函数契约）/ server.py（stdio 接线）
+│   ├── mcp/                     MCP 工具服务：tools.py（纯函数契约）/ server.py（stdio 接线）
+│   ├── auth/                    身份层：principal / 角色 / token 哈希 / 审计（可选）
+│   └── ui/                      Streamlit 渲染件与三个直连视图（app.py 只做装配）
 │
 ├── data/                        三个子系统的数据按目录分开
 │   ├── knowledge/               documents/（「法规原文」10 篇 + 「电商客服示例」7 篇）、
@@ -98,8 +100,10 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 │   │   ├── source/              下载来的原始数据（96MB，**不进仓库**，见 .gitignore）
 │   │   └── output/              跑出来的图（不进仓库）
 │   ├── orchestrator/seed/       订单库种子 orders.csv / logistics.csv（派生物，**进仓库**）
+│   │                            router_eval.jsonl（路由评测题集，50 题）
 │   └── orders.sqlite            订单库运行时文件（不进仓库，由 seed 重建）
 │                                会话库在 data/orchestrator/sessions.db（同样不进仓库）
+│                                身份库在 data/orchestrator/auth.db（token 哈希 + 审计）
 ├── logs/                        日志 + requests.jsonl（trace）
 ├── frontend/                    React + Vite + TypeScript（可选界面）
 │                                `npm run build` 后由 api.py 挂到 /ui
@@ -107,7 +111,7 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 │                                上线清单.md（**要真上线还差什么**，含"明确不做"）
 │                                MCP.md（工具清单、契约、安全边界）
 │                                项目拆解.md（纵向拆解）
-└── tests/                       orchestrator/ knowledge/ analytics/ mcp/ + 跨系统的不变量测试
+└── tests/                       orchestrator/ knowledge/ analytics/ mcp/ auth/ + 跨系统的不变量测试
 ```
 
 **四个入口 + 一条 MCP 出口，各自的定位**（详见 [技术文档 §11](docs/技术文档.md)）：
@@ -117,7 +121,7 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 | `main.py` | **排查问题**（第一入口） | 读 |
 | `app.py` → 8501 | 演示 | 只读 |
 | `admin.py` → 8502 | **下结论**（退货审核） | **三个页面里只有一个能写** |
-| `api.py` → 8000 | 被别的程序调 | 读为主 |
+| `api.py` → 8000 | 被别的程序调 | 读；`AUTH_ENABLED=1` 时按角色和会话归属 |
 | `python -m ecom.mcp.server` → stdio | **别的 Agent**（MCP 客户端） | 默认只读；写操作两把钥匙 |
 
 ### 为什么是一个 `ecom` 而不是三个平级顶层包
@@ -148,17 +152,18 @@ uv run python main.py "订单 52644 到哪了" --stream       # 边生成边打�
 
 ```bash
 uv run streamlit run app.py                            # → 8501  客户界面
-uv run streamlit run admin.py                          # → 8502  后台（要 ADMIN_PASSWORD）
+uv run streamlit run admin.py                          # → 8502  后台（ADMIN_PASSWORD 或 admin token）
 uv run uvicorn api:app --port 8000                     # → 8000  HTTP 接口
 uv run python -m ecom.orchestrator.cli.returns stats   # 命令行版的退货审核
 uv run python -m ecom.mcp.server --list-tools          # MCP 工具列表（要先 --extra mcp）
+uv run python -m ecom.auth.cli create --name alice --role admin  # 生成 admin token
+uv run python -m ecom.orchestrator.cli.eval_router               # 路由评测（离线规则基线）
 ```
 
-> **`admin.py` 不配 `ADMIN_PASSWORD` 会拒绝启动**（`st.error` + `st.stop`）——这是
-> fail closed，故意的。它和 `api.py` 的 `API_KEY` 方向**刚好相反**：
-> 后者不配就放行。**读可以默认开放，写必须默认关闭。**
-> （`admin.py` 的门禁是**演示级**：一个明文口令，没有用户、没有角色、没有审计。
-> 第二层是端口只绑 `127.0.0.1`。别把它说成"做了权限系统"。）
+> **默认（`AUTH_ENABLED=0`）**：`admin.py` 不配 `ADMIN_PASSWORD` 会拒绝启动（fail closed），
+> `api.py` 不配 `API_KEY` 就放行。**对外提供 API / 后台时请打开 `AUTH_ENABLED=1`**：
+> `/chat` 要 `Authorization: Bearer <token>`、`/trace` 要 admin 角色、会话按 principal
+> 归属、`admin.py` 改用 admin token。两条路径的取舍见下面「身份与权限」。
 
 ### 用 Docker 跑（可选）
 
@@ -223,7 +228,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 不能做什么、为什么关掉那些能力写在 [docs/DEMO.md](docs/DEMO.md)；
 部署、换邀请码、查用量、排障、备份回滚写在 [docs/RUNBOOK.md](docs/RUNBOOK.md)。
 
-**这一层没有身份、审计、监控告警、多副本**，别把它当"上线完成"——
+**这一层仍是邀请码门禁；身份层（`AUTH_ENABLED`）是可选的另一层，且没有监控告警、多副本**，别把它当"上线完成"——
 缺口清单见 [上线清单.md](docs/上线清单.md) 第六节。
 
 ---
@@ -617,6 +622,57 @@ URL；回答按纯文本渲染，不走 `innerHTML`。细节和限制见
 
 ---
 
+## 身份与权限（`AUTH_ENABLED`）
+
+默认关闭：本地 CLI / Streamlit 演示不需要登录。**对公网提供 API 或后台时必须打开**，
+否则"会话属于谁"只是一句注释。
+
+打开后是三档有序角色：
+
+| 角色 | 能做什么 |
+|---|---|
+| `customer` | 只能用自己的 `session_id` 问答；拿别人的会话号一律 404 |
+| `agent` | 客服人员（当前与 customer 同权，预留给工单/客户查询） |
+| `admin` | 额外可看 `/trace`、在后台审核退货 |
+
+```bash
+# token 只在创建时打印一次；服务端只存 SHA-256，不存明文
+uv run python -m ecom.auth.cli create --name alice --role admin
+# → 打印 p_xxx / alice / admin，以及一行 TOKEN
+
+uv run python -m ecom.auth.cli list
+uv run python -m ecom.auth.cli revoke alice
+uv run python -m ecom.auth.cli audit --limit 20
+```
+
+接口用法：
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"question":"订单 52644 到哪了"}' \
+     http://127.0.0.1:8000/chat
+```
+
+- `/chat`、`/chat/stream`：任何有效 token；`X-API-Key` 只作为 bearer 的兼容别名。
+- `/trace`：admin 角色；customer 得到 403（不是 404——这里是"有权限要求"，
+  而不是隐藏资源存在性）。
+- 会话：`sessions.owner_id` 记录 principal；别人的 `session_id` 一律 404。
+  老库里 `owner_id=''` 的会话会被第一个拿它的 principal 认领（迁移用）。
+- 后台：`admin.py` 改成输入 admin token，审核人自动取 `principal.name`；
+  `returns.review_return` 在 `AUTH_ENABLED=1` 时写一条 `return.review` 审计。
+- 审计表 `audit_log` 在 `data/orchestrator/auth.db`，和 `sessions.db` 分开：
+  一个是"用户说过的话"，一个是"谁做了什么"，保留策略不该共用一个。
+
+**边界（别把它说大）**：
+
+- 没有登录页 / 密码找回 / MFA：token 由管理员生成、手工交付；
+- 没有过期时间，只能 `revoke`；轮换 = 新建 + 吊销旧 token；
+- 没有组织 / 多租户；`agent` 目前和 `customer` 同权；
+- MCP 仍只走 stdio，信任模型是"能拉起本进程的人"，不走这套 HTTP 身份。
+
+---
+
 ## 后台（`admin.py`）
 
 ```bash
@@ -779,10 +835,34 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 
 ---
 
+## 路由评测
+
+路由以前只有"真跑那次看起来对"，没有可复跑的分数。现在有一份 50 题的人工标注集
+（`data/orchestrator/router_eval.jsonl`）和一个离线评测 CLI：
+
+```bash
+uv run python -m ecom.orchestrator.cli.eval_router                 # 规则基线，不联网
+uv run python -m ecom.orchestrator.cli.eval_router --show-errors   # 列出错题
+uv run python -m ecom.orchestrator.cli.eval_router --llm --limit 20  # 真模型（花钱）
+```
+
+规则基线的当前结果（2026-10-30，50 题）：
+
+```
+exact   41/50（82.0%）　covered 42/50（84.0%）
+```
+
+`exact` 是计划集合完全相等；`covered` 是"期望的 worker 全被调到了"（多带不算错）。
+错题集中在三类：没有关键词的口语（"我要退货"）、把"发货方式延迟"误判成订单、
+以及 8 位发票号被当成订单号。**这些是规则层的边界，不是 bug 清单**——它们正是
+`--llm` 模式要覆盖的部分；改题让分数变好不算修好。
+
+---
+
 ## 测试
 
 ```bash
-uv run pytest        # 730 条（--all-extras 实测：728 passed / 2 skipped；条数以当次输出为准）
+uv run pytest        # 747 条（--all-extras 实测：745 passed / 2 skipped；条数以当次输出为准）
 uv run ruff check .
 ```
 
@@ -853,7 +933,7 @@ CI 现在有两个 job：`lint-and-test`（ruff + pytest）和 `frontend`（`npm
 | ✅ | **真实 Streamlit 运行时** | 真跑：`streamlit.testing.v1.AppTest` 把两个入口跑完，6 条全绿。**这补上了原来那一栏 ❌** |
 | ✅ | **合并后的 `API`（FastAPI）真起服务** | 容器内真起 uvicorn：`/health` 200（含 workers + order_db）、`/openapi.json` 元数据齐、空问题 422、`/trace/不存在` 404、真提问 200（257+29 token / 1.2s）。**这一条走了网络、花了 token**，不属于"测试不联网"那一栏 |
 | ✅ | **Milvus 那条代码路径** | 真跑：连宿主常驻的 v2.5.5，`ecom_verify_<随机>` 临时集合走完 add / count / search / delete / drop，**零残留**（另有一条专门查残留）。⚠️ 见下面的版本错位 |
-| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 10 条**，现在宿主 `.venv`（`--all-extras`）上是 **730 条 / 728 passed / 2 skipped**，`ruff` 干净（这批的 GitHub CI 还没跑过；workflow 里已经加了前端构建 job） |
+| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 10 条**，现在宿主 `.venv`（`--all-extras`）上是 **747 条 / 745 passed / 2 skipped**，`ruff` 干净（这批的 GitHub CI 还没跑过；workflow 里已经加了前端构建 job） |
 | ✅ | **L1 只读 / 邀请码 / 预算闸门** | 真跑：32 条测试覆盖 fail closed 的邀请码、每客户端限流、跨重连的 token 账本、损坏账本拒绝花钱、路由不选 analytics、退货在落库前被挡、API 429 与 trace 404、界面门禁与建议语。**只验证了代码层**；下面那栏是部署文件 |
 | ✅ | **公网演示编排能解析** | 真跑：`docker compose --env-file .env.prod -f docker-compose.prod.yml config --quiet` 退出 0（临时 `.env.prod` 校验后已删）；Caddyfile 用 `caddy:2.10-alpine caddy validate` 通过（健康检查那条 `context canceled` 是校验时没有 app 容器，属预期）。**没有真部署**：没有域名和公网服务器，HTTPS 证书签发、Caddy→app 转发、公网可达都**没验过** |
 | ✅ | **CI 本身真跑绿了** | 真跑：[run #38132662970](https://github.com/My16210/ecommerce-multi-agent-cs/actions/runs/38132662970)（2026-10-11）——`ruff: All checks passed!`，`pytest: 517 passed, 3 skipped, 15.06s`，和本机干净 checkout 预演的数字一致。**这一栏原来是 ❌**：工作流写过、命令本地验过，但没推上去就一次都没真跑过。<br>真跑还多抓到两处**本地永远看不出来**的东西：① `python-version-file` 这个输入名**不存在**，setup-uv 只打一条 warning 就忽略它，workflow 照样绿、看着像钉住了版本；② `astral-sh/setup-uv` **没有 `v10` 这个大版本 tag**（它的可移动大版本 tag 只发到 v7），钉 `@v10` 会让 job 在 "Set up job" 阶段就红，得钉精确的 `@v10.3.0`。两处都改成实测过的写法 |
@@ -896,7 +976,7 @@ CI 现在有两个 job：`lint-and-test`（ruff + pytest）和 `frontend`（`npm
 - **会话过期要有外挂的 cron，长驻进程不会自我清理。** 过期只在两处触发：进程启动时一次、CLI 显式调用。**不做**懒加载式的"读的时候顺手删"——那会让读操作产生写副作用，出问题时极难定位。这个代价是**换来的**，不是漏掉的。同一台机器跑三个副本的话，各自清各自的。
 - **跨轮指代消解只做"订单号"这一种实体，而且只在指代词出现时才触发。** 这条原来叫"路由不解析代词回指"（真跑 `/chat` 时发现的，不是推测）：带历史追问「那它的金额是多少」，历史**确实进了 prompt**（token 从 257 涨到 387），但路由第一层是关键词规则，`plan` 是空的，于是答了"没听明白"。**现在修了**，判定集中在 [`utils/entities.py`](ecom/orchestrator/utils/entities.py)，router 的规则层和 order worker 走同一个函数（细节见上面「会话持久化」一节）。三条边界，都是有意的：**（1）只有订单号**会被携带，金额 / 商品名没做；**（2）读操作可以回退到携带来的号，写操作 `create_return` 不可以**（所以它永远**不会**替用户对一笔猜出来的订单提交退货）；**（3）携带只覆盖最近 `HISTORY_TURNS` 条用户发言**。它**不解决**"聊久了早期信息滑出窗口"——那是会话内长期记忆，见上面「会话内长期记忆：蒸馏 + 按需召回」一节。
 - **Milvus 客户端与服务端版本错位**。本机常驻的服务端是 **v2.5.5**，而 `pyproject.toml` 把 pymilvus pin 在 `>=2.6,<3`、compose 里那个服务是 `milvusdb/milvus:v2.6.24`。实测客户端 2.6 连 2.5.5 服务端这几个接口都能用（验证矩阵里那一行就是跑通的证据），但**这条对应关系没有保证**。真要长期用，服务端该换到 2.6.x 对齐 pin。
-- **`admin.py` 是演示级鉴权**。一个明文口令，没有用户、没有角色、没有审计（"审核人"是界面上手填的一个字符串，填不填都行）。它挡住的是"随手扫到这个端口的人"，**别把它说成"做了权限系统"**。第二层是 compose 里那个 `127.0.0.1` 绑定。
+- **`admin.py` 默认仍是演示级鉴权**。`AUTH_ENABLED=0` 时是一个明文口令，没有用户、没有角色、没有审计（"审核人"是手填字符串）；`AUTH_ENABLED=1` 时改成 admin token + `audit_log`，但仍没有登录页、MFA、token 过期。别把它说成"做了完整权限系统"。第二层是 compose 的 `127.0.0.1` 绑定。
 - **两个界面现在都只绑 `127.0.0.1`**（原来只有 admin 绑，app 发布在 `0.0.0.0` 且无任何鉴权）。app 那条没有口令那一层，所以绑定是它**唯一**的一层。要跨机器演示就 `APP_BIND=0.0.0.0 docker compose up -d`——那一刻是你**自己**决定暴露它，而不是默认敞着。
 
 > **上面这些"已知限制"是散落的。** 如果想知道**它们合起来意味着什么、真上线会先坏在哪里**，
