@@ -8,6 +8,7 @@ import {
   fetchSessions,
   fetchTicket,
   login,
+  logout,
   openHandoff,
   streamChat,
 } from "./api";
@@ -410,8 +411,8 @@ export default function App() {
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
-  /** token 失效：清掉凭证和身份文案。**不自动弹登录框**，避免打断正在看的会话。 */
-  function forgetLogin(): void {
+  /** 清掉本地凭证和身份文案；服务端吊销另行处理。 */
+  function clearLocalLogin(): void {
     writeStored(API_KEY_KEY, "");
     writeStored(IDENTITY_KEY, "");
     writeStored(ROLE_KEY, "");
@@ -420,7 +421,73 @@ export default function App() {
     setWhoami("");
     setRole("");
     setConsoleOpen(false);
+  }
+
+  /**
+   * 把本地会话缓存清成一张空白对话。
+   *
+   * 用在**身份变化**的三个时刻：主动退出、登录成功、手工换 token。同一台
+   * 机器上换账号时，上一个账号的对话不该继续留在侧边栏里——登录后的历史
+   * 是按账号从服务端拉的，本地缓存却是无主的。
+   *
+   * **token 过期不走这里**（`forgetLogin` 只清凭证）：那是一次被动失效，
+   * 正在看的内容突然消失比留着更糟；下一次登录会先把缓存清掉。
+   */
+  function resetLocalHistory(): void {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    loadingSessionsRef.current.clear();
+    const draft = makeConversation();
+    setStore({ conversations: [draft], activeId: draft.id });
+    setInput("");
+    setBusy(false);
+    writeStored(STORE_KEY, "");
+    writeStored(ACTIVE_KEY, "");
+    writeStored(LEGACY_SESSION_KEY, "");
+  }
+
+  /**
+   * 服务端吊销当前 token。**尽力而为**：网络不通、服务端已经判它失效，
+   * 都不能阻止本地退出——否则用户会被困在登录态里。
+   */
+  function revokeToken(token: string): void {
+    if (!token) return;
+    void logout(token).catch(() => undefined);
+  }
+
+  /** token 失效：清掉凭证和身份文案。**不自动弹登录框**，避免打断正在看的会话。 */
+  function forgetLogin(): void {
+    revokeToken(apiKey);
+    clearLocalLogin();
     setError("登录已过期，请重新登录。");
+  }
+
+  /**
+   * 用户主动退出：吊销服务端 token，并清掉本地凭证与会话缓存。
+   *
+   * 本地永远先退干净——网络不通不能把人困在登录态。服务端的结果只用来
+   * 补一句提示：**长期 API token 不会被 `/auth/logout` 吊销**，这时必须
+   * 告诉用户，否则"已退出"是个假的安心。
+   */
+  async function doLogout(): Promise<void> {
+    const token = apiKey;
+    clearLocalLogin();
+    resetLocalHistory();
+    setError("");
+    setSettingsOpen(false);
+    if (!token) return;
+    try {
+      const result = await logout(token);
+      if (!result.revoked && !result.alreadyInvalid) {
+        setError(
+          "已退出本地登录。这枚是长期 API token，服务端不会因登出失效；要真正吊销请让管理员运行 python -m ecom.auth.cli rotate <账号>。",
+        );
+      }
+    } catch {
+      setError(
+        "已退出本地登录；服务端吊销没有确认（网络异常），登录 token 会在到期后自动失效。",
+      );
+    }
   }
 
   /**
@@ -775,6 +842,8 @@ export default function App() {
       setRole("");
       // 换 token 可能等于换成普通用户：客服台按钮要跟着消失，不能等刷新。
       setConsoleOpen(false);
+      // 凭证变了就是身份变了，本地会话缓存不能跨账号留着。
+      resetLocalHistory();
     }
     writeStored(API_KEY_KEY, key);
     writeStored(INVITE_KEY, invite);
@@ -795,6 +864,8 @@ export default function App() {
       // 名字/角色只用于显示，不是凭证；服务端从不读它。
       writeStored(IDENTITY_KEY, identity);
       writeStored(ROLE_KEY, result.role);
+      // 登录可能是换账号：先清掉上一个身份的本地缓存，再由 /sessions 补回来。
+      resetLocalHistory();
       setApiKey(result.token);
       setKeyDraft(result.token);
       setWhoami(identity);
@@ -1035,6 +1106,7 @@ export default function App() {
         <AgentConsole
           open={consoleOpen}
           token={apiKey}
+          role={role}
           onClose={() => setConsoleOpen(false)}
           onUnauthorized={forgetLogin}
         />
@@ -1054,6 +1126,7 @@ export default function App() {
         onApiKey={setKeyDraft}
         onInviteCode={setInviteDraft}
         onLogin={() => void doLogin()}
+        onLogout={doLogout}
         onSave={saveSettings}
         onClose={() => setSettingsOpen(false)}
       />

@@ -205,6 +205,45 @@ def test_handoff_ui_is_wired_end_to_end():
     assert "closeTicket" in console
 
 
+def test_identity_changes_clear_the_local_conversation_cache():
+    """换账号时本地缓存不能跟着走。
+
+    服务端按 owner 过滤会话，但已经加载到内存里的正文在本地是无主的；
+    退出 / 登录 / 手工换 token 这三条路少清一条，都会让上一个账号的对话
+    留在下一个账号的侧边栏里。
+    """
+    source = _read("src/App.tsx")
+    assert "function resetLocalHistory" in source
+    assert source.count("resetLocalHistory();") >= 3
+
+    reset_body = source.split("function resetLocalHistory", 1)[1].split("function ", 1)[0]
+    for key in ("STORE_KEY", "ACTIVE_KEY", "LEGACY_SESSION_KEY"):
+        assert f'writeStored({key}, "")' in reset_body
+
+
+def test_logout_surfaces_that_a_long_lived_token_was_not_revoked():
+    """`revoked: false` 不能翻译成"已安全退出"。
+
+    长期 API token 没有登录会话，`/auth/logout` 吊销不了它；前端清掉本地
+    凭证后仍必须告诉用户这枚 token 还有效，否则是一次假的安心。
+    """
+    api_source = _read("src/api.ts")
+    app_source = _read("src/App.tsx")
+    assert "interface LogoutResult" in api_source
+    assert "alreadyInvalid" in api_source
+    assert "长期 API token" in app_source
+    assert "ecom.auth.cli rotate" in app_source
+
+
+def test_caddy_sets_csp_and_denies_framing():
+    """生产入口的安全头不能被改掉：CSP 防注入，frame-ancestors 防点击劫持。"""
+    caddy = (FRONTEND.parent / "Caddyfile").read_text(encoding="utf-8")
+    assert "Content-Security-Policy" in caddy
+    assert "frame-ancestors 'none'" in caddy
+    assert 'X-Frame-Options "DENY"' in caddy
+    assert "Permissions-Policy" in caddy
+
+
 def test_mount_frontend_serves_index_from_temp_dist(tmp_path):
     dist = tmp_path / "dist"
     dist.mkdir()

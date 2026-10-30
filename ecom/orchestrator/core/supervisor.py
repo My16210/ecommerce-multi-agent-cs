@@ -198,6 +198,22 @@ def _recursion_limit() -> dict:
     return {"recursion_limit": MAX_ROUNDS * 4 + 6}
 
 
+def _total_tokens(final: dict) -> dict:
+    """
+    汇总一次请求（可能有多轮、多个 worker）花掉的 token。
+
+    **算所有轮次**，不是最后一轮——重路由那一轮也花了钱，只算最后一轮
+    会让成本表比真实成本低。`_finalize()` 和流式中断时的记账共用这一份，
+    避免两条路各算各的、迟早分叉。
+    """
+    total = dict(EMPTY)
+    for result in final.get("results") or []:
+        total = add(total, result.get("tokens") or EMPTY)
+    total = add(total, final.get("router_tokens") or EMPTY)
+    total = add(total, final.get("synth_tokens") or EMPTY)
+    return total
+
+
 def _finalize(final: dict, question: str, request_id: str, record: bool) -> dict:
     """
     收尾：算总账、写 trace、打日志。
@@ -206,15 +222,9 @@ def _finalize(final: dict, question: str, request_id: str, record: bool) -> dict
     （一边把重路由那轮算进去、另一边忘了），而 trace 一旦写两次，成本表的
     分母也会翻倍。这是"回答路径只有一条"这句话的落点。
     """
-    # 记账要算**所有轮次**的调用，不是最后一轮的——重路由那一轮也花了钱，
-    # 只算最后一轮会让成表比真实成本低。
-    results = final.get("results") or []
-    total = dict(EMPTY)
-    for r in results:
-        total = add(total, r.get("tokens") or EMPTY)
-    total = add(total, final.get("router_tokens") or EMPTY)
-    total = add(total, final.get("synth_tokens") or EMPTY)
+    total = _total_tokens(final)
     final["tokens"] = total
+    results = final.get("results") or []
 
     if record:
         trace.record(
@@ -293,7 +303,7 @@ def answer(question: str, chat_history: list = None, workers: dict = None,
 
 def answer_stream(question: str, chat_history: list = None, workers: dict = None,
                   router_llm=None, synth_llm=None, record: bool = True,
-                  customer_id: str = ""):
+                  customer_id: str = "", on_usage=None):
     """
     跑一次完整问答，并把**最终答复的增量**和**思考过程**边生成边交出来（生成器）。
 
@@ -332,9 +342,29 @@ def answer_stream(question: str, chat_history: list = None, workers: dict = None
     【记账只有一处】
     收尾走 `_finalize()`，和 `answer()` 是同一份：trace 只写一条、token 只
     汇总一次。所以"加了一条流式路径"没有变成"两份成本账"。
+
+    【中途断开也要记账】
+    `on_usage(tokens)` 在**正常结束或生成器被提前关闭**时都会收到一次总量。
+    客户端断线时 Starlette 会关闭这个生成器，之前的实现会连已经花掉的
+    token 一起丢掉——预算就多了一个"发完请求立刻断开"的绕过口。现在在
+    循环的 `finally` 里用最后一个 values 帧结算，账单不会因为没人看完而消失。
     """
     question = _prepare_question(question)
     request_id = trace.new_request_id()
+    billed = False
+
+    def report_usage(state: dict) -> None:
+        """把这一单的 token 交给调用方。只报一次，异常不能拖垮回答。"""
+        nonlocal billed
+        if billed:
+            return
+        billed = True
+        if on_usage is None:
+            return
+        try:
+            on_usage(_total_tokens(state))
+        except Exception:  # noqa: BLE001 —— 记账失败只记日志，见 answer_stream 文档
+            logger.exception("上报请求 %s 的 token 用量失败", request_id)
 
     started = time.perf_counter()
     yield {"type": "start", "request_id": request_id}
@@ -351,6 +381,7 @@ def answer_stream(question: str, chat_history: list = None, workers: dict = None
     # delta→final），消费方不需要为"这一轮没建图"写分支。
     if wants_human(question):
         final = _finalize(_handoff_state(request_id), question, request_id, record)
+        report_usage(final)
         yield stage("用户明确要求人工客服，跳过路由。\n")
         yield {"type": "delta", "text": final["answer"]}
         yield {
@@ -376,69 +407,76 @@ def answer_stream(question: str, chat_history: list = None, workers: dict = None
     last_decision = ""
     # stream_mode 给两种：custom 是汇总节点推出来的增量，values 是每一步之后
     # 的完整 state。最后一帧 values 就是 answer() 里 invoke() 拿到的那个 dict。
-    for mode, chunk in app.stream(
-        state, config=_recursion_limit(), stream_mode=["custom", "values"]
-    ):
-        if mode == "custom":
-            if not isinstance(chunk, dict):
-                continue
-            if chunk.get("type") == "delta":
-                emitted = True
-                yield chunk
-            elif chunk.get("type") == "thinking":
-                thinking.append(str(chunk.get("text") or ""))
-                yield chunk
-        elif mode == "values":
-            final_state = chunk
-            round_no = int(chunk.get("round") or 0)
+    try:
+        for mode, chunk in app.stream(
+            state, config=_recursion_limit(), stream_mode=["custom", "values"]
+        ):
+            if mode == "custom":
+                if not isinstance(chunk, dict):
+                    continue
+                if chunk.get("type") == "delta":
+                    emitted = True
+                    yield chunk
+                elif chunk.get("type") == "thinking":
+                    thinking.append(str(chunk.get("text") or ""))
+                    yield chunk
+            elif mode == "values":
+                final_state = chunk
+                round_no = int(chunk.get("round") or 0)
 
-            if round_no and round_no != last_round:
-                last_round = round_no
-                # 重路由：上一轮可能已经流出了半段答案（单 worker 直流的代价），
-                # 那一段不再属于最终答复。显式让消费方清空，而不是靠下一次
-                # delta 往上拼——拼出来的会是两轮答案的混合。
-                if emitted:
-                    emitted = False
-                    yield {"type": "reset"}
-                plan = chunk.get("plan") or []
-                labels = "、".join(
-                    aggregate_mod.WORKER_LABELS.get(name, name) for name in plan
-                ) or "无"
-                source = _ROUTER_SOURCE_LABELS.get(
-                    str(chunk.get("router_source") or ""), "路由"
-                )
-                line = f"第 {round_no} 轮 · {source}：{labels}"
-                confidence = chunk.get("plan_confidence")
-                if isinstance(confidence, (int, float)) and confidence:
-                    line += f"（置信度 {confidence:.2f}）"
-                reason = str(chunk.get("plan_reason") or "").strip()
-                if reason:
-                    line += f"\n  {reason}"
-                yield stage(line + "\n")
-
-            results = chunk.get("results") or []
-            if len(results) > seen_results:
-                for result in results[seen_results:]:
-                    label = aggregate_mod.WORKER_LABELS.get(
-                        result.get("worker"), result.get("worker") or "单元"
+                if round_no and round_no != last_round:
+                    last_round = round_no
+                    # 重路由：上一轮可能已经流出了半段答案（单 worker 直流的代价），
+                    # 那一段不再属于最终答复。显式让消费方清空，而不是靠下一次
+                    # delta 往上拼——拼出来的会是两轮答案的混合。
+                    if emitted:
+                        emitted = False
+                        yield {"type": "reset"}
+                    plan = chunk.get("plan") or []
+                    labels = "、".join(
+                        aggregate_mod.WORKER_LABELS.get(name, name) for name in plan
+                    ) or "无"
+                    source = _ROUTER_SOURCE_LABELS.get(
+                        str(chunk.get("router_source") or ""), "路由"
                     )
-                    if result.get("ok") is False:
-                        line = f"「{label}」失败：{result.get('error') or '未知错误'}"
-                    elif result.get("insufficient"):
-                        line = f"「{label}」没有找到足够的信息"
-                    else:
-                        line = f"「{label}」完成（{int(result.get('elapsed_ms') or 0)} ms）"
+                    line = f"第 {round_no} 轮 · {source}：{labels}"
+                    confidence = chunk.get("plan_confidence")
+                    if isinstance(confidence, (int, float)) and confidence:
+                        line += f"（置信度 {confidence:.2f}）"
+                    reason = str(chunk.get("plan_reason") or "").strip()
+                    if reason:
+                        line += f"\n  {reason}"
                     yield stage(line + "\n")
-                seen_results = len(results)
 
-            decision = str(chunk.get("decision") or "")
-            if decision and decision != last_decision:
-                last_decision = decision
-                line = f"决策：{_DECISION_LABELS.get(decision, decision)}"
-                reason = str(chunk.get("decision_reason") or "").strip()
-                if reason:
-                    line += f"（{reason}）"
-                yield stage(line + "\n")
+                results = chunk.get("results") or []
+                if len(results) > seen_results:
+                    for result in results[seen_results:]:
+                        label = aggregate_mod.WORKER_LABELS.get(
+                            result.get("worker"), result.get("worker") or "单元"
+                        )
+                        if result.get("ok") is False:
+                            line = f"「{label}」失败：{result.get('error') or '未知错误'}"
+                        elif result.get("insufficient"):
+                            line = f"「{label}」没有找到足够的信息"
+                        else:
+                            line = f"「{label}」完成（{int(result.get('elapsed_ms') or 0)} ms）"
+                        yield stage(line + "\n")
+                    seen_results = len(results)
+
+                decision = str(chunk.get("decision") or "")
+                if decision and decision != last_decision:
+                    last_decision = decision
+                    line = f"决策：{_DECISION_LABELS.get(decision, decision)}"
+                    reason = str(chunk.get("decision_reason") or "").strip()
+                    if reason:
+                        line += f"（{reason}）"
+                    yield stage(line + "\n")
+    finally:
+        # 正常跑完和客户端断线都会经过这里：用最后一帧结算已经花掉的 token。
+        # `billed` 保证只上报一次；放在 `_finalize()` 之前，trace 落盘失败也
+        # 不会把账丢掉。
+        if not billed:
+            report_usage(final_state or {})
 
     final = _finalize(final_state or {}, question, request_id, record)
 

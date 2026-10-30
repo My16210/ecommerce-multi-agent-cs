@@ -157,6 +157,98 @@ def test_deleting_a_session_deletes_its_ticket(store):
     assert tickets.list_tickets(status="all") == []
 
 
+def test_agent_sees_open_queue_but_not_other_peoples_claimed_or_closed(store):
+    sid_claimed = _owned_session(store, first="别人接手的")
+    sid_closed = _owned_session(store, first="别人关掉的")
+    sid_open = _owned_session(store, first="还在排队")
+
+    claimed = tickets.open_ticket(sid_claimed, "p_demo", "")
+    closed = tickets.open_ticket(sid_closed, "p_demo", "")
+    opened = tickets.open_ticket(sid_open, "p_demo", "")
+
+    tickets.claim_ticket(claimed["ticket_id"], "p_a", "小 A")
+    tickets.claim_ticket(closed["ticket_id"], "p_a", "小 A")
+    tickets.close_ticket(closed["ticket_id"], "p_a")
+
+    # 排队中的所有人都要看见（不看前因没法决定接不接）。
+    assert [t["ticket_id"] for t in tickets.list_tickets(
+        status="open", viewer_id="p_b"
+    )] == [opened["ticket_id"]]
+    # 别人接手的、别人关掉的，列表里不出现。
+    assert tickets.list_tickets(status="claimed", viewer_id="p_b") == []
+    assert tickets.list_tickets(status="closed", viewer_id="p_b") == []
+    # 自己的能看到，admin 不受限制。
+    assert [t["ticket_id"] for t in tickets.list_tickets(
+        status="claimed", viewer_id="p_a"
+    )] == [claimed["ticket_id"]]
+    assert len(tickets.list_tickets(status="all", viewer_id="p_a", is_admin=True)) == 3
+
+    # 详情走的是另一条路，必须与列表同口径，否则绕过列表就能读全文。
+    # 注意要拿**刷新后的行**：open_ticket 返回的是开单那一刻的快照。
+    claimed = tickets.get_ticket(claimed["ticket_id"])
+    closed = tickets.get_ticket(closed["ticket_id"])
+    assert tickets.can_view(opened, "p_b") is True
+    assert tickets.can_view(claimed, "p_b") is False
+    assert tickets.can_view(claimed, "p_a") is True
+    assert tickets.can_view(closed, "p_b") is False
+    assert tickets.can_view(closed, "p_a") is True
+    assert tickets.can_view(claimed, "p_b", is_admin=True) is True
+
+
+def test_admin_can_force_close_an_unclaimed_ticket(store):
+    sid = _owned_session(store)
+    ticket = tickets.open_ticket(sid, "p_demo", "")
+
+    with pytest.raises(tickets.TicketConflict):
+        tickets.close_ticket(ticket["ticket_id"], "p_admin")
+
+    closed = tickets.close_ticket(ticket["ticket_id"], "p_admin", allow_override=True)
+    assert closed["status"] == "closed"
+    assert closed["closed_by"] == "p_admin"
+    assert closed["claimed_by"] is None
+
+
+def test_transfer_reassigns_and_release_puts_it_back_in_the_queue(store):
+    sid = _owned_session(store)
+    ticket = tickets.open_ticket(sid, "p_demo", "")
+    tickets.claim_ticket(ticket["ticket_id"], "p_a", "小 A")
+
+    moved = tickets.transfer_ticket(
+        ticket["ticket_id"], {"id": "p_b", "name": "小 B"}
+    )
+    assert moved["status"] == "claimed"
+    assert moved["claimed_by"] == "p_b"
+    assert moved["claimed_by_name"] == "小 B"
+    assert moved["queue_position"] == 0
+
+    # 原认领人已经不能再回 / 关。
+    with pytest.raises(tickets.TicketConflict):
+        tickets.reply_ticket(ticket["ticket_id"], "p_a", "小 A", "旧客服插话")
+    with pytest.raises(tickets.TicketConflict):
+        tickets.close_ticket(ticket["ticket_id"], "p_a")
+
+    released = tickets.transfer_ticket(ticket["ticket_id"], None)
+    assert released["status"] == "open"
+    assert released["claimed_by"] is None
+    assert released["claimed_by_name"] is None
+    assert released["claimed_at"] is None
+    assert released["queue_position"] == 0
+
+    # 已经回到队列的单再放一次是幂等的，不该报错（admin 点重了很常见）。
+    again = tickets.transfer_ticket(ticket["ticket_id"], None)
+    assert again["status"] == "open"
+
+
+def test_closed_ticket_cannot_be_transferred(store):
+    sid = _owned_session(store)
+    ticket = tickets.open_ticket(sid, "p_demo", "")
+    tickets.claim_ticket(ticket["ticket_id"], "p_a", "小 A")
+    tickets.close_ticket(ticket["ticket_id"], "p_a")
+
+    with pytest.raises(tickets.TicketConflict):
+        tickets.transfer_ticket(ticket["ticket_id"], {"id": "p_b", "name": "小 B"})
+
+
 def test_purge_takes_the_tickets_with_it(store):
     from datetime import datetime, timedelta
 

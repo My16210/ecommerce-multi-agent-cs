@@ -330,6 +330,43 @@ def test_streaming_records_exactly_one_trace_line(monkeypatch):
     assert recorded[0]["tokens"] == events[-1]["state"]["tokens"]
 
 
+def test_streaming_reports_usage_exactly_once_on_completion():
+    """正常看完一条流，`on_usage` 只收到一次，数值和 final.state 对齐。"""
+    usage = []
+    events = list(
+        answer_stream(
+            "订单 52644 到哪了",
+            workers=workers(),
+            router_llm=FakeLLM('{"workers": ["order"], "confidence": 1.0}'),
+            record=False,
+            on_usage=usage.append,
+        )
+    )
+    assert usage == [events[-1]["state"]["tokens"]]
+
+
+def test_streaming_reports_usage_when_the_client_disconnects_early():
+    """断线不能把已经花掉的路由 token 漏掉——这是预算的绕道口。"""
+    usage = []
+    stream = answer_stream(
+        "订单 52644 到哪了",
+        workers=workers(),
+        router_llm=FakeLLM(
+            '{"workers": ["order"], "confidence": 1.0}',
+            usage={"input_tokens": 7, "output_tokens": 3},
+        ),
+        record=False,
+        on_usage=usage.append,
+    )
+    # 路由那一帧已经处理完（token 已花），但 worker 还没跑完就断开。
+    for event in stream:
+        if event.get("type") == "thinking" and "第 1 轮" in event.get("text", ""):
+            break
+    assert usage == [], "还没到收尾，不该提前记账"
+    stream.close()
+    assert usage == [{"in": 7, "out": 3}]
+
+
 def test_a_dead_synth_model_still_yields_a_complete_answer():
     """汇总挂了 → 退回拼接。流式这条路也必须给出完整答复，而不是半句。"""
     events = list(

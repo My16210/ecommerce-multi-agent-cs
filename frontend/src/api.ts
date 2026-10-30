@@ -35,15 +35,21 @@ export interface StreamChatOptions {
 async function readError(response: Response): Promise<ApiError> {
   let message = `请求失败（HTTP ${response.status}）`;
   let requestId = "";
+  let fromServer = false;
   try {
     const body = await response.json();
-    if (typeof body?.error === "string" && body.error) message = body.error;
+    if (typeof body?.error === "string" && body.error) {
+      message = body.error;
+      fromServer = true;
+    }
     if (typeof body?.request_id === "string") requestId = body.request_id;
   } catch {
     // 响应不是 JSON（例如反向代理返回的 HTML 错误页）：保留状态码那句话。
   }
-  if (response.status === 401) message = "API Key 不正确或没有提供。";
-  if (response.status === 403) message = message || "邀请码不正确。";
+  // 服务端已经给了具体原因（例如“用户名或密码不正确”）就不要覆盖它。
+  // 这句兜底只留给没有结构化错误体的 401——通常来自代理或网关。
+  if (response.status === 401 && !fromServer) message = "API Key 不正确或没有提供。";
+  if (response.status === 403 && !fromServer) message = "邀请码不正确。";
   return new ApiError(message, response.status, requestId);
 }
 
@@ -72,6 +78,40 @@ export async function login(username: string, password: string): Promise<LoginRe
   });
   if (!response.ok) throw await readError(response);
   return (await response.json()) as LoginResult;
+}
+
+export interface LogoutResult {
+  /** 服务端在这次请求里真的吊销了 token（登录会话）。 */
+  revoked: boolean;
+  /** token 在调用前就已经失效（401），不算"没吊销成功"。 */
+  alreadyInvalid: boolean;
+}
+
+/**
+ * 主动登出：让服务端立刻吊销这枚登录 token，而不是等它到期。
+ *
+ * 返回服务端的结果，而不是只抛错：**长期 API token 不在 `/auth/logout`
+ * 的吊销范围内**（它没有登录会话），服务端会返回 `revoked: false`。界面
+ * 必须把这件事说清楚，否则用户会以为自己已经安全退出了，实际上那枚
+ * token 仍然能用到过期。
+ *
+ * 401 说明 token 已经无效，按"无需再吊销"处理；其它错误照常抛。
+ */
+export async function logout(token: string): Promise<LogoutResult> {
+  if (!token) return { revoked: false, alreadyInvalid: true };
+  const response = await fetch("/auth/logout", {
+    method: "POST",
+    headers: sessionHeaders(token),
+  });
+  if (response.status === 401) return { revoked: false, alreadyInvalid: true };
+  if (!response.ok) throw await readError(response);
+  try {
+    const body = (await response.json()) as { revoked?: unknown };
+    return { revoked: body?.revoked === true, alreadyInvalid: false };
+  } catch {
+    // 服务端返回了 2xx 但没有 JSON：不能假装吊销成功。
+    return { revoked: false, alreadyInvalid: false };
+  }
 }
 
 /**
@@ -202,6 +242,22 @@ export async function closeTicket(ticketId: string, token: string): Promise<Tick
   const response = await fetch(`/tickets/${encodeURIComponent(ticketId)}/close`, {
     method: "POST",
     headers: sessionHeaders(token),
+  });
+  if (!response.ok) throw await readError(response);
+  const body = (await response.json()) as { ticket: TicketInfo };
+  return body.ticket;
+}
+
+/** 转派 / 放回队列（admin）。`assignee=null` 表示放回排队。 */
+export async function transferTicket(
+  ticketId: string,
+  token: string,
+  assignee: string | null,
+): Promise<TicketInfo> {
+  const response = await fetch(`/tickets/${encodeURIComponent(ticketId)}/transfer`, {
+    method: "POST",
+    headers: { ...sessionHeaders(token), "Content-Type": "application/json" },
+    body: JSON.stringify({ assignee }),
   });
   if (!response.ok) throw await readError(response);
   const body = (await response.json()) as { ticket: TicketInfo };

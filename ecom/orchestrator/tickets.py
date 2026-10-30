@@ -168,11 +168,21 @@ def get_ticket(ticket_id: str) -> dict | None:
         return _with_position(conn, row) if row is not None else None
 
 
-def list_tickets(status: str = None, limit: int = 50) -> list:
+def list_tickets(
+    status: str = None,
+    limit: int = 50,
+    viewer_id: str = None,
+    is_admin: bool = False,
+) -> list:
     """
     队列。`status=None` / `"all"` 表示全部；否则只认 open/claimed/closed。
 
     排队看的是**最老的在前**（先来先服务）；已关闭的看最近关闭的在前。
+
+    `viewer_id` 不为空时按客服收口：**排队中的所有人可见**（要先看前因才决定
+    认不认领），**进行中 / 已结束的只有自己认领或关闭的可见**。`is_admin=True`
+    不受限制。`viewer_id=None` 表示不加范围（CLI / 单元测试用），API 永远传
+    principal id，不会走到这里的分支。
     """
     filter_status = str(status or "").strip().lower()
     if filter_status in ("", "all"):
@@ -181,11 +191,18 @@ def list_tickets(status: str = None, limit: int = 50) -> list:
         raise TicketError(f"status 只能是 {STATUSES} 或 all")
     limit = max(1, min(int(limit or 50), 200))
 
-    where = ""
+    where_parts: list[str] = []
     args: list = []
     if filter_status:
-        where = "WHERE t.status = ?"
+        where_parts.append("t.status = ?")
         args.append(filter_status)
+    if viewer_id is not None and not is_admin:
+        # 排队中的公开；接手过的（claimed_by）和关过的（closed_by）才算自己的。
+        where_parts.append(
+            "(t.status = 'open' OR t.claimed_by = ? OR t.closed_by = ?)"
+        )
+        args.extend([str(viewer_id), str(viewer_id)])
+    where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     args.append(limit)
 
     order = "t.id DESC" if filter_status == "closed" else "t.id ASC"
@@ -206,6 +223,26 @@ def list_tickets(status: str = None, limit: int = 50) -> list:
             tuple(args),
         ).fetchall()
         return [_with_position(conn, row) for row in rows]
+
+
+def can_view(ticket: dict, viewer_id: str, is_admin: bool = False) -> bool:
+    """
+    这张工单的上下文（transcript）能不能给这个人看。
+
+    · admin：全部可见；
+    · 排队中的：所有客服可见——不看前因没法判断该不该接；
+    · 进行中 / 已结束：只有认领人（或执行关闭的人）可见。
+
+    列表已经按同一口径过滤；这个函数守的是**直接拿 ticket_id 来查详情**的路径，
+    两条路必须一致，否则列表看不见、详情却能读到。
+    """
+    if is_admin:
+        return True
+    if ticket is None or not viewer_id:
+        return False
+    if ticket.get("status") == "open":
+        return True
+    return viewer_id in {ticket.get("claimed_by"), ticket.get("closed_by")}
 
 
 def claim_ticket(ticket_id: str, agent_id: str, agent_name: str) -> dict:
@@ -291,8 +328,14 @@ def reply_ticket(ticket_id: str, agent_id: str, agent_name: str, text: str) -> d
     return {"message_id": message_id}
 
 
-def close_ticket(ticket_id: str, agent_id: str) -> dict:
-    """关掉工单。只有认领人能关（重复关是幂等的）。"""
+def close_ticket(ticket_id: str, agent_id: str, allow_override: bool = False) -> dict:
+    """
+    关掉工单。默认只有认领人能关（重复关是幂等的）。
+
+    `allow_override=True` 只给 admin 的恢复路径用：认领人离职 / 账号被吊销 /
+    忘了关，工单不能因此永远占着这个会话。旁路必须留审计（API 层负责写），
+    不能让"谁对这张单负责"变成一个查不出来的问题。
+    """
     tid = str(ticket_id or "").strip()
     aid = str(agent_id or "").strip()
     with session.transaction() as conn:
@@ -303,7 +346,7 @@ def close_ticket(ticket_id: str, agent_id: str) -> dict:
             raise TicketNotFound(f"没有这个工单：{tid}")
         if row["status"] == "closed":
             return _with_position(conn, row)
-        if row["claimed_by"] != aid:
+        if not allow_override and row["claimed_by"] != aid:
             raise TicketConflict("只有认领人可以关闭这张工单")
         now = _now()
         conn.execute(
@@ -311,6 +354,52 @@ def close_ticket(ticket_id: str, agent_id: str) -> dict:
             "updated_at = ? WHERE ticket_id = ?",
             (now, aid, now, tid),
         )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM tickets WHERE ticket_id = ?", (tid,)
+        ).fetchone()
+        return _with_position(conn, row)
+
+
+def transfer_ticket(ticket_id: str, assignee: dict = None) -> dict:
+    """
+    把工单转给另一个客服；`assignee=None` 表示**放回队列**（清空认领）。
+
+    只给 admin 用，API 层校验角色。转派会把 `claimed_at` 重置为现在——
+    "这张单从什么时候开始归我"必须能从数据里读出来；放回队列则把三个
+    claimed_* 字段一起清空，排队位置按 `id` 重新算。
+    """
+    tid = str(ticket_id or "").strip()
+    with session.transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM tickets WHERE ticket_id = ?", (tid,)
+        ).fetchone()
+        if row is None:
+            raise TicketNotFound(f"没有这个工单：{tid}")
+        if row["status"] == "closed":
+            raise TicketConflict("工单已关闭，不能转派")
+
+        now = _now()
+        if assignee is None:
+            conn.execute(
+                "UPDATE tickets SET status = 'open', claimed_by = NULL, "
+                "claimed_by_name = NULL, claimed_at = NULL, updated_at = ? "
+                "WHERE ticket_id = ?",
+                (now, tid),
+            )
+        else:
+            conn.execute(
+                "UPDATE tickets SET status = 'claimed', claimed_by = ?, "
+                "claimed_by_name = ?, claimed_at = ?, updated_at = ? "
+                "WHERE ticket_id = ?",
+                (
+                    str(assignee.get("id") or ""),
+                    str(assignee.get("name") or "")[:64],
+                    now,
+                    now,
+                    tid,
+                ),
+            )
         conn.commit()
         row = conn.execute(
             "SELECT * FROM tickets WHERE ticket_id = ?", (tid,)

@@ -345,6 +345,27 @@ def issue_session(principal: dict, ttl_hours: float = None) -> dict:
     return {"token": plain, "expires_at": expires_at}
 
 
+def revoke_token(token: str) -> bool:
+    """
+    吊销一枚**登录会话** token，返回是否真的吊销了一条。
+
+    长期 API token（`principals.token_hash`）不在这里处理：它是账号的根凭证，
+    吊销它等于把该账号所有设备一起踢下线，应该走 `rotate_principal` 显式轮换。
+    登出只结束当前这枚短期 token。
+    """
+    plain = str(token or "").strip()
+    if not plain:
+        return False
+    now = _stamp(_now())
+    with closing(_connect()) as conn:
+        cursor = conn.execute(
+            "UPDATE auth_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+            (now, _hash(plain)),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
 def purge_sessions() -> int:
     """删掉过期/已吊销的登录会话，返回删除条数。启动时和 CLI 都可以调。"""
     now = _stamp(_now())

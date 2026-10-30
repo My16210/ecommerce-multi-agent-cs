@@ -17,6 +17,8 @@ interface SettingsDialogProps {
   onApiKey: (value: string) => void;
   onInviteCode: (value: string) => void;
   onLogin: () => void;
+  /** 主动退出：吊销服务端 token 并清本地凭证。 */
+  onLogout: () => void;
   onSave: () => void;
   onClose: () => void;
 }
@@ -35,6 +37,7 @@ export function SettingsDialog({
   onApiKey,
   onInviteCode,
   onLogin,
+  onLogout,
   onSave,
   onClose,
 }: SettingsDialogProps) {
@@ -99,6 +102,11 @@ export function SettingsDialog({
               </div>
               <div className="settings-inline">
                 <p>密码只在这次请求里出现，不会被保存。登录后侧边栏会恢复该账号的历史会话。</p>
+                {whoami && (
+                  <button className="ghost-btn" type="button" onClick={onLogout}>
+                    退出登录
+                  </button>
+                )}
                 <button
                   className="secondary-btn"
                   type="button"

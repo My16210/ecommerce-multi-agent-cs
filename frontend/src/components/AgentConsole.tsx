@@ -7,6 +7,7 @@ import {
   fetchTicketDetail,
   fetchTickets,
   replyTicket,
+  transferTicket,
 } from "../api";
 import type { TicketDetail, TicketSummary } from "../types";
 import { Icon } from "./Icon";
@@ -28,6 +29,8 @@ const STATUS_LABEL: Record<string, string> = {
 interface AgentConsoleProps {
   open: boolean;
   token: string;
+  /** 当前角色；admin 多出强制关闭和转派两个恢复动作。 */
+  role: string;
   onClose: () => void;
   /** token 失效时交给 App 统一处理（清凭证、提示重新登录）。 */
   onUnauthorized: () => void;
@@ -42,13 +45,15 @@ interface AgentConsoleProps {
  * 只对 agent / admin 显示（按钮在 App 里按角色判断）；服务端仍然会再校验
  * 一次角色——前端藏起来不代表接口关上了。
  */
-export function AgentConsole({ open, token, onClose, onUnauthorized }: AgentConsoleProps) {
+export function AgentConsole({ open, token, role, onClose, onUnauthorized }: AgentConsoleProps) {
   const [tab, setTab] = useState<Tab>("open");
   const [tickets, setTickets] = useState<TicketSummary[]>([]);
   const [selected, setSelected] = useState<TicketDetail | null>(null);
   const [draft, setDraft] = useState("");
+  const [assignee, setAssignee] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const isAdmin = role === "admin";
 
   function fail(caught: unknown): void {
     if (caught instanceof ApiError && caught.status === 401) {
@@ -100,6 +105,7 @@ export function AgentConsole({ open, token, onClose, onUnauthorized }: AgentCons
       const detail = await fetchTicketDetail(ticket.ticket_id, token);
       setSelected(detail);
       setDraft("");
+      setAssignee("");
     } catch (caught) {
       fail(caught);
     }
@@ -224,11 +230,58 @@ export function AgentConsole({ open, token, onClose, onUnauthorized }: AgentCons
                         disabled={busy}
                         onClick={() => selected && void act(() => closeTicket(selected.ticket_id, token))}
                       >
-                        结束工单
+                        {isAdmin ? "强制关闭" : "结束工单"}
+                      </button>
+                    )}
+                    {isAdmin && selected.status === "open" && (
+                      <button
+                        className="ghost-btn"
+                        type="button"
+                        disabled={busy}
+                        onClick={() => selected && void act(() => closeTicket(selected.ticket_id, token))}
+                      >
+                        强制关闭
                       </button>
                     )}
                   </div>
                 </div>
+
+                {isAdmin && selected.status !== "closed" && (
+                  <div className="transfer-row">
+                    <input
+                      value={assignee}
+                      onChange={(event) => setAssignee(event.target.value)}
+                      placeholder="客服用户名（转派给谁）"
+                      aria-label="转派目标客服用户名"
+                      disabled={busy}
+                    />
+                    <button
+                      className="ghost-btn"
+                      type="button"
+                      disabled={busy || !assignee.trim()}
+                      onClick={() =>
+                        selected &&
+                        void act(() =>
+                          transferTicket(selected.ticket_id, token, assignee.trim()),
+                        )
+                      }
+                    >
+                      转派
+                    </button>
+                    {selected.status === "claimed" && (
+                      <button
+                        className="ghost-btn"
+                        type="button"
+                        disabled={busy}
+                        onClick={() =>
+                          selected && void act(() => transferTicket(selected.ticket_id, token, null))
+                        }
+                      >
+                        放回队列
+                      </button>
+                    )}
+                  </div>
+                )}
 
                 <div className="ticket-transcript">
                   {selected.transcript.map((message) => (

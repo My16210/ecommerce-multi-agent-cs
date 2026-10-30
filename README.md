@@ -164,6 +164,9 @@ uv run python -m ecom.orchestrator.cli.eval_router               # 路由评测�
 > `api.py` 不配 `API_KEY` 就放行。**对外提供 API / 后台时请打开 `AUTH_ENABLED=1`**：
 > `/chat` 要 `Authorization: Bearer <token>`、`/trace` 要 admin 角色、会话按 principal
 > 归属、`admin.py` 改用 admin token。两条路径的取舍见下面「身份与权限」。
+>
+> 设了 `APP_ENV=prod` 之后这条"不配就放行"不再成立：既没开 `AUTH_ENABLED` 也没开
+> `DEMO_MODE` 时，`api.py` / `app.py` 会**拒绝启动**并打印缺哪个变量。
 
 ### 用 Docker 跑（可选）
 
@@ -645,8 +648,8 @@ http/https 链接），只生成 React 元素，不拼 DOM 字符串、不走 `i
 | 角色 | 能做什么 |
 |---|---|
 | `customer` | 只能用自己的 `session_id` 问答；拿别人的会话号一律 404 |
-| `agent` | 客服人员：看转人工队列、认领工单、读该会话上下文、回复、关闭；不能看 `/trace`、不能审核退货 |
-| `admin` | 额外可看 `/trace`、在后台审核退货 |
+| `agent` | 客服人员：看排队中的工单、认领后读该会话上下文、回复、关闭自己的单；别人的进行中/已结束工单不出现在列表里，直查详情 403；不能看 `/trace`、不能审核退货 |
+| `admin` | 额外可看 `/trace`、在后台审核退货，并能在客服台上强制关闭任意未结束工单、转派或放回队列（都写审计） |
 
 ```bash
 # 长期 API token（可设过期天数；0 = 不过期）
@@ -679,6 +682,13 @@ curl -X POST http://127.0.0.1:8000/auth/login \
      -H "Content-Type: application/json" \
      -d '{"username":"alice","password":"..."}'
 # → {"token":"...","expires_at":"...","name":"alice","role":"admin"}
+
+# 退出登录：立刻吊销这枚登录 token，不用等 12 小时自然过期
+curl -X POST http://127.0.0.1:8000/auth/logout \
+     -H "Authorization: Bearer $TOKEN"
+# → {"revoked":true}
+# 长期 API token 没有登录会话可吊销，会返回 {"revoked":false}；
+# 前端会明确提示"本地已退出但 token 仍有效"，真正吊销要用 auth.cli rotate。
 ```
 
 接口用法：
@@ -693,8 +703,25 @@ curl -H "Authorization: Bearer $TOKEN" \
 - `/chat`、`/chat/stream`：任何有效 token；`X-API-Key` 只作为 bearer 的兼容别名。
 - `/trace`：admin 角色；customer 得到 403（不是 404——这里是"有权限要求"，
   而不是隐藏资源存在性）。
-- `/auth/login`：`AUTH_ENABLED=1` 时才存在；密码存 scrypt 哈希，按 IP 限流
-  （10 次/分钟），失败不区分"用户不存在"和"密码错"。
+- `/auth/login`：`AUTH_ENABLED=1` 时才存在；密码存 scrypt 哈希，**按 IP（10 次/分钟）
+  和账号（20 次/分钟）两个桶同时限流**，失败不区分"用户不存在"和"密码错"。
+  默认只信 TCP 对端地址；部署在反代后面时设 `TRUST_PROXY_HEADERS=1`，否则
+  `X-Forwarded-For` 是客户端可伪造的，限流会被换假 IP 绕过。
+- `/auth/logout`：吊销当前登录 token，返回 `{"revoked": true}`。它只结束登录会话；
+  长期 API token 要走 `auth.cli rotate`（这时返回 `{"revoked": false}`，前端会明确
+  告诉用户"本地已退出，但这枚 token 仍然有效"）。没开身份层时和 `/auth/login`
+  一样返回 404。
+- **每个登录账号还有一道成本闸**：`/chat`、`/chat/stream` 默认 **30 次/分钟**
+  （进程内滑动窗口）、**20 万 token/天/账号**，以及**整个部署 100 万 token/天**
+  （SQLite 按 `(day, principal)` 记账再按天求和，重启仍算数）。超了返回 429；
+  账本读不出来时返回 503 而不是放行——成本闸失效要倒向不花钱那一边。变量是
+  `CHAT_RATE_LIMIT_PER_MINUTE`、`CHAT_DAILY_TOKEN_BUDGET`、
+  `CHAT_GLOBAL_DAILY_TOKEN_BUDGET`、`CHAT_USAGE_DB_PATH`。**流式请求中途断开
+  也会结算已经花掉的 token**，不能靠"发完就断"绕过预算。匿名接口没有 principal，
+  不走这道闸：`DEMO_MODE=1` 时由演示闸按 IP 管，没开演示时就没有这层配额。
+- **`APP_ENV=prod` 时启动会 fail closed**：既没开 `AUTH_ENABLED` 也没开
+  `DEMO_MODE`，进程直接拒绝启动并说明缺哪个变量——一个看起来正常、实际裸奔的
+  服务比起不来更危险。
 - `/sessions`、`/sessions/{id}`：登录后回看自己的历史；只按 `owner_id` 过滤，
   别人的会话和不存在的会话都返回 404。`DELETE /sessions/{id}` 删自己的会话，
   演示环境不提供。没开身份层时三个接口都是 404。
@@ -702,7 +729,10 @@ curl -H "Authorization: Bearer $TOKEN" \
   （`POST /sessions/{id}/handoff`，幂等，同一会话同时只有一张未关闭工单）。
   用户在 `POST /tickets/...` 上看不到任何东西；`agent` / `admin` 用
   `GET /tickets?status=open|claimed|closed` 看队列，`claim` / `reply` / `close`
-  走同一套状态机。人工回复写进同一个会话（`role='agent'`），用户刷新就能看到。
+  走同一套状态机。列表和详情同口径：客服只看得到排队中的单，以及自己认领/关闭的
+  单；admin 不受限。`admin` 还能 `POST /tickets/{id}/transfer`（`assignee` 传用户名
+  转派，传 `null` 放回队列）和强制关闭，解决"客服失联后工单卡死"。
+  人工回复写进同一个会话（`role='agent'`），用户刷新就能看到。
   没开身份层或演示模式下这些接口都是 404——不假装有人接待。
 - 客户绑定：principal 上的 `customer_id` 会一路传到订单 worker（`answer(...,
   customer_id=...)`）；查询/写别人的订单会被拒绝，`list_orders` 直接按绑定客户查。
@@ -722,8 +752,8 @@ curl -H "Authorization: Bearer $TOKEN" \
   客户号，订单 worker 只查这个客户名下的单，查/写别人的单一律拒绝；**没绑定**
   （匿名、本地演示）时仍会退回 `_guess_customer` 猜客户号；
 - 没有组织 / 多租户；工单队列是演示级：没有实时推送（用户端 5 秒轮询）、
-  没有转接/升级、没有 SLA 和排队超时、没有客服在线/下班状态，也没有
-  "工单里的客户身份自动绑定到 agent"；
+  没有技能路由 / 升级、SLA 和排队超时、客服在线/下班状态，也没有
+  "工单里的客户身份自动绑定到 agent"；转派只有 admin 手工指定用户名；
 - 历史回看只有列表 / 读 / 删，没有搜索、导出、跨设备同步和多标签页实时刷新；
   思考过程不落盘，重新登录后只恢复问答原文；
 - MCP 仍只走 stdio，信任模型是"能拉起本进程的人"，不走这套 HTTP 身份。
@@ -849,6 +879,11 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 
 - **匿名（`AUTH_ENABLED=0`，默认）**：会话列表放在 `sessionStorage`，每个标签页一份，关掉就没。这不是偷懒——`session_id` 是 bearer token，写进 `localStorage` 等于把凭证留在磁盘上。
 - **登录（`AUTH_ENABLED=1`）**：会话创建时写入 `owner_id`，`/chat` 和 `/sessions` 都按 principal 做归属检查。登录后侧边栏从 `GET /sessions` 恢复历史，**关掉浏览器再登录，记录还在**。正文按需加载，思考过程不落盘。
+- **身份变化时本地缓存会先清空**：主动退出、登录成功、手工换 token 都会把
+  `sessionStorage` 里的会话重置成一张空白对话——账号 A 的对话不该在账号 B
+  登录后还挂在侧边栏里。退出时还会顺手 `POST /auth/logout` 吊销服务端 token；
+  登录成功后由 `GET /sessions` 把该账号的历史补回来。被动过期（token 失效）
+  不清当前视图，避免正在看的内容突然消失；下一次登录仍会先清。
 
 两种模式都保留的边界：
 
@@ -892,9 +927,10 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 4. **没有人工可转时如实说，不假装。** 演示模式或 `AUTH_ENABLED=0` 时工单接口
    一律 404，`_attach_handoff` 把答复换成"当前环境没有开通人工客服（需要登录
    账号）……"，而不是"已转接，请耐心等待"。
-5. **`reply` 要求先认领，`close` 只能是认领人**（admin 也没有强制关闭的旁路：
-   认领后"谁在服务这个用户"只认一个答案；客服失联时由运维删会话/改库处理）。
-   认领后其他人再 `claim` 返回 409，不是悄悄覆盖。
+5. **`reply` 要求先认领，`close` 默认只能是认领人**；admin 有显式的
+   `allow_override` 旁路（强制关闭）和 `transfer`（转派 / 放回队列），两者都写
+   审计。这不是把规则放宽给所有人：客服失联或客户重复排队时，需要一条不用改库
+   的恢复路径。普通客服认领后，其他人再 `claim` 仍返回 409，不是悄悄覆盖。
 
 删除与过期一起级联：`DELETE /sessions/{id}` 和 `purge()` 都会删掉该会话的工单，
 返回值里多一个 `tickets` 计数。
@@ -975,7 +1011,7 @@ exact   46/50（92.0%）　covered 46/50（92.0%）
 ## 测试
 
 ```bash
-uv run pytest        # 818 条（--all-extras 实测：816 passed / 2 skipped；条数以当次输出为准）
+uv run pytest        # 842 条（--all-extras 实测：840 passed / 2 skipped；条数以当次输出为准）
 uv run ruff check .
 ```
 
@@ -1046,7 +1082,7 @@ CI 现在有两个 job：`lint-and-test`（ruff + pytest）和 `frontend`（`npm
 | ✅ | **真实 Streamlit 运行时** | 真跑：`streamlit.testing.v1.AppTest` 把两个入口跑完，6 条全绿。**这补上了原来那一栏 ❌** |
 | ✅ | **合并后的 `API`（FastAPI）真起服务** | 容器内真起 uvicorn：`/health` 200（含 workers + order_db）、`/openapi.json` 元数据齐、空问题 422、`/trace/不存在` 404、真提问 200（257+29 token / 1.2s）。**这一条走了网络、花了 token**，不属于"测试不联网"那一栏 |
 | ✅ | **Milvus 那条代码路径** | 真跑：连宿主常驻的 v2.5.5，`ecom_verify_<随机>` 临时集合走完 add / count / search / delete / drop，**零残留**（另有一条专门查残留）。⚠️ 见下面的版本错位 |
-| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 13 条、登录历史又加了 9 条、**转人工工单又加了 39 条**，现在宿主 `.venv`（`--all-extras`）上是 **818 条 / 816 passed / 2 skipped**，`ruff` 干净（这批的 GitHub CI 还没跑过；workflow 里已经加了前端构建 job） |
+| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 13 条、登录历史又加了 9 条、**转人工工单又加了 39 条**、**生产 fail-closed / 工单权限 / 登出与代理限流又加了 14 条**、**账号配额与登出本地清理又加了 5 条**、**全站日预算 / 断流记账 / CSP 与登出提示又加了 5 条**，现在宿主 `.venv`（`--all-extras`）上是 **842 条 / 840 passed / 2 skipped**，`ruff` 干净（这批的 GitHub CI 还没跑过；workflow 里已经加了前端构建 job） |
 | ✅ | **L1 只读 / 邀请码 / 预算闸门** | 真跑：32 条测试覆盖 fail closed 的邀请码、每客户端限流、跨重连的 token 账本、损坏账本拒绝花钱、路由不选 analytics、退货在落库前被挡、API 429 与 trace 404、界面门禁与建议语。**只验证了代码层**；下面那栏是部署文件 |
 | ✅ | **公网演示编排能解析** | 真跑：`docker compose --env-file .env.prod -f docker-compose.prod.yml config --quiet` 退出 0（临时 `.env.prod` 校验后已删）；Caddyfile 用 `caddy:2.10-alpine caddy validate` 通过（健康检查那条 `context canceled` 是校验时没有 app 容器，属预期）。**没有真部署**：没有域名和公网服务器，HTTPS 证书签发、Caddy→app 转发、公网可达都**没验过** |
 | ✅ | **CI 本身真跑绿了** | 真跑：[run #38132662970](https://github.com/My16210/ecommerce-multi-agent-cs/actions/runs/38132662970)（2026-10-11）——`ruff: All checks passed!`，`pytest: 517 passed, 3 skipped, 15.06s`，和本机干净 checkout 预演的数字一致。**这一栏原来是 ❌**：工作流写过、命令本地验过，但没推上去就一次都没真跑过。<br>真跑还多抓到两处**本地永远看不出来**的东西：① `python-version-file` 这个输入名**不存在**，setup-uv 只打一条 warning 就忽略它，workflow 照样绿、看着像钉住了版本；② `astral-sh/setup-uv` **没有 `v10` 这个大版本 tag**（它的可移动大版本 tag 只发到 v7），钉 `@v10` 会让 job 在 "Set up job" 阶段就红，得钉精确的 `@v10.3.0`。两处都改成实测过的写法 |
@@ -1089,6 +1125,7 @@ CI 现在有两个 job：`lint-and-test`（ruff + pytest）和 `frontend`（`npm
 - **会话过期要有外挂的 cron，长驻进程不会自我清理。** 过期只在两处触发：进程启动时一次、CLI 显式调用。**不做**懒加载式的"读的时候顺手删"——那会让读操作产生写副作用，出问题时极难定位。这个代价是**换来的**，不是漏掉的。同一台机器跑三个副本的话，各自清各自的。
 - **跨轮指代消解只做"订单号"这一种实体，而且只在指代词出现时才触发。** 这条原来叫"路由不解析代词回指"（真跑 `/chat` 时发现的，不是推测）：带历史追问「那它的金额是多少」，历史**确实进了 prompt**（token 从 257 涨到 387），但路由第一层是关键词规则，`plan` 是空的，于是答了"没听明白"。**现在修了**，判定集中在 [`utils/entities.py`](ecom/orchestrator/utils/entities.py)，router 的规则层和 order worker 走同一个函数（细节见上面「会话持久化」一节）。三条边界，都是有意的：**（1）只有订单号**会被携带，金额 / 商品名没做；**（2）读操作可以回退到携带来的号，写操作 `create_return` 不可以**（所以它永远**不会**替用户对一笔猜出来的订单提交退货）；**（3）携带只覆盖最近 `HISTORY_TURNS` 条用户发言**。它**不解决**"聊久了早期信息滑出窗口"——那是会话内长期记忆，见上面「会话内长期记忆：蒸馏 + 按需召回」一节。
 - **Milvus 客户端与服务端版本错位**。本机常驻的服务端是 **v2.5.5**，而 `pyproject.toml` 把 pymilvus pin 在 `>=2.6,<3`、compose 里那个服务是 `milvusdb/milvus:v2.6.24`。实测客户端 2.6 连 2.5.5 服务端这几个接口都能用（验证矩阵里那一行就是跑通的证据），但**这条对应关系没有保证**。真要长期用，服务端该换到 2.6.x 对齐 pin。
+- **账号级问答配额只覆盖 HTTP API，限流不跨副本。** `/chat` 和 `/chat/stream` 对已登录 principal 有每分钟次数、每人每日 token 预算和部署每日总预算（`ecom/chat_quota.py`）；CLI / Streamlit 不经过这道闸，多副本时每分钟计数各算各的。每日预算落 SQLite，跨副本仍有效；账本读不出来时返回 503，宁可停止也不继续花。流式断线会在生成器关闭时结算，但**失败的模型调用如果 provider 没返回 usage，账本仍只能记 0**——这是上游用量缺失，不是本地漏记。
 - **`admin.py` 默认仍是演示级鉴权**。`AUTH_ENABLED=0` 时是一个明文口令，没有用户、没有角色、没有审计；`AUTH_ENABLED=1` 时改成 admin token / 登录会话 + `audit_log`，token 有过期和轮换。React 有登录表单，Streamlit 仍靠粘贴 token；没有 MFA、忘记密码、OIDC。别把它说成"做了完整权限系统"。第二层是 compose 的 `127.0.0.1` 绑定。
 - **两个界面现在都只绑 `127.0.0.1`**（原来只有 admin 绑，app 发布在 `0.0.0.0` 且无任何鉴权）。app 那条没有口令那一层，所以绑定是它**唯一**的一层。要跨机器演示就 `APP_BIND=0.0.0.0 docker compose up -d`——那一刻是你**自己**决定暴露它，而不是默认敞着。
 

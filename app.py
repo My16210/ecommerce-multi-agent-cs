@@ -93,6 +93,7 @@ from typing import NamedTuple
 import streamlit as st
 
 from ecom import demo
+from ecom.auth import settings as auth_settings
 from ecom.knowledge.vector_store import get_vector_store
 from ecom.orchestrator import session
 from ecom.orchestrator.core.supervisor import answer_stream
@@ -111,6 +112,13 @@ st.set_page_config(
     page_icon=":material/shopping_cart:",
     layout="centered",
 )
+
+# 生产环境默认必须 fail closed：没开身份层、也没显式打开只读演示时，拒绝启动。
+# 放在 set_page_config 之后，是为了让错误页仍然有正常的页面标题。
+_runtime_problem = auth_settings.production_problem(demo.enabled())
+if _runtime_problem:
+    st.error(_runtime_problem)
+    st.stop()
 
 
 # ——————————————————————————————————————————————————————————————

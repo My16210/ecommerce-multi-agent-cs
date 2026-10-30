@@ -23,6 +23,13 @@
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
 		X-Content-Type-Options "nosniff"
 		Referrer-Policy "strict-origin-when-cross-origin"
+		# Streamlit 的页面里有内联脚本和样式，所以 script/style 必须留
+		# 'unsafe-inline'；其余来源一律收紧到同源。connect-src 留 ws/wss
+		# 给 Streamlit 自己的 websocket，worker-src 留 blob 给前端 worker。
+		Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; worker-src 'self' blob:"
+		# frame-ancestors 已经够新浏览器用；X-Frame-Options 照顾老浏览器。
+		X-Frame-Options "DENY"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
 		# 不把 Caddy 版本报给外面。
 		-Server
 	}

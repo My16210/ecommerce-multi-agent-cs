@@ -81,7 +81,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from ecom import demo
+from ecom import chat_quota, demo
 from ecom.auth import settings as auth_settings
 from ecom.auth import store as auth_store
 from ecom.orchestrator import memory, session, tickets
@@ -109,12 +109,17 @@ TAGS = [
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """
-    启动时清一次过期会话。
+    启动时先做配置安全检查，再清一次过期会话。
 
     **为什么放在启动而不是"读的时候顺手删"**：懒清理会让一个只读操作产生写
     副作用，出问题（"我的会话怎么没了"）时极难定位。代价是长驻进程不会自我
     清理，所以要外挂一行 cron——这条写进 README 的已知限制。
     """
+    problem = auth_settings.production_problem(demo.enabled())
+    if problem:
+        # 拒绝启动而不是打 warning：一个"看起来正常、实际裸奔"的服务，
+        # 比一个起不来、必须去改配置的服务危险得多。
+        raise RuntimeError(problem)
     result = session.purge()
     # 登录会话也要清一次：它们是短期凭证，过期后留着只会让 auth.db 变大。
     auth_store.purge_sessions()
@@ -185,6 +190,13 @@ class LoginResponse(BaseModel):
     expires_at: str = Field(description="过期时间（本地时间字符串）。")
     name: str = Field(description="principal 名字。")
     role: str = Field(description="customer / agent / admin。")
+
+
+class LogoutResponse(BaseModel):
+    revoked: bool = Field(
+        description="是否真的吊销了一枚登录 token。"
+                    "传长期 API token 时为 false——它不属于登出能结束的凭证。"
+    )
 
 
 class SessionSummary(BaseModel):
@@ -272,6 +284,15 @@ class ReplyRequest(BaseModel):
         max_length=tickets.MAX_REPLY_CHARS,
         description="客服回复的正文。写进用户会话，用户下次打开或轮询时能看到。",
         examples=["你好，我是人工客服小李，订单 52644 已签收，我来帮你确认退款进度。"],
+    )
+
+
+class TicketTransferRequest(BaseModel):
+    assignee: str | None = Field(
+        default=None,
+        max_length=128,
+        description="目标客服的用户名或 principal id；传 `null` 表示放回队列。",
+        examples=["carol", None],
     )
 
 
@@ -449,10 +470,21 @@ def _call_answer(question: str, history: list, customer_id: str) -> dict:
     return answer(question, history)
 
 
-def _call_answer_stream(question: str, history: list, customer_id: str):
-    if "customer_id" in inspect.signature(answer_stream).parameters:
-        return answer_stream(question, history, customer_id=customer_id)
-    return answer_stream(question, history)
+def _call_answer_stream(question: str, history: list, customer_id: str,
+                        on_usage=None):
+    """
+    兼容旧的、只接受两个参数的 `answer_stream` 替身（测试里常见）。
+
+    真实实现多了 `customer_id` 和 `on_usage`；按签名逐个传，而不是硬编码
+    关键字，避免替身函数在收到陌生参数时直接炸掉。
+    """
+    params = inspect.signature(answer_stream).parameters
+    kwargs = {}
+    if "customer_id" in params:
+        kwargs["customer_id"] = customer_id
+    if "on_usage" in params and on_usage is not None:
+        kwargs["on_usage"] = on_usage
+    return answer_stream(question, history, **kwargs)
 
 
 def require_demo_access(
@@ -473,6 +505,30 @@ def require_demo_access(
         raise HTTPException(status_code=403, detail="演示环境需要正确的 X-Invite-Code")
 
 
+def _client_ip(request: Request) -> str:
+    """
+    取限流用的客户端 IP。
+
+    默认只信 TCP 对端（`request.client.host`）。`X-Forwarded-For` 是客户端
+    可以随便写的，默认采信等于把限流键交给攻击者——每个请求换一个假 IP 就能
+    绕过。只有部署在**自己控制的反向代理**后面、并显式设置
+    `TRUST_PROXY_HEADERS=1` 时才读它。
+
+    `X-Forwarded-For` 取最后一跳：代理会把自己看到的对端追加在末尾，最左边
+    才是客户端自报的（可伪造）。前提是只有一层代理；多层时请在代理上覆盖
+    `X-Real-IP`，而不是让这个头一路透传。
+    """
+    if auth_settings.TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
+        if hops:
+            return hops[-1]
+        real = request.headers.get("x-real-ip", "").strip()
+        if real:
+            return real
+    return request.client.host if request.client else "unknown"
+
+
 def _demo_precheck(request: Request) -> None:
     """
     每次问答前的两道闸：限流、每日预算。**都在真正调模型之前**——拦在调用
@@ -480,7 +536,7 @@ def _demo_precheck(request: Request) -> None:
     """
     if not demo.enabled():
         return
-    client = request.client.host if request.client else "unknown"
+    client = _client_ip(request)
     if not demo.allow_request(f"ip:{client}"):
         raise HTTPException(
             status_code=429,
@@ -491,32 +547,84 @@ def _demo_precheck(request: Request) -> None:
         raise HTTPException(status_code=429, detail="今天的演示额度已经用完")
 
 
+def _chat_quota_precheck(principal: dict) -> None:
+    """
+    已登录账号的第三道闸：每人限流 + 每人每日 token 预算 + 全站每日总预算。
+
+    匿名请求（`id` 为空）直接放行——它们由上面的 demo 闸按 IP 管。这道闸
+    必须在调模型之前，理由和 demo 一样：拦在调用之后等于钱已经花了。
+    """
+    principal_id = str(principal.get("id") or "").strip()
+    if not principal_id:
+        return
+    if not chat_quota.allow_request(principal_id):
+        raise HTTPException(
+            status_code=429,
+            detail="请求过于频繁，请稍后再试",
+            headers={"Retry-After": "60"},
+        )
+    try:
+        personal_exhausted = chat_quota.budget_exhausted(principal_id)
+        global_exhausted = chat_quota.global_budget_exhausted()
+    except chat_quota.LedgerUnavailable:
+        # fail closed：读不出用量就不放行，见 ecom/chat_quota.py 的模块说明。
+        raise HTTPException(
+            status_code=503, detail="用量账本暂时不可用，请稍后再试"
+        ) from None
+    if personal_exhausted:
+        raise HTTPException(status_code=429, detail="今天的个人 token 额度已经用完")
+    if global_exhausted:
+        raise HTTPException(status_code=429, detail="今天的全站 token 额度已经用完")
+
+
+def _record_chat_usage(principal: dict, final: dict) -> None:
+    """记账失败不影响这次回答（`add_tokens` 内部只记日志）。"""
+    chat_quota.add_tokens(
+        str(principal.get("id") or "").strip(), final.get("tokens") or {}
+    )
+
+
 # 登录限流：进程内滑动窗口。它挡的是"对着一台实例猜密码"，不是分布式撞库；
 # 真要跨副本，得把这本账挪到共享存储（和 demo 的预算账本同一个道理）。
 _LOGIN_MAX_ATTEMPTS = 10
+# 账号维度放宽一倍：只按 IP 挡不住换 IP 打同一个账号，但账号维度太紧又会
+# 变成"知道用户名就能把别人锁在门外"的拒绝服务。60 秒窗口让这个代价可控。
+_LOGIN_ACCOUNT_MAX_ATTEMPTS = 20
 _LOGIN_WINDOW_SECONDS = 60.0
 _login_hits: dict[str, list[float]] = {}
 _login_lock = threading.Lock()
 
 
-def _login_precheck(request: Request) -> None:
-    client = request.client.host if request.client else "unknown"
+def _login_precheck(request: Request, username: str) -> None:
+    """
+    按 IP 和账号两个桶同时限流，两个都过才放行。
+
+    只按 IP：攻击者换一批出口 IP，每个 IP 试几次。
+    只按账号：同一个 IP 换着用户名扫，仍然能撞库。
+    """
+    buckets = [(f"ip:{_client_ip(request)}", _LOGIN_MAX_ATTEMPTS)]
+    account = str(username or "").strip().lower()
+    if account:
+        buckets.append((f"user:{account}", _LOGIN_ACCOUNT_MAX_ATTEMPTS))
+
     now = time.monotonic()
     with _login_lock:
-        recent = [
-            stamp
-            for stamp in _login_hits.get(client, [])
-            if now - stamp < _LOGIN_WINDOW_SECONDS
-        ]
-        if len(recent) >= _LOGIN_MAX_ATTEMPTS:
-            _login_hits[client] = recent
-            raise HTTPException(
-                status_code=429,
-                detail="登录尝试过于频繁，请稍后再试",
-                headers={"Retry-After": "60"},
-            )
-        recent.append(now)
-        _login_hits[client] = recent
+        # 先全部剪枝再判断：否则某一次被拒会让另一个桶的旧记录一直留着。
+        for key, _limit in buckets:
+            _login_hits[key] = [
+                stamp
+                for stamp in _login_hits.get(key, [])
+                if now - stamp < _LOGIN_WINDOW_SECONDS
+            ]
+        for key, limit in buckets:
+            if len(_login_hits[key]) >= limit:
+                raise HTTPException(
+                    status_code=429,
+                    detail="登录尝试过于频繁，请稍后再试",
+                    headers={"Retry-After": "60"},
+                )
+        for key, _limit in buckets:
+            _login_hits[key].append(now)
         if len(_login_hits) > 2048:
             for key, hits in list(_login_hits.items()):
                 if not hits or now - hits[-1] >= _LOGIN_WINDOW_SECONDS:
@@ -568,7 +676,7 @@ def login(req: LoginRequest, request: Request) -> dict:
     if not auth_settings.AUTH_ENABLED:
         # 404 而不是 403：没开身份层时，这个端点"不存在"比"存在但不给用"更准确。
         raise HTTPException(status_code=404, detail="身份层未启用（AUTH_ENABLED=0）")
-    _login_precheck(request)
+    _login_precheck(request, req.username)
     principal = auth_store.verify_password(req.username, req.password)
     if principal is None:
         # 不区分"用户不存在"和"密码错"：区分了就是一个用户名枚举接口。
@@ -580,6 +688,46 @@ def login(req: LoginRequest, request: Request) -> dict:
         "name": principal["name"],
         "role": principal["role"],
     }
+
+
+@app.post(
+    "/auth/logout",
+    response_model=LogoutResponse,
+    tags=["auth"],
+    summary="吊销当前登录 token",
+    description="让这枚 token **立刻失效**，而不是等它 12 小时后自然过期。"
+                "只结束登录会话；长期 API token 不在这里处理（用 CLI 的 "
+                "`rotate` 轮换）。没开 `AUTH_ENABLED` 时返回 404，和 `/auth/login` 一致。",
+    responses={
+        401: {"model": ErrorResponse, "description": "token 缺失或无效"},
+        404: {"model": ErrorResponse, "description": "身份层未启用"},
+    },
+)
+def logout(
+    authorization: str = Header(default="", description="`Bearer <token>`"),
+    x_api_key: str = Header(default="", description="兼容旧的 X-API-Key 用法。"),
+) -> dict:
+    if not auth_settings.AUTH_ENABLED:
+        raise HTTPException(status_code=404, detail="身份层未启用（AUTH_ENABLED=0）")
+
+    token = _bearer_token(authorization) or str(x_api_key or "").strip()
+    principal = auth_store.authenticate(token)
+    if principal is None:
+        # 已经失效的 token 再来登出也按 401：不能拿它探测"这枚 token 存在过"。
+        raise HTTPException(
+            status_code=401,
+            detail="需要有效的 bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    revoked = auth_store.revoke_token(token)
+    auth_store.audit(
+        principal.get("name", ""),
+        "auth.logout",
+        principal.get("name", ""),
+        "revoked" if revoked else "long-lived-token",
+    )
+    return {"revoked": revoked}
 
 
 def _history_owner(principal: dict) -> str:
@@ -872,7 +1020,14 @@ def ticket_queue(
     limit: int = 50,
 ) -> dict:
     _require_tickets_enabled()
-    rows = _ticket_or_error(tickets.list_tickets, status=status, limit=limit)
+    is_admin = auth_store.has_role(principal, "admin")
+    rows = _ticket_or_error(
+        tickets.list_tickets,
+        status=status,
+        limit=limit,
+        viewer_id=str(principal.get("id") or ""),
+        is_admin=is_admin,
+    )
     return {"tickets": [_ticket_summary(row) for row in rows]}
 
 
@@ -896,6 +1051,10 @@ def ticket_detail(
     ticket = _ticket_or_error(tickets.get_ticket, ticket_id)
     if ticket is None:
         raise HTTPException(status_code=404, detail=f"没有这个工单：{ticket_id}")
+    is_admin = auth_store.has_role(principal, "admin")
+    if not tickets.can_view(ticket, str(principal.get("id") or ""), is_admin):
+        # 列表已经按同一口径过滤；这是"绕过列表直接拿 ticket_id 查"的那条路。
+        raise HTTPException(status_code=403, detail="只能查看排队中的或自己处理的工单")
     auth_store.audit(
         principal.get("name", ""), "ticket.view", ticket_id, f"session={ticket['session_id']}"
     )
@@ -969,22 +1128,70 @@ def reply_ticket(
     response_model=TicketStatusResponse,
     tags=["tickets"],
     summary="关闭工单（agent / admin）",
-    description="只有认领人能关；重复关闭是幂等的。关闭后这个会话再要人工会新建一张单。",
+    description="默认只有认领人能关；**admin 可以强制关闭**（写审计）。重复关闭是幂等的。"
+                "关闭后这个会话再要人工会新建一张单。",
     responses={
         401: {"model": ErrorResponse, "description": "需要 bearer token"},
         403: {"model": ErrorResponse, "description": "需要 agent 或 admin 角色"},
         404: {"model": ErrorResponse, "description": "工单不存在"},
-        409: {"model": ErrorResponse, "description": "不是由你认领的"},
+        409: {"model": ErrorResponse, "description": "不是由你认领的，且你没有 admin 角色"},
     },
 )
 def close_ticket(
     ticket_id: str, principal: Annotated[dict, Depends(require_agent)]
 ) -> dict:
     _require_tickets_enabled()
+    agent_id = str(principal.get("id") or "")
+    is_admin = auth_store.has_role(principal, "admin")
+    before = _ticket_or_error(tickets.get_ticket, ticket_id)
     ticket = _ticket_or_error(
-        tickets.close_ticket, ticket_id, principal.get("id", "")
+        tickets.close_ticket, ticket_id, agent_id, allow_override=is_admin
     )
-    auth_store.audit(principal.get("name", ""), "ticket.close", ticket_id, "")
+    override = bool(is_admin and before and before.get("claimed_by") != agent_id)
+    auth_store.audit(
+        principal.get("name", ""),
+        "ticket.close",
+        ticket_id,
+        "admin-override" if override else "",
+    )
+    return {"ticket": _ticket_info(ticket)}
+
+
+@app.post(
+    "/tickets/{ticket_id}/transfer",
+    response_model=TicketStatusResponse,
+    tags=["tickets"],
+    summary="转派工单或放回队列（admin）",
+    description="把工单转给另一个客服；`assignee=null` 表示放回排队。"
+                "用来处理认领人离职 / 账号被吊销 / 长期不关单。每次转派都写审计。",
+    responses={
+        401: {"model": ErrorResponse, "description": "需要 bearer token"},
+        403: {"model": ErrorResponse, "description": "需要 admin 角色"},
+        404: {"model": ErrorResponse, "description": "工单不存在"},
+        409: {"model": ErrorResponse, "description": "工单已关闭"},
+        422: {"model": ErrorResponse, "description": "目标账号不存在 / 已吊销 / 不是客服"},
+    },
+)
+def transfer_ticket(
+    ticket_id: str,
+    req: TicketTransferRequest,
+    principal: Annotated[dict, Depends(require_admin)],
+) -> dict:
+    _require_tickets_enabled()
+    target = None
+    if req.assignee:
+        target = auth_store.get_principal(req.assignee)
+        if target is None or target.get("revoked_at"):
+            raise HTTPException(status_code=422, detail="目标账号不存在或已吊销")
+        if not auth_store.has_role(target, "agent"):
+            raise HTTPException(status_code=422, detail="目标账号不是客服")
+    ticket = _ticket_or_error(tickets.transfer_ticket, ticket_id, target)
+    auth_store.audit(
+        principal.get("name", ""),
+        "ticket.transfer",
+        ticket_id,
+        target["name"] if target else "queue",
+    )
     return {"ticket": _ticket_info(ticket)}
 
 
@@ -999,13 +1206,15 @@ def close_ticket(
     responses={
         401: {"model": ErrorResponse, "description": "需要 bearer token（开了 AUTH_ENABLED 时）"},
         403: {"model": ErrorResponse, "description": "演示模式但邀请码不对"},
-        429: {"model": ErrorResponse, "description": "请求太频繁或今日演示额度已用完"},
+        429: {"model": ErrorResponse, "description": "请求太频繁，或今日演示 / 个人额度已用完"},
+        503: {"model": ErrorResponse, "description": "账号用量账本暂时不可用（fail closed）"},
     },
 )
 def chat(
     req: ChatRequest, request: Request, principal: Annotated[dict, Depends(require_access)]
 ) -> dict:
     _demo_precheck(request)
+    _chat_quota_precheck(principal)
 
     # 先确保会话存在再读历史——顺序反过来的话，新会话的第一问会因为
     # "查不到这个 session_id"而拿不到空历史（这一版不会报错，只是白查一次）。
@@ -1022,6 +1231,7 @@ def chat(
         principal.get("customer_id") or "",
     )
     demo.add_tokens(final.get("tokens") or {})
+    _record_chat_usage(principal, final)
     handoff = _attach_handoff(final, session_id, principal)
 
     # **先答完再落盘**。反过来的话，模型调用失败也会留下一条"问了没答"的
@@ -1100,7 +1310,8 @@ def _sse(payload: dict) -> str:
     responses={
         401: {"model": ErrorResponse, "description": "需要 bearer token（开了 AUTH_ENABLED 时）"},
         403: {"model": ErrorResponse, "description": "演示模式但邀请码不对"},
-        429: {"model": ErrorResponse, "description": "请求太频繁或今日演示额度已用完"},
+        429: {"model": ErrorResponse, "description": "请求太频繁，或今日演示 / 个人额度已用完"},
+        503: {"model": ErrorResponse, "description": "账号用量账本暂时不可用（fail closed）"},
     },
 )
 def chat_stream(
@@ -1116,6 +1327,7 @@ def chat_stream(
     # 闸必须在**开始发 SSE 之前**：一旦返回了 StreamingResponse，HTTP 状态码
     # 就已经是 200 了，再把 429 塞进流里，客户端会以为"答到一半失败了"。
     _demo_precheck(request)
+    _chat_quota_precheck(principal)
 
     session_id = _session_for(req.session_id, principal)
     history = session.history(session_id)
@@ -1127,9 +1339,23 @@ def chat_stream(
         final = None
         elapsed_ms = None
         thinking: list[str] = []
+        usage_reported = False
+
+        def bill(tokens: dict) -> None:
+            """流式中断/正常结束都从这里记一次账，两条闸各记各的。"""
+            nonlocal usage_reported
+            usage_reported = True
+            demo.add_tokens(tokens or {})
+            chat_quota.add_tokens(
+                str(principal.get("id") or "").strip(), tokens or {}
+            )
+
         try:
             for event in _call_answer_stream(
-                req.question, augmented, principal.get("customer_id") or ""
+                req.question,
+                augmented,
+                principal.get("customer_id") or "",
+                on_usage=bill,
             ):
                 kind = event.get("type")
                 if kind == "start":
@@ -1182,6 +1408,11 @@ def chat_stream(
             )
             return
 
+        # 真实 supervisor 会在收尾（含断线）通过 on_usage 记账；只有替身
+        # 生成器不认识 on_usage 时才走这里兜底。
+        if not usage_reported:
+            bill(final.get("tokens") or {})
+
         # **拿到完整答复之后再落盘。** 中途断开的请求不写会话——半句话接进
         # 下一轮，比没答更坏。和 /chat 的"先答完再落盘"是同一条规矩。
         # 和 /chat 一样：先落工单、再落盘，写进历史的是带工单号的那句。
@@ -1189,7 +1420,6 @@ def chat_stream(
         session.append_turn(
             session_id, req.question, final.get("answer") or "", owner_id=principal.get("id", "")
         )
-        demo.add_tokens(final.get("tokens") or {})
 
         yield _sse(
             {

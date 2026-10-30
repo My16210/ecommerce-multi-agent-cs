@@ -53,6 +53,11 @@ python3 -c "import secrets; print(secrets.token_urlsafe(24))"
 - `DEMO_INVITE_CODE` 非空。**留空会让所有人都进不来**，这是有意的 fail closed。
 - `DEMO_DAILY_TOKEN_BUDGET` 按预算填；20 万 token 大致是几块钱量级。
 - `ENABLE_QUESTION_REVIEW=false`，公网演示不攒用户问题。
+- `APP_ENV=prod`（compose 已经写死）。它和 `DEMO_MODE` / `AUTH_ENABLED` 一起
+  构成启动闸门：生产环境如果两者都没开，进程会直接拒绝启动，而不是裸奔。
+- 如果以后在这套演示前面再加一层自己的反向代理，并且需要按真实客户端 IP 限流，
+  才设 `TRUST_PROXY_HEADERS=1`。当前 Caddy 直接终止 TLS，默认的 TCP 对端就够用；
+  **不要在没有可信代理时打开它**，否则 `X-Forwarded-For` 可以被客户端随意伪造。
 
 ### 1.2 建订单库和向量库
 
@@ -167,6 +172,11 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d app
 | 邀请码对却进不去 | 浏览器里是不是还留着旧码；换一个会话/清 cookie 再试；看 app 日志 |
 | 一直"今天的演示额度已经用完" | 查上面 3.1 的用量；要临时放开就改 `DEMO_DAILY_TOKEN_BUDGET` |
 | 429 / "问得有点快" | 限流，等一分钟；或调 `DEMO_RATE_LIMIT_PER_MINUTE` |
+| 登录账号问答 429 "请求过于频繁" | 账号级限流（默认 30 次/分钟）；等一分钟，或调 `CHAT_RATE_LIMIT_PER_MINUTE` |
+| 登录账号 429 "个人 token 额度已经用完" | 这个账号当天额度用完（默认 20 万）；查 `CHAT_USAGE_DB_PATH` 里的 `principal_usage`，或调 `CHAT_DAILY_TOKEN_BUDGET` |
+| 登录账号 429 "全站 token 额度已经用完" | 所有账号当天合计达到部署上限（默认 100 万）；查同一张表按天求和，或调 `CHAT_GLOBAL_DAILY_TOKEN_BUDGET`（<= 0 关闭） |
+| 登录账号问答 503 "用量账本暂时不可用" | 故意的 fail closed：查 `data/orchestrator/chat_usage.sqlite` 的权限/磁盘。修好之前不会继续花 token |
+| 退出登录后仍能用同一枚 token | 如果那是长期 API token，`/auth/logout` 不会吊销它；界面已经会提示。让管理员跑 `python -m ecom.auth.cli rotate <账号>` |
 | 证书申请失败 | 域名 A/AAAA 是否指向本机；80/443 是否被占用；`logs caddy` 里的 ACME 报错 |
 | 502 | `docker compose ps` 看 app 是否 healthy；`curl` 容器内 `/_stcore/health` |
 | 答案全是"知识库查不了" | `SILICONFLOW_API_KEY` 是否有效、服务器能不能访问它的 API |
@@ -238,7 +248,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml down -v
 
 以下每一条都是"真上线"必须补的，不能因为 Demo 能跑就当成已完成：
 
-1. **身份与权限**：`AUTH_ENABLED` 提供 token / 角色 / 审计 / 会话归属 / 历史回看；公网演示仍用共享邀请码（没开它），也没有产品级用户体系（注册、找回密码、MFA、OIDC、多租户）。
+1. **身份与权限**：`AUTH_ENABLED` 提供 token / 角色 / 审计 / 会话归属 / 历史回看，以及每个账号的问答限流和每日 token 预算；公网演示仍用共享邀请码（没开它），也没有产品级用户体系（注册、找回密码、MFA、OIDC、多租户）。问答限流是进程内的，多副本各算各的；每日预算落 SQLite，跨副本仍有效。
    转人工工单是**演示级闭环**：5 秒轮询、没有实时推送、SLA、排队超时、在线状态和客服技能分组；公网演示里这个能力整个是 404。
 2. **写操作**：退货申请在演示里被硬关掉，没有"演示账号可以写"的旁路。
 3. **数据分析**：整条路被停用；沙箱不是强隔离，不要在公网打开它。

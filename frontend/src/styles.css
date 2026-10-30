@@ -1813,6 +1813,31 @@ button:disabled {
   gap: 8px;
 }
 
+/* 转派 / 放回队列只对 admin 出现；它是一排恢复动作，不跟认领/关闭抢位置。 */
+.transfer-row {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+  padding: 0 14px 10px;
+}
+
+.transfer-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+}
+
+.transfer-row input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
 .ticket-transcript {
   display: flex;
   flex: 1 1 auto;
