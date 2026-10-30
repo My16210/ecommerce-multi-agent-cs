@@ -438,3 +438,131 @@ def test_demo_suggestions_do_not_offer_sales_analytics(app, monkeypatch):
     shown = " ".join(str(c[1]) for c in CALLS)
     assert "哪个地区卖得最好" not in shown
     assert "退款一般多久到账" in shown
+
+
+# ——— 演示闸的位置：必须在花钱之前 ———
+
+def test_demo_rate_limit_is_checked_before_image_understanding(app, monkeypatch):
+    """图片理解是一次独立的视觉模型调用，不能绕过演示限流。
+
+    这里让 session 已经是"被限流"状态，再上传一张图；如果代码先识别图片
+    再检查限流，`understand_image` 就会被调用——那正是要防的成本漏洞。
+    """
+    _enable_demo(app, monkeypatch)
+    app.demo.reset_rate_limits()
+    monkeypatch.setattr(app.demo, "allow_request", lambda key: False)
+    app.st.session_state.clear()
+
+    class _Upload:
+        type = "image/png"
+
+        def getvalue(self):
+            return b"fake-image"
+
+    app.st.file_uploader = lambda *a, **k: _Upload()
+    app.st.chat_input = lambda *a, **k: "这张图里是什么"
+    called = []
+    monkeypatch.setattr(app.chat, "understand_image", lambda *a, **k: called.append(1))
+
+    CALLS.clear()
+    app.render_agent_view()
+
+    assert called == [], "限流没拦住图片理解"
+    shown = " ".join(str(c[1]) for c in CALLS)
+    assert "问得有点快" in shown
+
+
+def test_demo_rate_key_prefers_client_ip_over_the_tab_session(app, monkeypatch):
+    """新开标签页会换一个 Streamlit session，不能因此换一个新的限流桶。"""
+    from types import SimpleNamespace
+
+    app.st.session_state["agent_session_id"] = "tab-1"
+    app.st.context = SimpleNamespace(ip_address="203.0.113.9", headers={})
+    assert app.chat._demo_client_key() == "ip:203.0.113.9"
+
+    # 默认不信代理头：客户端可以自己写 X-Forwarded-For，信了等于换假 IP 绕过。
+    app.st.context = SimpleNamespace(
+        ip_address="", headers={"X-Forwarded-For": "198.51.100.2, 10.0.0.1"}
+    )
+    assert app.chat._demo_client_key() == "session:tab-1"
+
+    monkeypatch.setattr(app.chat.auth_settings, "TRUST_PROXY_HEADERS", True)
+    # 代理把真实对端追加在末尾；最左边是客户端自己写的，不能拿来当键。
+    assert app.chat._demo_client_key() == "ip:10.0.0.1"
+
+
+def test_streaming_usage_is_billed_when_the_stream_ends_without_final(app, monkeypatch):
+    """客户端断开时 supervisor 仍会通过 on_usage 报一次账，界面必须接住。"""
+    _enable_demo(app, monkeypatch)
+    app.st.session_state["agent_session_id"] = app.session.ensure_session("")
+    app.st.session_state["agent_turns"] = []
+    billed = []
+    monkeypatch.setattr(app.demo, "allow_request", lambda key: True)
+    monkeypatch.setattr(app.demo, "budget_exhausted", lambda: False)
+    monkeypatch.setattr(app.demo, "add_tokens", lambda tokens: billed.append(tokens))
+
+    def _stream(question, history, on_usage=None):  # noqa: ANN001
+        on_usage({"in": 3, "out": 4})
+        yield {"type": "start", "request_id": "req-test"}
+        # 没有 final：模拟生成器在收尾前被关闭。
+
+    ctx = app.chat.ChatContext(
+        session=app.session, demo=app.demo, answer_stream=_stream
+    )
+    app.chat._run_turn(ctx, "断开也要记账", prechecked=True)
+
+    assert billed == [{"in": 3, "out": 4}]
+
+
+def test_streaming_usage_is_not_billed_twice_on_normal_completion(app, monkeypatch):
+    """真实 supervisor 在 finally 报账，final 里的 tokens 只用于旧替身兜底。"""
+    _enable_demo(app, monkeypatch)
+    app.st.session_state["agent_session_id"] = app.session.ensure_session("")
+    app.st.session_state["agent_turns"] = []
+    billed = []
+    monkeypatch.setattr(app.demo, "allow_request", lambda key: True)
+    monkeypatch.setattr(app.demo, "budget_exhausted", lambda: False)
+    monkeypatch.setattr(app.demo, "add_tokens", lambda tokens: billed.append(tokens))
+
+    def _stream(question, history, on_usage=None):  # noqa: ANN001
+        yield {"type": "start", "request_id": "req-test"}
+        on_usage({"in": 2, "out": 5})
+        yield {
+            "type": "final",
+            "state": {"answer": "好", "tokens": {"in": 2, "out": 5}},
+            "elapsed_ms": 1,
+        }
+
+    ctx = app.chat.ChatContext(
+        session=app.session, demo=app.demo, answer_stream=_stream
+    )
+    app.chat._run_turn(ctx, "正常结束", prechecked=True)
+
+    assert billed == [{"in": 2, "out": 5}]
+    assert len(app.session.history(app.st.session_state["agent_session_id"])) == 2
+
+
+def test_a_two_argument_answer_stream_still_bills_from_final(app, monkeypatch):
+    """测试替身/旧调用方只有两个参数时，不能因为传 on_usage 直接 TypeError。"""
+    _enable_demo(app, monkeypatch)
+    app.st.session_state["agent_session_id"] = app.session.ensure_session("")
+    app.st.session_state["agent_turns"] = []
+    billed = []
+    monkeypatch.setattr(app.demo, "allow_request", lambda key: True)
+    monkeypatch.setattr(app.demo, "budget_exhausted", lambda: False)
+    monkeypatch.setattr(app.demo, "add_tokens", lambda tokens: billed.append(tokens))
+
+    def _stream(question, history):  # noqa: ANN001
+        yield {"type": "start", "request_id": "req-test"}
+        yield {
+            "type": "final",
+            "state": {"answer": "好", "tokens": {"in": 1, "out": 2}},
+            "elapsed_ms": 1,
+        }
+
+    ctx = app.chat.ChatContext(
+        session=app.session, demo=app.demo, answer_stream=_stream
+    )
+    app.chat._run_turn(ctx, "旧替身", prechecked=True)
+
+    assert billed == [{"in": 1, "out": 2}]

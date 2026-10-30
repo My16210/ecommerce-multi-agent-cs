@@ -9,11 +9,13 @@
 **依赖通过 ChatContext 传**，不 import app：测试可以 monkeypatch
 `app.session` / `app.answer_stream` 之后仍然生效，也避免循环导入。
 """
+import inspect
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
+from ecom.auth import settings as auth_settings
 from ecom.orchestrator import memory
 from ecom.orchestrator.tools.image_understander import understand_image
 from ecom.orchestrator.utils.image_intent import augment_question_with_image
@@ -93,6 +95,12 @@ def render_agent_view(ctx: ChatContext) -> None:
     if not question and not (uploaded is not None and send_image_only):
         return
 
+    # **先过演示闸，再碰会花钱的图片理解。** 图片理解在 supervisor 之外
+    # 单独调一次视觉模型，如果把这一步放在限流/预算检查之前，演示访客可以
+    # 绕开次数限制反复上传图片烧钱。
+    if not _demo_precheck(ctx):
+        return
+
     display_question = question or "（图片）"
     if uploaded is not None:
         augmented = _prepare_image_question(ctx, uploaded, question or "")
@@ -105,7 +113,7 @@ def render_agent_view(ctx: ChatContext) -> None:
 
     if not question:
         return
-    _run_turn(ctx, question, display_question=display_question)
+    _run_turn(ctx, question, display_question=display_question, prechecked=True)
     if uploaded is not None:
         st.rerun()
 
@@ -153,6 +161,78 @@ def _render_image_uploader():
             else False
         )
     return uploaded, send_image_only
+
+
+def _header(headers, name: str) -> str:
+    """从 Streamlit 的 Headers / 普通 dict 里按大小写不敏感取一个头。"""
+    if headers is None:
+        return ""
+    try:
+        getter = getattr(headers, "get", None)
+        if callable(getter):
+            for key in (name, name.lower(), name.upper()):
+                value = getter(key)
+                if value:
+                    return str(value)
+        for key, value in headers.items():
+            if str(key).lower() == name.lower():
+                return str(value or "")
+    except Exception:  # noqa: BLE001 —— 拿不到头就按"没有"处理
+        return ""
+    return ""
+
+
+def _demo_client_key() -> str:
+    """
+    演示限流键：优先客户端 IP，拿不到再回退到浏览器会话。
+
+    `session:<id>` 不能单独用：Streamlit 的 session 是按标签页/websocket 分的，
+    用户新开一个标签页就换了一个桶，限流等于没做。`st.context.ip_address` 在
+    直连时就是 TCP 对端地址；部署在反代后面时，只有显式打开
+    `TRUST_PROXY_HEADERS` 才读 `X-Forwarded-For` —— 否则客户端可以自己伪造，
+    把"按 IP 限流"变成"按我喜欢的任意字符串限流"。
+
+    同一 NAT 后面的访客会共用一个桶，这是演示模式的已知取舍：它比"每个标签页
+    一个桶"更接近文档里承诺的"按客户端"；真要区分人，得先有身份。
+    """
+    st = _st()
+    try:
+        context = getattr(st, "context", None)
+        if auth_settings.TRUST_PROXY_HEADERS:
+            for header in ("X-Forwarded-For", "X-Real-IP"):
+                value = _header(getattr(context, "headers", None), header)
+                # Caddy 会把真实对端追加在末尾；最左边是客户端自报的，可伪造。
+                client = value.split(",")[-1].strip() if value else ""
+                if client:
+                    return f"ip:{client}"
+        ip = str(getattr(context, "ip_address", "") or "").strip()
+        if ip:
+            return f"ip:{ip}"
+    except Exception:  # noqa: BLE001 —— 上下文拿不到就回退，不影响问答
+        logger.debug("读取 Streamlit 客户端上下文失败", exc_info=True)
+    sid = str(st.session_state.get("agent_session_id") or "").strip()
+    return f"session:{sid or 'anonymous'}"
+
+
+def _demo_precheck(ctx: ChatContext) -> bool:
+    """演示模式的次数和预算闸。**任何会花钱的动作之前都要先过这里。**"""
+    if not ctx.demo.enabled():
+        return True
+    st = _st()
+    if not ctx.demo.allow_request(_demo_client_key()):
+        st.warning("问得有点快，等一分钟再试。")
+        return False
+    if ctx.demo.budget_exhausted():
+        st.error("今天的演示额度已经用完，明天再来。")
+        return False
+    return True
+
+
+def _call_answer_stream(ctx: ChatContext, question: str, history: list, on_usage):
+    """兼容只接受两个参数的测试替身：真实实现才认识 `on_usage`。"""
+    if "on_usage" in inspect.signature(ctx.answer_stream).parameters:
+        return ctx.answer_stream(question, history, on_usage=on_usage)
+    return ctx.answer_stream(question, history)
 
 
 def _prepare_image_question(ctx: ChatContext, uploaded, question: str) -> str | None:
@@ -209,20 +289,24 @@ def _render_turn(turn: dict) -> None:
         render_decision_chain(turn["final"], turn["elapsed_ms"])
 
 
-def _run_turn(ctx: ChatContext, question: str, display_question: str | None = None) -> None:
-    """跑一轮问答。`question` 喂模型，`display_question` 画给用户。"""
+def _run_turn(
+    ctx: ChatContext,
+    question: str,
+    display_question: str | None = None,
+    prechecked: bool = False,
+) -> None:
+    """跑一轮问答。`question` 喂模型，`display_question` 画给用户。
+
+    `prechecked=True` 表示调用方已经在图片理解之前过了演示闸；否则在这里补上，
+    避免别处调用时漏掉限流和预算。
+    """
     st = _st()
     sid = st.session_state["agent_session_id"]
     turns = st.session_state["agent_turns"]
     display_question = question if display_question is None else display_question
 
-    if ctx.demo.enabled():
-        if not ctx.demo.allow_request(f"session:{sid}"):
-            st.warning("问得有点快，等一分钟再试。")
-            return
-        if ctx.demo.budget_exhausted():
-            st.error("今天的演示额度已经用完，明天再来。")
-            return
+    if not prechecked and not _demo_precheck(ctx):
+        return
 
     with st.chat_message("user"):
         st.markdown(display_question)
@@ -236,9 +320,18 @@ def _run_turn(ctx: ChatContext, question: str, display_question: str | None = No
         answer_box = st.empty()
         pieces: list[str] = []
         final = None
+        billed = False
+
+        def bill(tokens: dict) -> None:
+            """一份请求只记一次账：正常结束和生成器被关闭都由它兜住。"""
+            nonlocal billed
+            if billed:
+                return
+            billed = True
+            ctx.demo.add_tokens(tokens or {})
 
         try:
-            for event in ctx.answer_stream(question, augmented):
+            for event in _call_answer_stream(ctx, question, augmented, bill):
                 kind = event.get("type")
                 if kind == "delta":
                     if not pieces:
@@ -265,7 +358,10 @@ def _run_turn(ctx: ChatContext, question: str, display_question: str | None = No
             st.error("这次请求没有正常结束，请重试。")
             return
 
-        ctx.demo.add_tokens(final.get("tokens") or {})
+        # 真实 supervisor 在收尾（含生成器被提前关闭）通过 on_usage 报过账；
+        # 只有两参数替身不会回调，才用 final 里的汇总兜底。
+        if not billed:
+            bill(final.get("tokens") or {})
 
         answer_box.markdown(final.get("answer") or "（没有生成答复）")
         sources = final.get("sources") or []

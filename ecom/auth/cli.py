@@ -7,12 +7,13 @@
     python -m ecom.auth.cli revoke alice
     python -m ecom.auth.cli purge-sessions
     python -m ecom.auth.cli audit --limit 20
+    python -m ecom.auth.cli purge-audit [--days 90]
 """
 import argparse
 import getpass
 import json
 
-from ecom.auth import store
+from ecom.auth import settings, store
 
 
 def _print_json(payload) -> None:
@@ -56,6 +57,11 @@ def main(argv: list = None) -> int:
 
     audit = sub.add_parser("audit", help="看最近的审计")
     audit.add_argument("--limit", type=int, default=20)
+
+    purge_audit = sub.add_parser("purge-audit", help="清掉超过保留期的审计")
+    purge_audit.add_argument(
+        "--days", type=float, default=None, help="保留天数，默认 AUDIT_RETENTION_DAYS"
+    )
 
     args = parser.parse_args(argv)
 
@@ -116,6 +122,11 @@ def main(argv: list = None) -> int:
 
     if args.cmd == "audit":
         _print_json(store.recent_audit(args.limit))
+        return 0
+
+    if args.cmd == "purge-audit":
+        days = settings.AUDIT_RETENTION_DAYS if args.days is None else args.days
+        print(f"删掉 {store.purge_audit(days)} 条超过 {days:g} 天的审计。")
         return 0
 
     parser.error("未知命令")

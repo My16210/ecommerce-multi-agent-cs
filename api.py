@@ -74,7 +74,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -123,15 +123,19 @@ async def lifespan(_: FastAPI):
     result = session.purge()
     # 登录会话也要清一次：它们是短期凭证，过期后留着只会让 auth.db 变大。
     auth_store.purge_sessions()
+    # 审计按保留期清理。它包含退货审批等解释性记录，不能无限增长；
+    # 默认 90 天，`AUDIT_RETENTION_DAYS<=0` 可关闭。
+    purged_audit = auth_store.purge_audit()
     # 记忆也一起报：它是这段对话的摘要，**也是用户说过的话**。只报消息数的话，
     # "记忆有没有被删掉"这件事在日志里看不见——而它恰恰是最该被看见的那部分。
     logger.info(
-        "会话库就绪：%s（清理过期 %s 个会话 / %s 条消息 / %s 条记忆 / %s 张工单）",
+        "会话库就绪：%s（清理过期 %s 个会话 / %s 条消息 / %s 条记忆 / %s 张工单 / %s 条审计）",
         session.SESSION_DB_PATH,
         result["sessions"],
         result["messages"],
         result["memories"],
         result.get("tickets", 0),
+        purged_audit,
     )
     yield
 
@@ -672,7 +676,7 @@ def health() -> dict:
         429: {"model": ErrorResponse, "description": "登录尝试过于频繁"},
     },
 )
-def login(req: LoginRequest, request: Request) -> dict:
+def login(req: LoginRequest, request: Request, response: Response) -> dict:
     if not auth_settings.AUTH_ENABLED:
         # 404 而不是 403：没开身份层时，这个端点"不存在"比"存在但不给用"更准确。
         raise HTTPException(status_code=404, detail="身份层未启用（AUTH_ENABLED=0）")
@@ -682,6 +686,8 @@ def login(req: LoginRequest, request: Request) -> dict:
         # 不区分"用户不存在"和"密码错"：区分了就是一个用户名枚举接口。
         raise HTTPException(status_code=401, detail="用户名或密码不正确")
     issued = auth_store.issue_session(principal)
+    # 登录响应里有 bearer token，不能进浏览器/代理的缓存。
+    response.headers["Cache-Control"] = "no-store"
     return {
         "token": issued["token"],
         "expires_at": issued["expires_at"],

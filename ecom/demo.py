@@ -159,6 +159,12 @@ def _connect() -> sqlite3.Connection:
     path = DEMO_USAGE_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=5)
+    # 账本是**多个进程/线程共写**的：API 的请求线程、Streamlit 的脚本重跑、
+    # CLI 的清理命令都可能同时开连接。WAL 让读不挡写、写不挡读，busy_timeout
+    # 把短暂的锁冲突变成等待而不是立刻 "database is locked"（那会变成少记账）。
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS usage (day TEXT PRIMARY KEY, tokens INTEGER NOT NULL)"
     )

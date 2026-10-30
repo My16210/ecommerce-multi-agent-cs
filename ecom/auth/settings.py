@@ -33,6 +33,10 @@ AUTH_TOKEN_BYTES = int(os.getenv("AUTH_TOKEN_BYTES", "32"))
 # 登录会话的有效期（小时）。API token 可以不过期；登录会话必须有。
 AUTH_SESSION_TTL_HOURS = float(os.getenv("AUTH_SESSION_TTL_HOURS", "12"))
 
+# 审计保留期（天）。默认与会话保留期（SESSION_TTL_DAYS=30）的 3 倍，
+# 给"事后追责"留出比用户内容更长的时间；<= 0 表示不自动清理。
+AUDIT_RETENTION_DAYS = float(os.getenv("AUDIT_RETENTION_DAYS", "90"))
+
 
 def production_problem(demo_mode: bool) -> str | None:
     """

@@ -151,6 +151,16 @@ def _hash_password(password: str) -> str:
     return f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}${salt.hex()}${digest.hex()}"
 
 
+# 用户不存在 / 已过期 / 没设密码时，也要跑一次同样代价的 scrypt。
+# 否则 `/auth/login` 的耗时会把"这个用户名存在吗"直接告诉调用者：
+# 存在但密码错要算 scrypt（几十毫秒），不存在几乎立刻返回（几毫秒）。
+# 用一个固定的、永远不会被真实密码命中的哈希，只为了消耗同样的 CPU。
+_DUMMY_PASSWORD_HASH = (
+    "scrypt$16384$8$1$c608b51229044238cabf022cbd2b3413$"
+    "37727d614f5be57a59f976c009c60ecdbc23a18daff10cb956da6db81e06d2d3"
+)
+
+
 def _verify_password(password: str, stored: str) -> bool:
     try:
         scheme, n, r, p, salt_hex, digest_hex = str(stored).split("$")
@@ -303,29 +313,50 @@ def set_password(identifier: str, password: str) -> None:
         raise ValueError(f"没有这个 principal：{identifier}")
     if len(str(password or "")) < 8:
         raise ValueError("密码至少 8 个字符")
+    now = _stamp(_now())
     with closing(_connect()) as conn:
         conn.execute(
             "UPDATE principals SET password_hash = ? WHERE id = ?",
             (_hash_password(password), principal["id"]),
         )
+        # **改密码等于把所有已登录设备踢下线。** 否则密码泄露后受害者改了密码，
+        # 已经拿到旧会话 token 的人还能继续用到 12 小时过期——而"重置密码"
+        # 是用户在这种情况下唯一会做的动作。长期 API token 不受影响，轮换走 rotate。
+        conn.execute(
+            "UPDATE auth_tokens SET revoked_at = ? "
+            "WHERE principal_id = ? AND revoked_at IS NULL",
+            (now, principal["id"]),
+        )
         conn.commit()
-    audit(principal["name"], "principal.set_password", principal["name"], "")
+    audit(
+        principal["name"],
+        "principal.set_password",
+        principal["name"],
+        "已吊销所有登录会话",
+    )
 
 
 def verify_password(name: str, password: str) -> dict:
-    """用户名 + 密码 → principal；任何一步不对都返回 None（不区分原因）。"""
+    """
+    用户名 + 密码 → principal；任何一步不对都返回 None。
+
+    返回值和**耗时**都不区分原因：用户不存在、已过期、没设密码、密码错，
+    都会跑一次 scrypt。只在响应体上不区分，仍然是一个用户名枚举接口。
+    """
     value = str(name or "").strip()
-    if not value or not password:
+    candidate = str(password or "")
+    if not value or not candidate:
+        _verify_password(candidate, _DUMMY_PASSWORD_HASH)
         return None
     with closing(_connect()) as conn:
         row = conn.execute(
             "SELECT * FROM principals WHERE name = ? AND revoked_at IS NULL", (value,)
         ).fetchone()
-    if row is None or not row["password_hash"]:
+    stored = row["password_hash"] if row is not None else None
+    if not stored or not _alive(row["expires_at"]):
+        _verify_password(candidate, _DUMMY_PASSWORD_HASH)
         return None
-    if not _alive(row["expires_at"]):
-        return None
-    return _public(row) if _verify_password(password, row["password_hash"]) else None
+    return _public(row) if _verify_password(candidate, stored) else None
 
 
 def issue_session(principal: dict, ttl_hours: float = None) -> dict:
@@ -450,3 +481,21 @@ def recent_audit(limit: int = 50) -> list:
             "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (int(limit),)
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def purge_audit(older_than_days: float = None) -> int:
+    """
+    删掉超过保留期的审计，返回删除条数。
+
+    `older_than_days=None` 用 `AUDIT_RETENTION_DAYS`（默认 90 天）；<= 0 表示
+    不清理。审计里有"谁批准了哪笔退货"这类解释性记录，不能无限留着，也不能
+    删得比会话保留期还短——默认值是 `SESSION_TTL_DAYS`（30 天）的 3 倍。
+    """
+    days = settings.AUDIT_RETENTION_DAYS if older_than_days is None else float(older_than_days)
+    if days <= 0:
+        return 0
+    cutoff = _stamp(_now() - timedelta(days=days))
+    with closing(_connect()) as conn:
+        cursor = conn.execute("DELETE FROM audit_log WHERE at < ?", (cutoff,))
+        conn.commit()
+        return cursor.rowcount

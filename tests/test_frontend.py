@@ -268,3 +268,10 @@ def test_built_assets_use_the_ui_prefix():
     # 页面能打开但白屏，通常就是这里和 base 不一致：资源在 /assets 而实际在 /ui/assets。
     assert 'src="/ui/assets/' in html
     assert 'href="/ui/assets/' in html
+
+
+def test_caddy_limits_request_body_size():
+    """超大请求体应在边缘被挡住，而不是先读进应用再拒绝。"""
+    caddy = (FRONTEND.parent / "Caddyfile").read_text(encoding="utf-8")
+    assert "request_body" in caddy
+    assert "max_size 8MB" in caddy

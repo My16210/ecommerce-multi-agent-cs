@@ -42,3 +42,15 @@ def test_cli_set_password_and_rotate(tmp_path, monkeypatch, capsys):
     assert new_token != created["token"]
     assert store.authenticate(created["token"]) is None
     assert store.authenticate(new_token)["name"] == "carol"
+
+
+def test_cli_purge_audit(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(store, "AUTH_DB_PATH", tmp_path / "auth.db")
+    store.audit("alice", "old.event", "", "")
+    with __import__("sqlite3").connect(store.AUTH_DB_PATH) as conn:
+        conn.execute("UPDATE audit_log SET at = '2000-01-01 00:00:00'")
+        conn.commit()
+
+    assert cli.main(["purge-audit", "--days", "30"]) == 0
+    assert "1 条" in capsys.readouterr().out
+    assert store.recent_audit() == []

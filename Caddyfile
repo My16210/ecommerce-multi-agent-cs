@@ -11,6 +11,13 @@
 {$DOMAIN} {
 	encode zstd gzip
 
+	# 限制 HTTP 请求体。Streamlit 的图片上传走 websocket frame，不受这条限制；
+	# 应用自己的图片上限是 VISION_MAX_IMAGE_MB=5，所以 8MB 留了余量。
+	# 没有这条时，一个超大表单可以先把内存/带宽吃掉再被应用拒绝。
+	request_body {
+		max_size 8MB
+	}
+
 	# Streamlit 的 websocket 和 /_stcore/health 都在这一个 upstream 上。
 	# reverse_proxy 自动处理 Upgrade，不需要额外配置。
 	reverse_proxy app:8501 {

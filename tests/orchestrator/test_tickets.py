@@ -263,3 +263,53 @@ def test_purge_takes_the_tickets_with_it(store):
 
     assert result["tickets"] == 1
     assert tickets.list_tickets(status="all") == []
+
+
+def test_claim_rechecks_rowcount_when_another_process_wins(monkeypatch):
+    """先 SELECT 看到 open、UPDATE 前被另一个进程抢走：不能把别人的单当成功。
+
+    顺序执行的同进程测试抓不到这个窗口，所以这里直接构造那条时间线。
+    """
+    from contextlib import contextmanager
+
+    open_row = {"id": 1, "ticket_id": "T1", "status": "open"}
+    taken_row = {
+        "id": 1,
+        "ticket_id": "T1",
+        "status": "claimed",
+        "claimed_by": "p_other",
+        "claimed_by_name": "小王",
+    }
+
+    class _Result:
+        def __init__(self, row):  # noqa: ANN001
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class _Cursor:
+        rowcount = 0
+
+    class _Conn:
+        selects = 0
+
+        def execute(self, sql, params=()):  # noqa: ANN001
+            if sql.lstrip().startswith("UPDATE tickets SET status"):
+                return _Cursor()
+            if "SELECT * FROM tickets" in sql:
+                self.selects += 1
+                return _Result(open_row if self.selects == 1 else taken_row)
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+        def commit(self):
+            return None
+
+    @contextmanager
+    def _transaction():
+        yield _Conn()
+
+    monkeypatch.setattr(tickets.session, "transaction", _transaction)
+
+    with pytest.raises(tickets.TicketConflict, match="小王"):
+        tickets.claim_ticket("T1", "p_agent", "小李")

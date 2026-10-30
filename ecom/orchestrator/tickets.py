@@ -271,12 +271,29 @@ def claim_ticket(ticket_id: str, agent_id: str, agent_name: str) -> dict:
             raise TicketConflict(f"工单已被 {row['claimed_by_name'] or '其他客服'} 认领")
 
         now = _now()
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE tickets SET status = 'claimed', claimed_by = ?, claimed_by_name = ?, "
             "claimed_at = ?, updated_at = ? WHERE ticket_id = ? AND status = 'open'",
             (aid, str(agent_name or "")[:64], now, now, tid),
         )
         conn.commit()
+        if cursor.rowcount == 0:
+            # 先 SELECT 再 UPDATE 之间，另一个进程可能已经认领或关闭了它。
+            # 不检查 rowcount 就会把**别人认领的那张单**当成自己的成功返回。
+            latest = conn.execute(
+                "SELECT * FROM tickets WHERE ticket_id = ?", (tid,)
+            ).fetchone()
+            if latest is None:
+                raise TicketNotFound(f"没有这个工单：{tid}")
+            if latest["status"] == "closed":
+                raise TicketConflict("工单已关闭")
+            if latest["status"] == "claimed":
+                if latest["claimed_by"] == aid:
+                    return _with_position(conn, latest)
+                raise TicketConflict(
+                    f"工单已被 {latest['claimed_by_name'] or '其他客服'} 认领"
+                )
+            raise TicketConflict("工单状态已变化，请刷新后重试")
         row = conn.execute(
             "SELECT * FROM tickets WHERE ticket_id = ?", (tid,)
         ).fetchone()

@@ -149,6 +149,8 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d app
 ```cron
 # 每天 04:10（服务器时区）
 10 4 * * * cd /opt/ecom_cs && docker compose --env-file .env.prod -f docker-compose.prod.yml exec -T app python -m ecom.orchestrator.cli.session purge >> logs/purge.log 2>&1
+# 每天 04:20：审计保留期清理（默认 90 天；AUDIT_RETENTION_DAYS<=0 时是空操作）
+20 4 * * * cd /opt/ecom_cs && docker compose --env-file .env.prod -f docker-compose.prod.yml exec -T app python -m ecom.auth.cli purge-audit >> logs/purge.log 2>&1
 ```
 
 保留期是 `.env.prod` 的 `SESSION_TTL_DAYS`（模板是 7 天）。工单存在同一个
@@ -213,7 +215,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 
 - `data/orchestrator/sessions.db` —— 用户会话 + 转人工工单（`tickets` 表），**不可重建**
 - `data/orchestrator/demo_usage.sqlite` —— 当日用量，丢了预算会重新计
-- `data/orchestrator/auth.db` —— principal / 登录会话 / 审计；丢了所有人都要重新建号
+- `data/orchestrator/auth.db` —— principal / 登录会话 / 审计；丢了所有人都要重新建号。审计默认保留 90 天，启动时自动清一次，长驻进程靠 `auth.cli purge-audit`
 - `data/orders.sqlite` —— 可重建（`--init-db`），但备份更省事
 - `data/knowledge/vector_store/` —— 可重建（`ingest`），体积较大，按需
 

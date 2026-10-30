@@ -159,3 +159,17 @@ def test_demo_mode_is_read_only_and_has_no_analytics_worker(demo_on):
     assert demo.filter_workers(["analytics", "order", "knowledge"]) == [
         "order", "knowledge",
     ]
+
+
+def test_the_ledger_uses_wal_so_readers_and_writers_do_not_block_each_other(demo_on):
+    """账本是 API 线程 / Streamlit 重跑 / CLI 共写的。
+
+    默认的 rollback journal 下，一次读会挡住写；并发时表现为 "database is
+    locked"，而记账失败只会打日志——预算于是被悄悄少记。WAL + busy_timeout
+    让短暂的锁冲突变成等待。
+    """
+    import sqlite3
+
+    demo.add_tokens({"in": 1, "out": 0})
+    with sqlite3.connect(str(demo.DEMO_USAGE_DB_PATH)) as conn:
+        assert str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"

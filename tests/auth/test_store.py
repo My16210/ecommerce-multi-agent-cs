@@ -138,3 +138,71 @@ def test_customer_binding():
 
     with pytest.raises(ValueError):
         store.set_customer("kim", "not-a-customer")
+
+
+def test_set_password_revokes_existing_sessions_but_not_the_api_token():
+    """改密码必须让旧登录会话立刻失效。
+
+    否则密码泄露后，受害者改了密码，已经拿到会话 token 的人还能继续用到
+    12 小时过期。长期 API token 是另一条根凭证，由 rotate 显式轮换。
+    """
+    created = store.create_principal("kate", "agent")
+    store.set_password("kate", "first long password")
+    principal = store.verify_password("kate", "first long password")
+    old_session = store.issue_session(principal, ttl_hours=1)
+
+    store.set_password("kate", "second long password")
+
+    assert store.authenticate(old_session["token"]) is None
+    assert store.authenticate(created["token"])["name"] == "kate"
+    assert store.verify_password("kate", "first long password") is None
+    assert store.verify_password("kate", "second long password")["name"] == "kate"
+
+
+def test_unknown_expired_and_passwordless_users_still_pay_the_hash_cost(monkeypatch):
+    """用户名枚举不能靠耗时做：不存在 / 过期 / 没密码也要跑一次 scrypt。
+
+    这里不测墙钟（CI 上不稳），只钉住"确实调用了 `_verify_password` 且传入
+    的是固定假哈希"。任何人把提前 return 加回来都会让这条变红。
+    """
+    calls = []
+    real = store._verify_password
+
+    def spy(password, stored):  # noqa: ANN001
+        calls.append((password, stored))
+        return real(password, stored)
+
+    monkeypatch.setattr(store, "_verify_password", spy)
+
+    assert store.verify_password("nobody", "whatever") is None
+    assert calls[-1] == ("whatever", store._DUMMY_PASSWORD_HASH)
+
+    store.create_principal("leo", expires_days=-1)
+    store.set_password("leo", "expired but set")
+    assert store.verify_password("leo", "expired but set") is None
+    assert calls[-1] == ("expired but set", store._DUMMY_PASSWORD_HASH)
+
+    store.create_principal("mia")
+    assert store.verify_password("mia", "no password set") is None
+    assert calls[-1] == ("no password set", store._DUMMY_PASSWORD_HASH)
+
+    assert store.verify_password("", "") is None
+    assert calls[-1] == ("", store._DUMMY_PASSWORD_HASH)
+
+
+def test_purge_audit_removes_only_rows_past_retention():
+    store.audit("alice", "old.event", "R1", "")
+    store.audit("alice", "new.event", "R2", "")
+    with sqlite3.connect(store.AUTH_DB_PATH) as conn:
+        conn.execute(
+            "UPDATE audit_log SET at = '2000-01-01 00:00:00' WHERE action = 'old.event'"
+        )
+        conn.commit()
+
+    assert store.purge_audit(older_than_days=30) == 1
+    actions = [row["action"] for row in store.recent_audit()]
+    assert actions == ["new.event"]
+
+    # <= 0 表示关闭自动清理，不能把审计全删掉。
+    assert store.purge_audit(older_than_days=0) == 0
+    assert [row["action"] for row in store.recent_audit()] == ["new.event"]

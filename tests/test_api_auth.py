@@ -250,6 +250,8 @@ def test_login_issues_a_token_that_can_chat(client):
         "/auth/login", json={"username": "bob", "password": "a-long-enough-password"}
     )
     assert r.status_code == 200
+    # bearer token 在响应体里，不能进浏览器/代理缓存。
+    assert r.headers["cache-control"] == "no-store"
     body = r.json()
     assert body["role"] == "customer"
     assert body["expires_at"]
@@ -720,3 +722,14 @@ def test_chat_quota_is_a_no_op_without_a_principal(tmp_path, monkeypatch):
     assert chat_quota.budget_exhausted("") is False
     assert chat_quota.add_tokens("", {"in": 100, "out": 100}) == 0
     assert chat_quota.tokens_used_today("") == 0
+
+
+def test_chat_quota_ledger_uses_wal(tmp_path, monkeypatch):
+    """和 demo 账本同一条理由：多写者，不能让读挡写。"""
+    import sqlite3
+
+    path = tmp_path / "quota.sqlite"
+    monkeypatch.setattr(chat_quota, "CHAT_USAGE_DB_PATH", str(path))
+    chat_quota.add_tokens("p_wal", {"in": 1, "out": 0})
+    with sqlite3.connect(str(path)) as conn:
+        assert str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"

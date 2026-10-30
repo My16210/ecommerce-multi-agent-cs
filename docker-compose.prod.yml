@@ -37,6 +37,10 @@ services:
       # 强制只读演示。env_file 里的值会被这里覆盖——这是刻意的：
       # 公网编排文件的默认值必须是安全的那一边。
       DEMO_MODE: "1"
+      # 这个服务只在 compose 内网、且只有 Caddy 能访问；信任 Caddy 写的
+      # X-Forwarded-For，演示限流才能按真实客户端 IP 分桶（否则全部是 Caddy
+      # 的容器 IP，等于全站一个桶）。
+      TRUST_PROXY_HEADERS: "1"
       # 向量库用嵌入式 Chroma，零外部依赖。要接宿主机上的 Milvus 就改这里，
       # 并注意容器里的 localhost 是容器自己（用 host.docker.internal）。
       VECTOR_BACKEND: ${VECTOR_BACKEND:-chroma}
