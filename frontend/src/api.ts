@@ -39,10 +39,31 @@ async function readError(response: Response): Promise<ApiError> {
   return new ApiError(message, response.status, requestId);
 }
 
+export interface LoginResult {
+  token: string;
+  expires_at: string;
+  name: string;
+  role: string;
+}
+
 export async function fetchHealth(signal?: AbortSignal): Promise<Health> {
   const response = await fetch("/health", { signal });
   if (!response.ok) throw await readError(response);
   return (await response.json()) as Health;
+}
+
+/**
+ * 用户名 + 密码换短期 token。密码只在这次请求里出现，**不写进 sessionStorage**；
+ * 存下来的只有返回的 token（它是凭证，和 API Key 同一个位置）。
+ */
+export async function login(username: string, password: string): Promise<LoginResult> {
+  const response = await fetch("/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!response.ok) throw await readError(response);
+  return (await response.json()) as LoginResult;
 }
 
 /**

@@ -52,6 +52,9 @@ Docker 镜像会自己跑这一套（`Dockerfile` 的 `frontend` 阶段），所
 
 - **API Key / 邀请码只放 `sessionStorage`**，关掉标签页就没；不进 URL、
   不写 `localStorage`。会话号同理——它是凭证，不是账号。
+- 身份模式（`AUTH_ENABLED=1`）下，设置面板有用户名 + 密码登录，调 `/auth/login`
+  换短期 token；**密码只存在组件 state，不写 sessionStorage**，存下来的只有 token。
+  也可以跳过登录直接粘贴 token。
 - 界面里**没有** trace 查看器：`/trace` 会返回所有人问过的话和内部耗时，
   它是排障窗口，不是给演示观众看的。演示模式下服务端也会返回 404。
 - 回答按纯文本渲染（`white-space: pre-wrap`），不解析 Markdown / HTML。

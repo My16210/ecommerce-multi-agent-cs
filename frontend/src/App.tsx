@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { ApiError, fetchHealth, streamChat } from "./api";
+import { ApiError, fetchHealth, login, streamChat } from "./api";
 import type { ChatMeta, Health, Message } from "./types";
 
 const SESSION_KEY = "ecom.session_id";
@@ -77,6 +77,10 @@ export default function App() {
   const [inviteCode, setInviteCode] = useState(() => readStored(INVITE_KEY));
   const [keyDraft, setKeyDraft] = useState(apiKey);
   const [inviteDraft, setInviteDraft] = useState(inviteCode);
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [whoami, setWhoami] = useState("");
 
   const abortRef = useRef<AbortController | null>(null);
   const listRef = useRef<HTMLElement | null>(null);
@@ -204,6 +208,25 @@ export default function App() {
     setShowSettings(false);
   }
 
+  async function doLogin(): Promise<void> {
+    const name = username.trim();
+    if (!name || !password || loginBusy) return;
+    setLoginBusy(true);
+    setError("");
+    try {
+      const result = await login(name, password);
+      writeStored(API_KEY_KEY, result.token);
+      setApiKey(result.token);
+      setKeyDraft(result.token);
+      setWhoami(`${result.name}（${result.role}）`);
+      setPassword("");
+    } catch (caught) {
+      setError(errorText(caught));
+    } finally {
+      setLoginBusy(false);
+    }
+  }
+
   const statusText = health
     ? `${health.workers.length} 个单元在线 · ${health.order_db}`
     : "接口未连接";
@@ -228,6 +251,7 @@ export default function App() {
             {statusText}
           </span>
           {health?.demo && <span className="badge">只读演示</span>}
+          {whoami && <span className="badge">{whoami}</span>}
           <button
             className="ghost"
             type="button"
@@ -244,14 +268,53 @@ export default function App() {
 
       {showSettings && (
         <section className="settings" aria-label="连接设置">
+          {health?.auth && (
+            <>
+              <label>
+                用户名
+                <input
+                  autoComplete="username"
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                />
+              </label>
+              <label>
+                密码
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") void doLogin();
+                  }}
+                />
+              </label>
+              <div className="settings-actions">
+                <p>
+                  {whoami
+                    ? `已登录：${whoami}`
+                    : "登录后只保存 token；密码不写进 sessionStorage。"}
+                </p>
+                <button
+                  className="primary"
+                  type="button"
+                  onClick={() => void doLogin()}
+                  disabled={loginBusy || !username.trim() || !password}
+                >
+                  {loginBusy ? "登录中…" : "登录"}
+                </button>
+              </div>
+            </>
+          )}
           <label>
-            API Key
+            API Key / token
             <input
               type="password"
               autoComplete="off"
               value={keyDraft}
               onChange={(event) => setKeyDraft(event.target.value)}
-              placeholder="服务端没配鉴权就留空；开了身份层就填 token"
+              placeholder="不登录时可直接粘贴 token；服务端没配鉴权就留空"
             />
           </label>
           <label>

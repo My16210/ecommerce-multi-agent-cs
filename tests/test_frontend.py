@@ -88,8 +88,18 @@ def test_api_client_uses_sse_endpoint_and_auth_headers():
     source = _read("src/api.ts")
     assert '"/chat/stream"' in source
     assert '"/health"' in source
+    assert '"/auth/login"' in source
     assert "X-API-Key" in source
     assert "X-Invite-Code" in source
+
+
+def test_login_form_uses_the_login_endpoint_and_keeps_password_out_of_storage():
+    app_source = _read("src/App.tsx")
+    assert "doLogin" in app_source
+    assert "login(" in app_source
+    # 密码只放在组件 state 里，不写 sessionStorage
+    assert "password" in app_source
+    assert "writeStored" in app_source
 
 
 def test_mount_frontend_serves_index_from_temp_dist(tmp_path):
