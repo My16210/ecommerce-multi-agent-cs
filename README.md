@@ -174,7 +174,7 @@ docker compose up -d                                   # 默认：Chroma 嵌入�
 docker compose run --rm app python main.py --init-db                   # 灌订单库（65752 笔）—— 干净 clone 才需要
 docker compose run --rm app python -m ecom.knowledge.cli.ingest        # 建向量库 —— 同上
 # → http://localhost:8501     客户界面（端口被占就 APP_PORT=8600 docker compose up -d）
-# → http://127.0.0.1:8502     后台（要 .env 里的 ADMIN_PASSWORD）
+# → http://127.0.0.1:8502     后台（要 .env 里的 ADMIN_PASSWORD，或 admin token）
 ```
 
 **`build` 为什么必须单独一步**：`up -d` 只在镜像**不存在**时才构建，镜像一旦在就直接用旧的。
@@ -636,13 +636,32 @@ URL；回答按纯文本渲染，不走 `innerHTML`。细节和限制见
 | `admin` | 额外可看 `/trace`、在后台审核退货 |
 
 ```bash
-# token 只在创建时打印一次；服务端只存 SHA-256，不存明文
-uv run python -m ecom.auth.cli create --name alice --role admin
-# → 打印 p_xxx / alice / admin，以及一行 TOKEN
+# 长期 API token（可设过期天数；0 = 不过期）
+uv run python -m ecom.auth.cli create --name alice --role admin --ttl-days 30
+# → 打印 p_xxx / alice / admin，以及一行 TOKEN（只显示一次）
+
+# 给 alice 设登录密码（交互输入，不回显）
+uv run python -m ecom.auth.cli set-password alice
+
+# 轮换 API token：旧 token 和所有登录会话立即失效
+uv run python -m ecom.auth.cli rotate alice --ttl-days 30
 
 uv run python -m ecom.auth.cli list
 uv run python -m ecom.auth.cli revoke alice
+uv run python -m ecom.auth.cli purge-sessions
 uv run python -m ecom.auth.cli audit --limit 20
+```
+
+两种拿 token 的方式：
+
+1. **长期 API token**：服务/脚本用，管理员生成、手工交付；
+2. **登录会话**：用户名 + 密码换短期 token，默认 12 小时：
+
+```bash
+curl -X POST http://127.0.0.1:8000/auth/login \
+     -H "Content-Type: application/json" \
+     -d '{"username":"alice","password":"..."}'
+# → {"token":"...","expires_at":"...","name":"alice","role":"admin"}
 ```
 
 接口用法：
@@ -657,17 +676,21 @@ curl -H "Authorization: Bearer $TOKEN" \
 - `/chat`、`/chat/stream`：任何有效 token；`X-API-Key` 只作为 bearer 的兼容别名。
 - `/trace`：admin 角色；customer 得到 403（不是 404——这里是"有权限要求"，
   而不是隐藏资源存在性）。
+- `/auth/login`：`AUTH_ENABLED=1` 时才存在；密码存 scrypt 哈希，按 IP 限流
+  （10 次/分钟），失败不区分"用户不存在"和"密码错"。
 - 会话：`sessions.owner_id` 记录 principal；别人的 `session_id` 一律 404。
   老库里 `owner_id=''` 的会话会被第一个拿它的 principal 认领（迁移用）。
-- 后台：`admin.py` 改成输入 admin token，审核人自动取 `principal.name`；
-  `returns.review_return` 在 `AUTH_ENABLED=1` 时写一条 `return.review` 审计。
+- 后台：`admin.py` 改成输入 admin token（登录会话 token 也可以），审核人自动取
+  `principal.name`；退货审核写一条 `return.review` 审计。
 - 审计表 `audit_log` 在 `data/orchestrator/auth.db`，和 `sessions.db` 分开：
   一个是"用户说过的话"，一个是"谁做了什么"，保留策略不该共用一个。
 
 **边界（别把它说大）**：
 
-- 没有登录页 / 密码找回 / MFA：token 由管理员生成、手工交付；
-- 没有过期时间，只能 `revoke`；轮换 = 新建 + 吊销旧 token；
+- 没有**浏览器登录页** / OIDC / MFA / 忘记密码：密码登录目前是 API 端点，
+  两个界面仍然靠粘贴 token；
+- 没有**客户身份**：token 证明"谁在调 API"，不证明"这笔订单属于谁"，
+  `_guess_customer` 仍在；
 - 没有组织 / 多租户；`agent` 目前和 `customer` 同权；
 - MCP 仍只走 stdio，信任模型是"能拉起本进程的人"，不走这套 HTTP 身份。
 
@@ -676,7 +699,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 ## 后台（`admin.py`）
 
 ```bash
-uv run streamlit run admin.py       # → 8502，需要 .env 里的 ADMIN_PASSWORD
+uv run streamlit run admin.py       # → 8502，需要 ADMIN_PASSWORD 或 admin token
 ```
 
 **它是和 `app.py` 并列的第二个进程，不是它的一个视图**，这条是设计决定不是偷懒。`app.py` 的 docstring 里写着「不做登录 / 权限：这是离线演示，加一套假登录只会让演示多几步点击」——**那句话现在依然成立，因为后台不是它**。把两者合成一个文件的那天，那句注释就得划掉，而 `app.py` 的定位（面向客户、clone 下来点开就能用）会被一个密码框毁掉。
@@ -862,7 +885,7 @@ exact   41/50（82.0%）　covered 42/50（84.0%）
 ## 测试
 
 ```bash
-uv run pytest        # 749 条（--all-extras 实测：747 passed / 2 skipped；条数以当次输出为准）
+uv run pytest        # 757 条（--all-extras 实测：755 passed / 2 skipped；条数以当次输出为准）
 uv run ruff check .
 ```
 
@@ -933,7 +956,7 @@ CI 现在有两个 job：`lint-and-test`（ruff + pytest）和 `frontend`（`npm
 | ✅ | **真实 Streamlit 运行时** | 真跑：`streamlit.testing.v1.AppTest` 把两个入口跑完，6 条全绿。**这补上了原来那一栏 ❌** |
 | ✅ | **合并后的 `API`（FastAPI）真起服务** | 容器内真起 uvicorn：`/health` 200（含 workers + order_db）、`/openapi.json` 元数据齐、空问题 422、`/trace/不存在` 404、真提问 200（257+29 token / 1.2s）。**这一条走了网络、花了 token**，不属于"测试不联网"那一栏 |
 | ✅ | **Milvus 那条代码路径** | 真跑：连宿主常驻的 v2.5.5，`ecom_verify_<随机>` 临时集合走完 add / count / search / delete / drop，**零残留**（另有一条专门查残留）。⚠️ 见下面的版本错位 |
-| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 10 条**，现在宿主 `.venv`（`--all-extras`）上是 **749 条 / 747 passed / 2 skipped**，`ruff` 干净（这批的 GitHub CI 还没跑过；workflow 里已经加了前端构建 job） |
+| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 10 条**，现在宿主 `.venv`（`--all-extras`）上是 **757 条 / 755 passed / 2 skipped**，`ruff` 干净（这批的 GitHub CI 还没跑过；workflow 里已经加了前端构建 job） |
 | ✅ | **L1 只读 / 邀请码 / 预算闸门** | 真跑：32 条测试覆盖 fail closed 的邀请码、每客户端限流、跨重连的 token 账本、损坏账本拒绝花钱、路由不选 analytics、退货在落库前被挡、API 429 与 trace 404、界面门禁与建议语。**只验证了代码层**；下面那栏是部署文件 |
 | ✅ | **公网演示编排能解析** | 真跑：`docker compose --env-file .env.prod -f docker-compose.prod.yml config --quiet` 退出 0（临时 `.env.prod` 校验后已删）；Caddyfile 用 `caddy:2.10-alpine caddy validate` 通过（健康检查那条 `context canceled` 是校验时没有 app 容器，属预期）。**没有真部署**：没有域名和公网服务器，HTTPS 证书签发、Caddy→app 转发、公网可达都**没验过** |
 | ✅ | **CI 本身真跑绿了** | 真跑：[run #38132662970](https://github.com/My16210/ecommerce-multi-agent-cs/actions/runs/38132662970)（2026-10-11）——`ruff: All checks passed!`，`pytest: 517 passed, 3 skipped, 15.06s`，和本机干净 checkout 预演的数字一致。**这一栏原来是 ❌**：工作流写过、命令本地验过，但没推上去就一次都没真跑过。<br>真跑还多抓到两处**本地永远看不出来**的东西：① `python-version-file` 这个输入名**不存在**，setup-uv 只打一条 warning 就忽略它，workflow 照样绿、看着像钉住了版本；② `astral-sh/setup-uv` **没有 `v10` 这个大版本 tag**（它的可移动大版本 tag 只发到 v7），钉 `@v10` 会让 job 在 "Set up job" 阶段就红，得钉精确的 `@v10.3.0`。两处都改成实测过的写法 |
@@ -976,7 +999,7 @@ CI 现在有两个 job：`lint-and-test`（ruff + pytest）和 `frontend`（`npm
 - **会话过期要有外挂的 cron，长驻进程不会自我清理。** 过期只在两处触发：进程启动时一次、CLI 显式调用。**不做**懒加载式的"读的时候顺手删"——那会让读操作产生写副作用，出问题时极难定位。这个代价是**换来的**，不是漏掉的。同一台机器跑三个副本的话，各自清各自的。
 - **跨轮指代消解只做"订单号"这一种实体，而且只在指代词出现时才触发。** 这条原来叫"路由不解析代词回指"（真跑 `/chat` 时发现的，不是推测）：带历史追问「那它的金额是多少」，历史**确实进了 prompt**（token 从 257 涨到 387），但路由第一层是关键词规则，`plan` 是空的，于是答了"没听明白"。**现在修了**，判定集中在 [`utils/entities.py`](ecom/orchestrator/utils/entities.py)，router 的规则层和 order worker 走同一个函数（细节见上面「会话持久化」一节）。三条边界，都是有意的：**（1）只有订单号**会被携带，金额 / 商品名没做；**（2）读操作可以回退到携带来的号，写操作 `create_return` 不可以**（所以它永远**不会**替用户对一笔猜出来的订单提交退货）；**（3）携带只覆盖最近 `HISTORY_TURNS` 条用户发言**。它**不解决**"聊久了早期信息滑出窗口"——那是会话内长期记忆，见上面「会话内长期记忆：蒸馏 + 按需召回」一节。
 - **Milvus 客户端与服务端版本错位**。本机常驻的服务端是 **v2.5.5**，而 `pyproject.toml` 把 pymilvus pin 在 `>=2.6,<3`、compose 里那个服务是 `milvusdb/milvus:v2.6.24`。实测客户端 2.6 连 2.5.5 服务端这几个接口都能用（验证矩阵里那一行就是跑通的证据），但**这条对应关系没有保证**。真要长期用，服务端该换到 2.6.x 对齐 pin。
-- **`admin.py` 默认仍是演示级鉴权**。`AUTH_ENABLED=0` 时是一个明文口令，没有用户、没有角色、没有审计（"审核人"是手填字符串）；`AUTH_ENABLED=1` 时改成 admin token + `audit_log`，但仍没有登录页、MFA、token 过期。别把它说成"做了完整权限系统"。第二层是 compose 的 `127.0.0.1` 绑定。
+- **`admin.py` 默认仍是演示级鉴权**。`AUTH_ENABLED=0` 时是一个明文口令，没有用户、没有角色、没有审计；`AUTH_ENABLED=1` 时改成 admin token / 登录会话 + `audit_log`，token 有过期和轮换，但仍没有浏览器登录页、MFA、忘记密码。别把它说成"做了完整权限系统"。第二层是 compose 的 `127.0.0.1` 绑定。
 - **两个界面现在都只绑 `127.0.0.1`**（原来只有 admin 绑，app 发布在 `0.0.0.0` 且无任何鉴权）。app 那条没有口令那一层，所以绑定是它**唯一**的一层。要跨机器演示就 `APP_BIND=0.0.0.0 docker compose up -d`——那一刻是你**自己**决定暴露它，而不是默认敞着。
 
 > **上面这些"已知限制"是散落的。** 如果想知道**它们合起来意味着什么、真上线会先坏在哪里**，
