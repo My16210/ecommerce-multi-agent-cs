@@ -102,6 +102,11 @@ def _run_streaming(question: str, chat_history: list, verbose: bool, started: fl
             piece = event.get("text") or ""
             pieces.append(piece)
             print(_safe(piece), end="", flush=True)
+        elif kind == "reset":
+            # 重路由：上一轮已经打出去的字收不回来，但至少不能把它当成新一轮
+            # 正文继续拼。终端没有重画能力，所以明确分隔并把记录清空。
+            pieces.clear()
+            print(_safe("\n（重新规划，以下是新一轮答复）"))
         elif kind == "final":
             final = event.get("state") or {}
     elapsed_ms = int((time.perf_counter() - started) * 1000)

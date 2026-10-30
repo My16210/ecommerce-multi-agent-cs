@@ -1,4 +1,12 @@
-import type { ChatEvent, Health } from "./types";
+import type {
+  ChatEvent,
+  Health,
+  SessionDetail,
+  SessionSummary,
+  TicketDetail,
+  TicketInfo,
+  TicketSummary,
+} from "./types";
 
 /**
  * 接口错误。`requestId` 是给用户拿去对服务端日志的——和 api.py 的错误体
@@ -67,6 +75,140 @@ export async function login(username: string, password: string): Promise<LoginRe
 }
 
 /**
+ * 历史会话接口。token 同时放 `Authorization` 和 `X-API-Key`：服务端在开了
+ * 身份层时把两者都当 bearer 看，这样登录 token 和旧的手工 token 都能用。
+ */
+function sessionHeaders(token: string): Record<string, string> {
+  return { Authorization: `Bearer ${token}`, "X-API-Key": token };
+}
+
+/** 当前账号的会话列表（只有标题、时间和条数，不含正文）。 */
+export async function fetchSessions(
+  token: string,
+  signal?: AbortSignal,
+): Promise<SessionSummary[]> {
+  const response = await fetch("/sessions", { headers: sessionHeaders(token), signal });
+  if (!response.ok) throw await readError(response);
+  const body = (await response.json()) as { sessions?: SessionSummary[] };
+  return Array.isArray(body.sessions) ? body.sessions : [];
+}
+
+/** 一个会话的消息明细。 */
+export async function fetchSession(
+  sessionId: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<SessionDetail> {
+  const response = await fetch(`/sessions/${encodeURIComponent(sessionId)}`, {
+    headers: sessionHeaders(token),
+    signal,
+  });
+  if (!response.ok) throw await readError(response);
+  return (await response.json()) as SessionDetail;
+}
+
+/** 删除自己的会话（消息和摘要一起删）。 */
+export async function deleteSession(sessionId: string, token: string): Promise<number> {
+  const response = await fetch(`/sessions/${encodeURIComponent(sessionId)}`, {
+    method: "DELETE",
+    headers: sessionHeaders(token),
+  });
+  if (!response.ok) throw await readError(response);
+  const body = (await response.json()) as { deleted?: number };
+  return body.deleted ?? 0;
+}
+
+/* ── 人工工单 ───────────────────────────────────────────────────────── */
+
+/** 这个会话最近一张工单（包括已关闭的）；从没转过人工是 null。 */
+export async function fetchTicket(
+  sessionId: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<TicketInfo | null> {
+  const response = await fetch(
+    `/sessions/${encodeURIComponent(sessionId)}/ticket`,
+    { headers: sessionHeaders(token), signal },
+  );
+  if (!response.ok) throw await readError(response);
+  const body = (await response.json()) as { ticket?: TicketInfo | null };
+  return body.ticket ?? null;
+}
+
+/** 用户主动点「转人工」。幂等：已有未关闭工单时返回同一张。 */
+export async function openHandoff(sessionId: string, token: string): Promise<TicketInfo> {
+  const response = await fetch(
+    `/sessions/${encodeURIComponent(sessionId)}/handoff`,
+    { method: "POST", headers: sessionHeaders(token) },
+  );
+  if (!response.ok) throw await readError(response);
+  const body = (await response.json()) as { ticket?: TicketInfo | null };
+  if (!body.ticket) throw new ApiError("工单没有创建成功。", 0);
+  return body.ticket;
+}
+
+/** 客服的排队列表。status 见服务端：open / claimed / closed / all。 */
+export async function fetchTickets(
+  token: string,
+  status = "open",
+  signal?: AbortSignal,
+): Promise<TicketSummary[]> {
+  const response = await fetch(
+    `/tickets?status=${encodeURIComponent(status)}`,
+    { headers: sessionHeaders(token), signal },
+  );
+  if (!response.ok) throw await readError(response);
+  const body = (await response.json()) as { tickets?: TicketSummary[] };
+  return Array.isArray(body.tickets) ? body.tickets : [];
+}
+
+export async function fetchTicketDetail(
+  ticketId: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<TicketDetail> {
+  const response = await fetch(`/tickets/${encodeURIComponent(ticketId)}`, {
+    headers: sessionHeaders(token),
+    signal,
+  });
+  if (!response.ok) throw await readError(response);
+  return (await response.json()) as TicketDetail;
+}
+
+export async function claimTicket(ticketId: string, token: string): Promise<TicketInfo> {
+  const response = await fetch(`/tickets/${encodeURIComponent(ticketId)}/claim`, {
+    method: "POST",
+    headers: sessionHeaders(token),
+  });
+  if (!response.ok) throw await readError(response);
+  const body = (await response.json()) as { ticket: TicketInfo };
+  return body.ticket;
+}
+
+export async function replyTicket(
+  ticketId: string,
+  token: string,
+  content: string,
+): Promise<void> {
+  const response = await fetch(`/tickets/${encodeURIComponent(ticketId)}/reply`, {
+    method: "POST",
+    headers: { ...sessionHeaders(token), "Content-Type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+  if (!response.ok) throw await readError(response);
+}
+
+export async function closeTicket(ticketId: string, token: string): Promise<TicketInfo> {
+  const response = await fetch(`/tickets/${encodeURIComponent(ticketId)}/close`, {
+    method: "POST",
+    headers: sessionHeaders(token),
+  });
+  if (!response.ok) throw await readError(response);
+  const body = (await response.json()) as { ticket: TicketInfo };
+  return body.ticket;
+}
+
+/**
  * 调 `/chat/stream`，把 SSE 帧逐条吐出来。
  *
  * 用 `fetch` 而不是 `EventSource`：EventSource 只能发 GET、不能带请求体和
@@ -78,7 +220,12 @@ export async function login(username: string, password: string): Promise<LoginRe
  */
 export async function* streamChat(options: StreamChatOptions): AsyncGenerator<ChatEvent> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (options.apiKey) headers["X-API-Key"] = options.apiKey;
+  if (options.apiKey) {
+    // 登录 token 和手工粘贴的 token 走同一个字段；服务端开了身份层时
+    // `Authorization` 和 `X-API-Key` 都认，这里两个都带，省掉模式判断。
+    headers["X-API-Key"] = options.apiKey;
+    headers["Authorization"] = `Bearer ${options.apiKey}`;
+  }
   if (options.inviteCode) headers["X-Invite-Code"] = options.inviteCode;
 
   const response = await fetch("/chat/stream", {

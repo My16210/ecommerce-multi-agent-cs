@@ -4,6 +4,8 @@
 
 知识库结果和联网结果会分栏拼进 prompt，让模型知道每条资料的出处
 """
+from collections.abc import Callable
+
 from ecom.knowledge.utils import streaming
 from ecom.knowledge.utils.llm import get_llm
 from ecom.knowledge.utils.logger import setup_logger
@@ -106,12 +108,16 @@ def _invoke(llm, messages: list) -> tuple:
     return response.content, getattr(response, "usage_metadata", None) or {}
 
 
-def _stream(llm, messages: list) -> tuple:
+def _stream(llm, messages: list, on_token: Callable[[str], None] | None = None) -> tuple:
     """流式：边收边发给当前的汇，同时把全文拼回来
 
     拼回来的那份文本才是 state["answer"]——所以流式只改变"什么时候看到"，
     不改变"答案是什么"。这也是它敢改的原因：judge 判空、多轮记忆、评测
     读的都是同一份文本，它们不知道界面挂了汇。
+
+    `on_token` 是给 React/API 那条路的显式回调：worker 跑在另一个线程里，
+    `ContextVar` 不会跟过去，所以不能靠 `streaming.emit()`。传了回调就只走
+    回调，避免同一段字被发两次。
     """
     pieces = []
     usage = {}
@@ -119,7 +125,10 @@ def _stream(llm, messages: list) -> tuple:
         text = _chunk_text(chunk)
         if text:
             pieces.append(text)
-            streaming.emit(text)
+            if on_token is not None:
+                on_token(text)
+            else:
+                streaming.emit(text)
         # 开了 stream_usage 时，用量挂在最后一个 chunk 上（别的 chunk 上没有）
         if getattr(chunk, "usage_metadata", None):
             usage = chunk.usage_metadata
@@ -131,6 +140,7 @@ def generate_answer(
     contexts: list,
     web_contexts: list = None,
     chat_history: list = None,
+    on_token: Callable[[str], None] | None = None,
 ) -> str:
     """
     基于检索结果生成答案
@@ -141,6 +151,7 @@ def generate_answer(
                  其中 `role="memory"` 是多轮记忆（见 orchestrator/memory.py），
                  由调用方拼在真实历史前面——这里只负责把它的标签印对（见上面
                  `_ROLE_LABELS`），不判断它该不该来。
+    on_token：逐 token 回调（API 的 SSE 用）。不传时沿用 Streamlit 的 ContextVar 汇。
     """
     web_contexts = web_contexts or []
     chat_history = chat_history or []
@@ -165,12 +176,12 @@ def generate_answer(
 
     with stage("generate"):
         llm = get_llm(TEMPERATURE, TIMEOUT)
-        # 有汇（界面挂了）就走流式，没有（命令行、评测、被直接 import）就走
-        # 原来的整段返回。两条路拼出来的文本必须一模一样，有测试钉住。
-        if streaming.current() is None:
+        # 有汇（界面挂了）或显式给了回调就走流式，没有（命令行、评测、被直接
+        # import）就走原来的整段返回。两条路拼出来的文本必须一模一样，有测试钉住。
+        if on_token is None and streaming.current() is None:
             content, usage = _invoke(llm, messages)
         else:
-            content, usage = _stream(llm, messages)
+            content, usage = _stream(llm, messages, on_token)
 
     # 用量记进计时器（没在采集时是空操作）。**只在这里记一次**：
     # 响应对象一返回就丢了（函数只往外给 content），事后再想补算是拿不到的。

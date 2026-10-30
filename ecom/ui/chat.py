@@ -245,6 +245,11 @@ def _run_turn(ctx: ChatContext, question: str, display_question: str | None = No
                         status.update(label=":shimmer[正在生成答复…]", state="running")
                     pieces.append(event.get("text") or "")
                     answer_box.markdown("".join(pieces) + "▌")
+                elif kind == "reset":
+                    # 重路由：上一轮的单 worker 直流可能已经画在屏幕上了，
+                    # 那是中间产物；不清掉就会和下一轮的正文拼在一起。
+                    pieces.clear()
+                    answer_box.markdown("")
                 elif kind == "final":
                     final = event.get("state") or {}
         except Exception:

@@ -53,14 +53,20 @@ def cmd_show(args) -> int:
     print("-" * 60)
 
     # 看全部，不走 HISTORY_TURNS 那个截断——那个参数管的是"喂给模型多少"，
-    # 这里是给人看的，人要看全的。
-    messages = session.history(args.session_id, max_turns=10**6)
+    # 这里是给人看的，人要看全的。用 `transcript()` 而不是 `history()`：
+    # 后者会把人工客服（role='agent'）映射成 assistant，人的回复就看不出来了。
+    messages = session.transcript(args.session_id, max_messages=10**6)
     if not messages:
         print("（这个会话还没有对话）")
         return 0
 
     for msg in messages:
-        who = "用户" if msg["role"] == "user" else "客服"
+        if msg["role"] == "user":
+            who = "用户"
+        elif msg["role"] == "agent":
+            who = f"人工客服 {msg['author']}" if msg.get("author") else "人工客服"
+        else:
+            who = "机器人"
         print(f"[{who}] {msg['content']}")
     return 0
 
@@ -81,7 +87,8 @@ def cmd_purge(args) -> int:
     # "记忆有没有被删掉"这件事在输出里看不见——而它恰恰是最该被看见的那部分。
     print(
         f"已清理 {result['sessions']} 个会话 / {result['messages']} 条消息 / "
-        f"{result['memories']} 条记忆（{days} 天没动静的）"
+        f"{result['memories']} 条记忆 / {result.get('tickets', 0)} 张工单"
+        f"（{days} 天没动静的）"
     )
     return 0
 
@@ -128,7 +135,8 @@ def main() -> int:
         print(f"\n会话库：{info['db_path']}")
         print(
             f"共 {info['sessions']} 个会话 / {info['messages']} 条消息 / "
-            f"{info['memories']} 条记忆，保留 {info['ttl_days']} 天"
+            f"{info['memories']} 条记忆 / {info.get('open_tickets', 0)} 张未关闭工单，"
+            f"保留 {info['ttl_days']} 天"
         )
         if info["newest"]:
             print(f"最早 {info['oldest']}　最新 {info['newest']}")

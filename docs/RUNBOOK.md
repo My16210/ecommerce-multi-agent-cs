@@ -146,7 +146,10 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d app
 10 4 * * * cd /opt/ecom_cs && docker compose --env-file .env.prod -f docker-compose.prod.yml exec -T app python -m ecom.orchestrator.cli.session purge >> logs/purge.log 2>&1
 ```
 
-保留期是 `.env.prod` 的 `SESSION_TTL_DAYS`（模板是 7 天）。
+保留期是 `.env.prod` 的 `SESSION_TTL_DAYS`（模板是 7 天）。工单存在同一个
+`data/orchestrator/sessions.db` 的 `tickets` 表里，**跟着会话一起过期、一起删**；
+`purge` 的输出里有 `tickets` 计数。正在排队的工单如果所属会话被清掉，工单也
+一并消失——这正是想要的：不能给一个已经不存在的会话留客服入口。
 
 ### 3.4 日志
 
@@ -167,6 +170,8 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d app
 | 证书申请失败 | 域名 A/AAAA 是否指向本机；80/443 是否被占用；`logs caddy` 里的 ACME 报错 |
 | 502 | `docker compose ps` 看 app 是否 healthy；`curl` 容器内 `/_stcore/health` |
 | 答案全是"知识库查不了" | `SILICONFLOW_API_KEY` 是否有效、服务器能不能访问它的 API |
+| 用户说转了人工但没人接 | 先看 `/health` 的 `auth` 和 `demo`：演示模式 / 未开身份层时**本来就没有人工**，答复会明说。开了身份层却没人接，是队列里真的没人（`GET /tickets?status=open` 用 agent token 看；`cli.session list` 的概览里有未关闭工单数） |
+| 客服台按钮不出现 | 登录账号角色是不是 `agent` / `admin`；手工粘贴的普通 token 不显示按钮，这是有意的 |
 | 图片识别失败 | `VISION_*` 配置；控制台模型是否仍然上架；`logs/app.log` 里有原因 |
 | 数据目录权限拒绝 | 容器以 uid 1000 运行：`sudo chown -R 1000:1000 data logs` |
 | 磁盘满 | 检查 `data/analytics/output`、`logs/`、旧会话；演示模式不跑数据分析，通常不会涨很快 |
@@ -196,8 +201,9 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 
 最少备份这些（都在 `data/`）：
 
-- `data/orchestrator/sessions.db` —— 用户会话，**不可重建**
+- `data/orchestrator/sessions.db` —— 用户会话 + 转人工工单（`tickets` 表），**不可重建**
 - `data/orchestrator/demo_usage.sqlite` —— 当日用量，丢了预算会重新计
+- `data/orchestrator/auth.db` —— principal / 登录会话 / 审计；丢了所有人都要重新建号
 - `data/orders.sqlite` —— 可重建（`--init-db`），但备份更省事
 - `data/knowledge/vector_store/` —— 可重建（`ingest`），体积较大，按需
 
@@ -232,7 +238,8 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml down -v
 
 以下每一条都是"真上线"必须补的，不能因为 Demo 能跑就当成已完成：
 
-1. **身份与权限**：`AUTH_ENABLED` 提供 token / 角色 / 审计；公网演示仍用共享邀请码（没开它），没有登录态 / 多租户 / token 过期。
+1. **身份与权限**：`AUTH_ENABLED` 提供 token / 角色 / 审计 / 会话归属 / 历史回看；公网演示仍用共享邀请码（没开它），也没有产品级用户体系（注册、找回密码、MFA、OIDC、多租户）。
+   转人工工单是**演示级闭环**：5 秒轮询、没有实时推送、SLA、排队超时、在线状态和客服技能分组；公网演示里这个能力整个是 404。
 2. **写操作**：退货申请在演示里被硬关掉，没有"演示账号可以写"的旁路。
 3. **数据分析**：整条路被停用；沙箱不是强隔离，不要在公网打开它。
 4. **备份与迁移**：没有自动备份、没有 schema 迁移。

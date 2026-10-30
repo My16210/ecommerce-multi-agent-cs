@@ -224,6 +224,27 @@ def test_streaming_ends_with_the_same_state_as_invoke():
     assert "elapsed_ms" in events[-1]
 
 
+def test_streaming_emits_stage_thinking_before_the_answer():
+    """思考过程是真实 state 的投影：路由、每个 worker、决策都要出现，
+    并且和答案正文分成两路（thinking 不能被拼进 answer）。"""
+    events = list(
+        answer_stream("订单 52644 到哪了，顺便问下退货政策", record=False, **_two_worker_kwargs())
+    )
+    thinking = [e for e in events if e["type"] == "thinking"]
+    texts = [e["text"] for e in thinking]
+
+    assert thinking and all(e["kind"] == "stage" for e in thinking)
+    assert texts[0].startswith("正在理解问题")
+    assert any("第 1 轮" in t and "订单" in t and "知识库" in t for t in texts)
+    assert any("「订单」完成" in t for t in texts)
+    assert any(t.startswith("决策：直接回答") for t in texts)
+
+    first_thinking = next(i for i, e in enumerate(events) if e["type"] == "thinking")
+    first_delta = next(i for i, e in enumerate(events) if e["type"] == "delta")
+    assert first_thinking < first_delta, "等待期间就该有过程可看，而不是答完才出现"
+    assert events[-1]["thinking"] == "".join(texts)
+
+
 def test_streamed_deltas_rebuild_the_final_answer():
     events = list(
         answer_stream("订单 52644 到哪了，顺便问下退货政策", record=False, **_two_worker_kwargs())
@@ -246,6 +267,52 @@ def test_a_single_conclusion_arrives_as_exactly_one_delta():
     )
     deltas = [e for e in events if e["type"] == "delta"]
     assert [d["text"] for d in deltas] == ["订单结论"]
+
+
+def test_a_single_worker_that_supports_tokens_streams_instead_of_one_chunk():
+    """单 worker 时它就是最终答案，worker 的 token 可以真流——不是切字符串。"""
+    def streaming_answer(q, h, on_token=None):
+        assert on_token is not None, "单 worker 的流式路径必须把回调传进来"
+        on_token("逐")
+        on_token("字")
+        return {"answer": "逐字结论", "sources": []}
+
+    events = list(
+        answer_stream(
+            "退货政策是什么",
+            workers=workers(knowledge=streaming_answer),
+            router_llm=FakeLLM('{"workers": ["knowledge"], "confidence": 1.0}'),
+            record=False,
+        )
+    )
+
+    deltas = [e["text"] for e in events if e["type"] == "delta"]
+    assert deltas == ["逐", "字"]
+    assert events[-1]["state"]["answer"] == "逐字结论"
+
+
+def test_a_reroute_resets_the_previous_rounds_streamed_text():
+    """上一轮流出的中间产物不能被拼进下一轮；消费方需要一个显式的 reset。"""
+    def insufficient(q, h, on_token=None):
+        if on_token:
+            on_token("这是第一轮的中间答复")
+        return {"answer": "这是第一轮的中间答复", "insufficient": True, "sources": []}
+
+    events = list(
+        answer_stream(
+            "我这单到哪了",
+            workers=workers(knowledge=insufficient),
+            router_llm=FakeLLM(*plan_json('["knowledge"]', '["order"]')),
+            record=False,
+        )
+    )
+
+    types = [e["type"] for e in events]
+    assert "reset" in types
+    assert types.index("reset") > types.index("delta")
+    # 第一轮的澄清话术按设计会留在最终答复里（见上面"不丢澄清"那条测试）；
+    # reset 管的是客户端已经画出来的那一段，不是服务端的拼接规则。
+    assert "订单结论" in events[-1]["state"]["answer"]
 
 
 def test_streaming_records_exactly_one_trace_line(monkeypatch):
@@ -294,3 +361,48 @@ def test_summarize_workers_aggregates_per_worker():
     )
     assert summary["order"] == {"calls": 2, "ok": 1, "ms": 20120, "errors": ["超时"]}
     assert summary["knowledge"]["calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 明确要求人工：短路，不建图、不调模型
+# ---------------------------------------------------------------------------
+def test_explicit_human_request_skips_the_graph_and_costs_nothing():
+    """「转人工」是一个动作，不是一道要理解的问题。
+
+    这里把 router/synth 都换成会抛错的 ExplodingLLM：如果哪天有人把短路去掉，
+    这个测试会立刻炸，而不是"多花一次调用、结果看起来还行"。
+    """
+    from ecom.orchestrator.core.supervisor import HANDOFF_REQUESTED
+
+    final = answer(
+        "转人工",
+        workers=workers(),
+        router_llm=ExplodingLLM(),
+        synth_llm=ExplodingLLM(),
+        record=False,
+    )
+
+    assert final["decision"] == "human"
+    assert final["answer"] == HANDOFF_REQUESTED
+    assert final["tokens"].get("in", 0) == 0
+    assert final["tokens"].get("out", 0) == 0
+    assert final["results"] == []
+
+
+def test_explicit_human_request_streams_the_same_event_shape():
+    """流式消费方不需要为"这一轮没建图"写分支：start → delta → final。"""
+    events = list(
+        answer_stream(
+            "我要人工客服",
+            workers=workers(),
+            router_llm=ExplodingLLM(),
+            synth_llm=ExplodingLLM(),
+            record=False,
+        )
+    )
+
+    kinds = [e["type"] for e in events]
+    assert kinds[0] == "start"
+    assert kinds[-1] == "final"
+    assert any(e["type"] == "delta" for e in events)
+    assert events[-1]["state"]["decision"] == "human"

@@ -28,6 +28,8 @@ generate_answer 都是无副作用的函数，给一个进程边界带不来任�
 区别很实际：跑了图就会走到 `answer_node` 里的 `record_question`，把这次问的题
 写进人工待审核队列。线上客服每问一次就往审核队列里塞一条，那条队列就废了。
 """
+from collections.abc import Callable
+
 from ecom.knowledge.core.graph import ANSWER_FALLBACK
 from ecom.knowledge.generator.answer import generate_answer
 from ecom.knowledge.retriever.reranker import rerank
@@ -68,7 +70,11 @@ def _top_vector_score(hits: list) -> float:
     return best
 
 
-def run_knowledge(question: str, chat_history: list = None) -> dict:
+def run_knowledge(
+    question: str,
+    chat_history: list = None,
+    on_token: Callable[[str], None] | None = None,
+) -> dict:
     # 1) 混合检索（内部含向量+BM25→RRF；向量那一路失败会抛出来，交给 base 记成 ok=False）
     hits = retrieve(question, get_vector_store())
     # 2) rerank（三级降级，最差也会按 score 截断，不会返回空）
@@ -77,7 +83,11 @@ def run_knowledge(question: str, chat_history: list = None) -> dict:
 
     # 3) 生成。调的是知识库自己那个 generate_answer，不是复制一份逻辑——
     #    复制的那份只要有一处和生产不一样，评出来的结果就开始骗人。
-    answer = generate_answer(question, top, [], list(chat_history or []))
+    #    on_token 只有 API 单 worker 流式那条路会传（见 supervisor._worker_node）；
+    #    Streamlit 仍走 ContextVar 汇，命令行/评测走整段返回。
+    answer = generate_answer(
+        question, top, [], list(chat_history or []), on_token=on_token
+    )
     if answer == ANSWER_FALLBACK:
         # 兜底文案 = 生成服务故障，是"坏了"不是"不知道"。抛出去让 base 记 ok=False。
         raise RuntimeError("知识库答案生成服务不可用（返回了兜底文案）")

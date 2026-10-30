@@ -155,9 +155,40 @@ def _emit_text(emit, text: str) -> None:
         emit({"type": "delta", "text": text})
 
 
+def _emit_thinking(emit, text: str) -> None:
+    """推理内容单独走一路：它不是答复正文，不能拼进 `answer`。"""
+    if emit is not None and text:
+        emit({"type": "thinking", "kind": "reasoning", "text": text})
+
+
+def _reasoning_text(chunk) -> str:
+    """
+    取 provider 的推理增量。
+
+    千问 / DeepSeek 的 OpenAI 兼容接口把思维链放在 `reasoning_content` 里，
+    LangChain 会把它留在 `additional_kwargs`（不同版本也可能放到
+    `response_metadata`）。取不到就是空字符串——普通模型没有思维链，
+    这不是错误，只是这次没有可显示的推理。
+    """
+    for holder in (
+        getattr(chunk, "additional_kwargs", None),
+        getattr(chunk, "response_metadata", None),
+    ):
+        if not isinstance(holder, dict):
+            continue
+        for key in ("reasoning_content", "reasoning"):
+            value = holder.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
 def _stream_call(llm, messages: list, emit) -> tuple[str, dict]:
     """
     流式调模型：边收边交，最后把正文和用量一起返回。
+
+    正文走 `delta`，思维链走 `thinking`。两条路分开是因为消费方对它们的
+    处理完全不同：正文要拼成答案，思维链只用来展示过程，绝不能混进正文。
 
     用量只在**最后一个**带 `usage_metadata` 的块上取（和 provider 的实际形状
     一致：前面的块只有正文，最后一块把整次调用的用量一起报上来）。取不到就
@@ -170,6 +201,7 @@ def _stream_call(llm, messages: list, emit) -> tuple[str, dict]:
         if piece:
             pieces.append(piece)
             _emit_text(emit, piece)
+        _emit_thinking(emit, _reasoning_text(chunk))
         chunk_tokens = usage_of(chunk)
         if chunk_tokens["in"] or chunk_tokens["out"]:
             tokens = chunk_tokens

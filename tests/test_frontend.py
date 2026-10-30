@@ -39,6 +39,13 @@ def test_frontend_sources_are_present():
         "src/App.tsx",
         "src/api.ts",
         "src/main.tsx",
+        "src/components/AgentConsole.tsx",
+        "src/components/Composer.tsx",
+        "src/components/Icon.tsx",
+        "src/components/Markdown.tsx",
+        "src/components/SettingsDialog.tsx",
+        "src/components/Sidebar.tsx",
+        "src/components/TracePanel.tsx",
     ):
         assert (FRONTEND / relative).is_file(), f"缺少 frontend/{relative}"
 
@@ -78,10 +85,48 @@ def test_session_and_credentials_stay_in_session_storage():
 
 
 def test_model_output_is_not_rendered_as_html():
-    for relative in ("src/App.tsx", "src/api.ts"):
+    # Markdown 渲染器是模型输出进 DOM 的唯一位置；它只生成 React 元素，
+    # 不许有任何「拼 HTML 字符串再塞进节点」的路径。
+    for relative in (
+        "src/App.tsx",
+        "src/api.ts",
+        "src/components/Markdown.tsx",
+    ):
         source = _read(relative)
         assert "dangerouslySetInnerHTML" not in source
         assert "innerHTML" not in source
+
+
+def test_all_frontend_sources_avoid_html_injection_and_persistent_storage():
+    # 组件拆分之后，安全约定不能只靠「记得检查 App.tsx」。
+    checked = 0
+    for path in sorted((FRONTEND / "src").rglob("*")):
+        if path.suffix not in {".ts", ".tsx"}:
+            continue
+        source = path.read_text(encoding="utf-8")
+        assert "dangerouslySetInnerHTML" not in source, path
+        assert "innerHTML" not in source, path
+        assert "localStorage.setItem" not in source, path
+        assert "localStorage.getItem" not in source, path
+        assert "window.localStorage" not in source, path
+        checked += 1
+    assert checked >= 9, "src/ 下的源码文件数不对，扫描可能没跑到"
+
+
+def test_shell_wires_the_three_columns_and_session_store():
+    # 三栏组件存在还不够：必须真的接到 App 上，会话列表键也必须落在
+    # sessionStorage（按标签页），不能换成 localStorage。
+    app_source = _read("src/App.tsx")
+    for component in ("Sidebar", "Composer", "TracePanel", "Markdown", "SettingsDialog"):
+        assert f'./components/{component}' in app_source
+    assert '"ecom.conversations"' in app_source
+    assert '"ecom.active_conversation"' in app_source
+    # 思考过程单独一路：事件处理、展示组件、类型契约缺一不可。
+    assert 'event.type === "thinking"' in app_source
+    assert "ThinkingBlock" in app_source
+    types_source = _read("src/types.ts")
+    assert "ThinkingEvent" in types_source
+    assert "thinking?" in types_source
 
 
 def test_api_client_uses_sse_endpoint_and_auth_headers():
@@ -91,6 +136,31 @@ def test_api_client_uses_sse_endpoint_and_auth_headers():
     assert '"/auth/login"' in source
     assert "X-API-Key" in source
     assert "X-Invite-Code" in source
+    assert "Authorization" in source
+
+
+def test_login_hydrates_history_from_the_server_not_only_session_storage():
+    """关掉标签页后历史还在，靠的是登录后重新拉 `/sessions`。
+
+    这几条是"少一行也不会报错"的接线：没有 `fetchSessions`，侧边栏就永远
+    只有本标签页；没有 `loaded:false`，历史会话会被当成空对话显示欢迎页。
+    """
+    api_source = _read("src/api.ts")
+    assert '"/sessions"' in api_source
+    assert "fetchSessions" in api_source
+    assert "fetchSession" in api_source
+    assert "deleteSession" in api_source
+
+    app_source = _read("src/App.tsx")
+    assert "fetchSessions" in app_source
+    assert "mergeServerSessions" in app_source
+    assert "loaded: false" in app_source
+    assert "IDENTITY_KEY" in app_source
+
+    types_source = _read("src/types.ts")
+    assert "SessionSummary" in types_source
+    assert "SessionDetail" in types_source
+    assert "loaded?" in types_source
 
 
 def test_login_form_uses_the_login_endpoint_and_keeps_password_out_of_storage():
@@ -100,6 +170,39 @@ def test_login_form_uses_the_login_endpoint_and_keeps_password_out_of_storage():
     # 密码只放在组件 state 里，不写 sessionStorage
     assert "password" in app_source
     assert "writeStored" in app_source
+
+
+def test_handoff_ui_is_wired_end_to_end():
+    """转人工不只是一句文案：按钮、状态条、客服台、轮询缺一不可。
+
+    少任何一段都不会报错——用户点了没反应、客服看不到队列、回复要手动刷新。
+    """
+    app_source = _read("src/App.tsx")
+    assert "requestHandoff" in app_source
+    assert "openHandoff" in app_source
+    assert "syncTicket" in app_source
+    assert "handoff-banner" in app_source
+    assert "AgentConsole" in app_source
+    # 角色单独存：它决定客服台按钮在不在。
+    assert "ROLE_KEY" in app_source
+    assert 'role === "agent"' in app_source
+    # 人工消息要有独立样式，不能和机器人混在一起。
+    assert 'message.role === "agent"' in app_source
+
+    api_source = _read("src/api.ts")
+    for path in ("/handoff", "/tickets", "/claim", "/reply", "/close"):
+        assert path in api_source
+
+    types_source = _read("src/types.ts")
+    for name in ("HandoffInfo", "TicketInfo", "TicketDetail", "TicketSummary"):
+        assert name in types_source
+    assert '"agent"' in types_source
+
+    console = _read("src/components/AgentConsole.tsx")
+    assert "fetchTickets" in console
+    assert "claimTicket" in console
+    assert "replyTicket" in console
+    assert "closeTicket" in console
 
 
 def test_mount_frontend_serves_index_from_temp_dist(tmp_path):

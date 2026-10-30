@@ -62,6 +62,7 @@ checkpointer 才是对的工具。现在没有这个需求。
 import secrets
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -86,7 +87,8 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL,
     role       TEXT NOT NULL,
     content    TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    author     TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);
@@ -101,6 +103,25 @@ CREATE TABLE IF NOT EXISTS memories (
     UNIQUE(session_id, through_message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id, id);
+CREATE TABLE IF NOT EXISTS tickets (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id       TEXT NOT NULL UNIQUE,
+    session_id      TEXT NOT NULL,
+    owner_id        TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL CHECK (status IN ('open', 'claimed', 'closed')),
+    reason          TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    claimed_by      TEXT,
+    claimed_by_name TEXT,
+    claimed_at      TEXT,
+    closed_at       TEXT,
+    closed_by       TEXT
+);
+-- 一个会话同时最多一张未关闭的工单：重复触发转人工不该在队列里堆出好几行。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tickets_live_session
+    ON tickets(session_id) WHERE status != 'closed';
+CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status, created_at);
 """
 
 _conn = None
@@ -144,6 +165,12 @@ def connect() -> sqlite3.Connection:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
         if "owner_id" not in columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''")
+        # 人工客服答复也落在同一张 messages 表里（role='agent'），`author` 记是谁回的。
+        # 合并成一张表而不是另开 ticket_messages：历史回看、导出、删除都只有一条路径，
+        # 删会话时也不会漏掉"人工那几句还留着"。
+        message_columns = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
+        if "author" not in message_columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN author TEXT NOT NULL DEFAULT ''")
         conn.commit()
         _conn = conn
     return _conn
@@ -259,7 +286,13 @@ def history(session_id: str, max_turns: int = None) -> list:
             "ORDER BY id DESC LIMIT ?",
             (sid, turns * 2),
         ).fetchall()
-    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+    # 人工客服的答复（role='agent'）对模型来说就是"上一轮的助手说过的话"。
+    # **不把这个映射写在这里也不报错**：worker 会收到一个它不认识的 role，
+    # 各家模型对未知 role 的处理从忽略到报错都有，属于"换模型才炸"的坑。
+    return [
+        {"role": "assistant" if r["role"] == "agent" else r["role"], "content": r["content"]}
+        for r in reversed(rows)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -351,20 +384,38 @@ def memories_for(session_id: str, limit: int = None) -> list:
     return [dict(r) for r in rows]
 
 
-def list_sessions(limit: int = 50) -> list:
-    """会话列表，最近更新的在前。带轮数，供 CLI / 界面概览用。"""
+def list_sessions(limit: int = 50, owner_id: str = None) -> list:
+    """
+    会话列表，最近更新的在前。带消息条数和第一条提问（界面拿它当标题）。
+
+    `owner_id=None` 表示**不加归属过滤**，给 CLI 看全库用；传字符串则只返回
+    这个 principal 的会话。**不要把空字符串当成"不过滤"**——匿名会话的
+    owner_id 就是空串，那会把所有人的匿名会话混在一起。
+    """
+    where = ""
+    args: list = []
+    if owner_id is not None:
+        where = "WHERE s.owner_id = ?"
+        args.append(owner_id)
+    args.append(limit)
     with _lock:
         rows = connect().execute(
-            """
+            f"""
             SELECT s.session_id, s.created_at, s.updated_at, s.owner_id,
-                   COUNT(m.id) AS messages
+                   COUNT(m.id) AS messages,
+                   COALESCE((
+                       SELECT first.content FROM messages first
+                       WHERE first.session_id = s.session_id AND first.role = 'user'
+                       ORDER BY first.id ASC LIMIT 1
+                   ), '') AS title
             FROM sessions s
             LEFT JOIN messages m ON m.session_id = s.session_id
+            {where}
             GROUP BY s.session_id
             ORDER BY s.updated_at DESC
             LIMIT ?
             """,
-            (limit,),
+            args,
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -376,6 +427,94 @@ def get_session(session_id: str) -> dict:
             "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
         ).fetchone()
     return dict(row) if row else None
+
+
+def first_question(session_id: str) -> str:
+    """
+    这个会话的第一条用户提问。列表和明细都用它做标题。
+
+    单独查而不是从 `transcript()` 里拿：明细只取最近 200 条，一个聊得很长的
+    会话，第一条提问早就滑出去了——从窗口里取会让标题变成「未命名会话」。
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return ""
+    with _lock:
+        row = connect().execute(
+            "SELECT content FROM messages WHERE session_id = ? AND role = 'user' "
+            "ORDER BY id ASC LIMIT 1",
+            (sid,),
+        ).fetchone()
+    return row["content"] if row else ""
+
+
+def transcript(session_id: str, max_messages: int = 200) -> list:
+    """
+    一个会话的消息明细，**按时间正序**，带 `id` 和时间戳。
+
+    和 `history()` 的区别是用途：`history()` 是喂给模型的窗口（只留最近几轮、
+    不带 id），这里是给人回看的历史（更长、带 id 方便前端做 key）。两者不要
+    互相顶替——把 `transcript` 直接喂模型会悄悄把上下文窗口撑大。
+    """
+    sid = (session_id or "").strip()
+    if not sid or max_messages <= 0:
+        return []
+    with _lock:
+        rows = connect().execute(
+            "SELECT id, role, content, created_at, author FROM messages "
+            "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            (sid, max_messages),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def append_agent_message(session_id: str, content: str, author: str, owner_id: str = "") -> int:
+    """
+    人工客服在一个会话里回一句。返回消息 id。
+
+    写进 `messages`（role='agent'）而不是单独的工单消息表：用户重新打开会话时
+    走的是同一个 `transcript()`，人工说过的话必须和机器说过的话一起出现；
+    `history()` 会把它映射成 assistant 喂回模型。**写入前先做归属检查**——
+    `ensure_session(owner_id=...)` 会拒绝别人的会话。
+    """
+    sid = ensure_session(session_id, owner_id=owner_id)
+    now = _now()
+    with _lock:
+        conn = connect()
+        cursor = conn.execute(
+            "INSERT INTO messages (session_id, role, content, created_at, author) "
+            "VALUES (?, 'agent', ?, ?, ?)",
+            (sid, content, now, str(author or "")[:64]),
+        )
+        conn.execute("UPDATE sessions SET updated_at = ? WHERE session_id = ?", (now, sid))
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+@contextmanager
+def transaction():
+    """
+    在会话库上持锁执行一组读写。
+
+    工单模块和会话模块共用**同一个** sqlite 连接：sqlite3 的连接对象不是为
+    并发设计的，各自持一把锁仍然可能同时用同一个连接。所以工单那边不自己
+    开锁，而是通过这里拿连接——两把锁保护一个连接，等于没保护。
+    """
+    with _lock:
+        yield connect()
+
+
+def _delete_rows(conn, sid: str) -> int:
+    """在已持锁的连接上删消息 / 记忆 / 工单 / 会话，返回删掉的消息条数。"""
+    cursor = conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+    removed = cursor.rowcount
+    conn.execute("DELETE FROM memories WHERE session_id = ?", (sid,))
+    # 工单里有"这位用户找过人工、谁接待的、接待到哪一步"，和会话正文一样敏感。
+    # 删会话却留着工单，和删了正文留着摘要同一种假动作。
+    conn.execute("DELETE FROM tickets WHERE session_id = ?", (sid,))
+    conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+    conn.commit()
+    return removed
 
 
 def delete_session(session_id: str) -> int:
@@ -394,18 +533,34 @@ def delete_session(session_id: str) -> int:
     if not sid:
         return 0
     with _lock:
+        return _delete_rows(connect(), sid)
+
+
+def delete_session_owned(session_id: str, owner_id: str):
+    """
+    只删属于 `owner_id` 的会话。返回消息条数；不存在或不属于他返回 `None`。
+
+    归属检查和删除在**同一把锁、同一个连接**里做。先在 API 层 `get_session`
+    再删也能跑，但那是两次独立读取——删除权限的判断不该和删除动作之间留缝。
+    """
+    sid = (session_id or "").strip()
+    owner = str(owner_id or "").strip()
+    if not sid or not owner:
+        return None
+    with _lock:
         conn = connect()
-        cursor = conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
-        removed = cursor.rowcount
-        conn.execute("DELETE FROM memories WHERE session_id = ?", (sid,))
-        conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
-        conn.commit()
-    return removed
+        row = conn.execute(
+            "SELECT owner_id FROM sessions WHERE session_id = ?", (sid,)
+        ).fetchone()
+        if row is None or (row["owner_id"] or "") != owner:
+            return None
+        return _delete_rows(conn, sid)
 
 
 def purge(older_than_days: int = None) -> dict:
     """
-    删掉太久没动静的会话。返回 `{"sessions": n, "messages": m, "memories": k}`。
+    删掉太久没动静的会话。返回
+    `{"sessions": n, "messages": m, "memories": k, "tickets": t}`。
 
     **memories 一起删、一起报**：它是这段对话的摘要，里面同样有用户说过的话。
     只删消息留着摘要，等于"用户以为删干净了，而摘要还躺在库里"。计数单列出来，
@@ -436,16 +591,26 @@ def purge(older_than_days: int = None) -> dict:
             "(SELECT session_id FROM sessions WHERE updated_at < ?)",
             (cutoff,),
         ).rowcount
+        tickets = conn.execute(
+            "DELETE FROM tickets WHERE session_id IN "
+            "(SELECT session_id FROM sessions WHERE updated_at < ?)",
+            (cutoff,),
+        ).rowcount
         sessions = conn.execute(
             "DELETE FROM sessions WHERE updated_at < ?", (cutoff,)
         ).rowcount
         conn.commit()
     if sessions:
         logger.info(
-            "会话清理：删掉 %s 个会话 / %s 条消息 / %s 条记忆（早于 %s）",
-            sessions, removed, memories, cutoff,
+            "会话清理：删掉 %s 个会话 / %s 条消息 / %s 条记忆 / %s 张工单（早于 %s）",
+            sessions, removed, memories, tickets, cutoff,
         )
-    return {"sessions": sessions, "messages": removed, "memories": memories}
+    return {
+        "sessions": sessions,
+        "messages": removed,
+        "memories": memories,
+        "tickets": tickets,
+    }
 
 
 def stats() -> dict:
@@ -460,12 +625,16 @@ def stats() -> dict:
         sessions = conn.execute("SELECT COUNT(*) AS n FROM sessions").fetchone()["n"]
         messages = conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()["n"]
         memories = conn.execute("SELECT COUNT(*) AS n FROM memories").fetchone()["n"]
+        tickets = conn.execute(
+            "SELECT COUNT(*) AS n FROM tickets WHERE status != 'closed'"
+        ).fetchone()["n"]
         oldest = conn.execute("SELECT MIN(created_at) AS t FROM sessions").fetchone()["t"]
         newest = conn.execute("SELECT MAX(updated_at) AS t FROM sessions").fetchone()["t"]
     return {
         "sessions": sessions,
         "messages": messages,
         "memories": memories,
+        "open_tickets": tickets,
         "oldest": oldest,
         "newest": newest,
         "ttl_days": SESSION_TTL_DAYS,

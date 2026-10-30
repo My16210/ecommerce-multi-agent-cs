@@ -40,6 +40,7 @@ from ecom.orchestrator.core.router import route
 from ecom.orchestrator.core.state import CSState, make_initial_state
 from ecom.orchestrator.settings import MAX_QUESTION_CHARS, MAX_ROUNDS
 from ecom.orchestrator.utils import trace
+from ecom.orchestrator.utils.intent import wants_human
 from ecom.orchestrator.utils.logger import setup_logger
 from ecom.orchestrator.utils.tokens import EMPTY, add
 from ecom.orchestrator.workers.base import run, stamp_round, worker_names
@@ -48,6 +49,11 @@ logger = setup_logger(__name__)
 
 NODE_ROUTER = "router"
 NODE_AGGREGATE = "aggregate"
+
+# 轨迹里给人看的短标签。**只影响展示**，不改事件里的原始值——消费方要判断
+# 决策时仍然拿 `decision == "answer"`，不能依赖中文。
+_ROUTER_SOURCE_LABELS = {"llm": "模型路由", "rule": "规则路由", "fallback": "兜底路由"}
+_DECISION_LABELS = {"answer": "直接回答", "re_route": "重新路由", "human": "转人工"}
 
 
 def _node_name(worker: str) -> str:
@@ -85,16 +91,36 @@ def _router_node(state: dict, llm=None) -> dict:
     }
 
 
-def _worker_node(name: str, fn=None):
+def _worker_node(name: str, fn=None, stream: bool = False):
     def node(state: dict) -> dict:
-        if name not in (state.get("plan") or []):
+        plan = state.get("plan") or []
+        if name not in plan:
             return {}  # 不在本轮计划里：什么都不做（见模块开头第 1 条）
+
+        # 只有**本轮只有一个 worker** 时才把它的 token 直接流给用户。
+        #
+        # 多 worker 时不能流：那份答案是中间产物，汇总节点可能改写它，
+        # 先显示再被整段替换就是"闪一下"。单 worker 时没有汇总可做，它
+        # 就是最终答案——这时逐 token 流是真的，不是把长字符串切碎。
+        emit = None
+        if stream and len(plan) == 1:
+            try:
+                writer = get_stream_writer()
+            except Exception as exc:  # noqa: BLE001 —— 拿不到就退回整段，不影响作答
+                logger.warning("拿不到流式 writer，worker %s 按整段返回：%s", name, exc)
+            else:
+                # worker 只知道"一段文本"；事件形状是图这一层的契约（custom
+                # 通道里混着 string 和 dict 的话，answer_stream 就得猜）。
+                def emit(text: str) -> None:
+                    writer({"type": "delta", "text": text})
+
         result = run(
             name,
             state.get("question") or "",
             state.get("chat_history") or [],
             fn=fn,
             customer_id=state.get("customer_id") or "",
+            emit=emit,
         )
         return {"results": [stamp_round(result, state.get("round"))]}
 
@@ -140,7 +166,9 @@ def build_graph(workers: dict = None, router_llm=None, synth_llm=None, stream: b
 
     graph.add_node(NODE_ROUTER, lambda s: _router_node(s, llm=router_llm))
     for name in worker_names():
-        graph.add_node(_node_name(name), _worker_node(name, fn=workers.get(name)))
+        graph.add_node(
+            _node_name(name), _worker_node(name, fn=workers.get(name), stream=stream)
+        )
     graph.add_node(
         NODE_AGGREGATE, lambda s: _aggregate_node(s, fn=synth_llm, stream=stream)
     )
@@ -214,6 +242,33 @@ def _finalize(final: dict, question: str, request_id: str, record: bool) -> dict
     return final
 
 
+# 用户明确要求人工时给的一句话。**工单号由 API 层补上**——图不知道身份、
+# 也不知道队列，它只负责把"该转人工"这件事判出来。
+HANDOFF_REQUESTED = "好的，需要人工客服。"
+
+
+def _handoff_state(request_id: str) -> dict:
+    """
+    不跑图、直接转人工的 state。
+
+    **不调模型**：用户已经说清要什么了，再路由一遍只是多花一次钱、多一个
+    可能出错的地方。`tokens` 留空，账本如实记 0——这不是"漏算"。
+    """
+    return {
+        "request_id": request_id,
+        "question": "",
+        "decision": "human",
+        "answer": HANDOFF_REQUESTED,
+        "sources": [],
+        "decision_reason": "用户明确要求人工客服",
+        "plan": [],
+        "round": 0,
+        "results": [],
+        "chat_history": [],
+        "tokens": dict(EMPTY),
+    }
+
+
 def answer(question: str, chat_history: list = None, workers: dict = None,
            router_llm=None, synth_llm=None, record: bool = True,
            customer_id: str = "") -> dict:
@@ -225,6 +280,9 @@ def answer(question: str, chat_history: list = None, workers: dict = None,
     """
     question = _prepare_question(question)
     request_id = trace.new_request_id()
+    # 明确要求人工：短路，不建图、不调模型。规则命中就转，理由见 utils/intent.py。
+    if wants_human(question):
+        return _finalize(_handoff_state(request_id), question, request_id, record)
     state = make_initial_state(
         question, chat_history, request_id=request_id, customer_id=customer_id
     )
@@ -237,19 +295,34 @@ def answer_stream(question: str, chat_history: list = None, workers: dict = None
                   router_llm=None, synth_llm=None, record: bool = True,
                   customer_id: str = ""):
     """
-    跑一次完整问答，并把**最终答复的增量**边生成边交出来（生成器）。
+    跑一次完整问答，并把**最终答复的增量**和**思考过程**边生成边交出来（生成器）。
 
-    事件契约（消费方只需要认这三种）：
+    事件契约（消费方只需要认这五种）：
 
         {"type": "start", "request_id": "..."}
+        {"type": "thinking", "kind": "stage"|"reasoning", "text": "..."}
         {"type": "delta", "text": "..."}
-        {"type": "final", "state": <和 answer() 返回的同一个 dict>}
+        {"type": "reset"}   # 新一轮开始：上一轮流出的正文作废
+        {"type": "final", "state": <和 answer() 返回的同一个 dict>,
+         "thinking": "<完整思考过程>", "elapsed_ms": ...}
+
+    【两种 thinking】
+    - `stage`：路由、worker 完成/失败、最终决策。数据来自图每一步之后的
+      完整 state，**是真实发生的事**，不是编出来的内心独白。
+    - `reasoning`：模型自己吐出的思维链（provider 的 `reasoning_content`）。
+      普通模型没有这一路，收不到就是没有，不补假内容。
 
     【哪些字是真的流出来的】
-    只有**汇总模型**那次调用逐 token 流。worker 的答案不是最终答复（多路时
-    还会被汇总改写），送出去再收回只会让界面闪一下。没有汇总可做时（只有一个
-    结论），最终答复作为**一个** delta 交出去——**不把一整段字符串切成小块
-    假装在流**，那是在演延迟。
+    两条路，都是"生成时就有"，不是把完成的字符串切碎：
+    - **汇总模型**（多个 worker 出结论时）逐 token 流；
+    - **单 worker** 时它就是最终答案，worker 支持 `on_token` 就直接把 token
+      推出去（`_worker_node` 里 relay 到 custom 通道）。
+
+    多 worker 时不流单个 worker 的答案：那份是中间产物，汇总会改写它，
+    先显示再整段替换只会让界面闪一下。都没有可流的东西（直接转人工、
+    worker 不支持 token、模型层整个挂了）才作为**一个** delta 整段交出。
+    思考过程是另一条路：它从图每一步之后的真实 state 产生，所以单个
+    worker 的等待时间也能被看见。
 
     【中途失败怎么办】
     汇总流到一半失败会退回拼接，此时最终的 `answer` 和已吐出的增量不一致。
@@ -262,6 +335,32 @@ def answer_stream(question: str, chat_history: list = None, workers: dict = None
     """
     question = _prepare_question(question)
     request_id = trace.new_request_id()
+
+    started = time.perf_counter()
+    yield {"type": "start", "request_id": request_id}
+
+    emitted = False
+    final_state = None
+    thinking: list[str] = []
+
+    def stage(text: str) -> dict:
+        thinking.append(text)
+        return {"type": "thinking", "kind": "stage", "text": text}
+
+    # 明确要求人工：短路。事件形状保持和正常路径一致（start→thinking→
+    # delta→final），消费方不需要为"这一轮没建图"写分支。
+    if wants_human(question):
+        final = _finalize(_handoff_state(request_id), question, request_id, record)
+        yield stage("用户明确要求人工客服，跳过路由。\n")
+        yield {"type": "delta", "text": final["answer"]}
+        yield {
+            "type": "final",
+            "state": final,
+            "thinking": "".join(thinking),
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+        }
+        return
+
     state = make_initial_state(
         question, chat_history, request_id=request_id, customer_id=customer_id
     )
@@ -269,22 +368,77 @@ def answer_stream(question: str, chat_history: list = None, workers: dict = None
         workers=workers, router_llm=router_llm, synth_llm=synth_llm, stream=True
     )
 
-    started = time.perf_counter()
-    yield {"type": "start", "request_id": request_id}
+    # 先给一条，用户按下发送之后立刻有东西可看——后面的阶段由图的每一步补。
+    yield stage("正在理解问题，判断需要哪些单元…\n")
 
-    emitted = False
-    final_state = None
+    seen_results = 0
+    last_round = 0
+    last_decision = ""
     # stream_mode 给两种：custom 是汇总节点推出来的增量，values 是每一步之后
     # 的完整 state。最后一帧 values 就是 answer() 里 invoke() 拿到的那个 dict。
     for mode, chunk in app.stream(
         state, config=_recursion_limit(), stream_mode=["custom", "values"]
     ):
         if mode == "custom":
-            if isinstance(chunk, dict) and chunk.get("type") == "delta":
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("type") == "delta":
                 emitted = True
+                yield chunk
+            elif chunk.get("type") == "thinking":
+                thinking.append(str(chunk.get("text") or ""))
                 yield chunk
         elif mode == "values":
             final_state = chunk
+            round_no = int(chunk.get("round") or 0)
+
+            if round_no and round_no != last_round:
+                last_round = round_no
+                # 重路由：上一轮可能已经流出了半段答案（单 worker 直流的代价），
+                # 那一段不再属于最终答复。显式让消费方清空，而不是靠下一次
+                # delta 往上拼——拼出来的会是两轮答案的混合。
+                if emitted:
+                    emitted = False
+                    yield {"type": "reset"}
+                plan = chunk.get("plan") or []
+                labels = "、".join(
+                    aggregate_mod.WORKER_LABELS.get(name, name) for name in plan
+                ) or "无"
+                source = _ROUTER_SOURCE_LABELS.get(
+                    str(chunk.get("router_source") or ""), "路由"
+                )
+                line = f"第 {round_no} 轮 · {source}：{labels}"
+                confidence = chunk.get("plan_confidence")
+                if isinstance(confidence, (int, float)) and confidence:
+                    line += f"（置信度 {confidence:.2f}）"
+                reason = str(chunk.get("plan_reason") or "").strip()
+                if reason:
+                    line += f"\n  {reason}"
+                yield stage(line + "\n")
+
+            results = chunk.get("results") or []
+            if len(results) > seen_results:
+                for result in results[seen_results:]:
+                    label = aggregate_mod.WORKER_LABELS.get(
+                        result.get("worker"), result.get("worker") or "单元"
+                    )
+                    if result.get("ok") is False:
+                        line = f"「{label}」失败：{result.get('error') or '未知错误'}"
+                    elif result.get("insufficient"):
+                        line = f"「{label}」没有找到足够的信息"
+                    else:
+                        line = f"「{label}」完成（{int(result.get('elapsed_ms') or 0)} ms）"
+                    yield stage(line + "\n")
+                seen_results = len(results)
+
+            decision = str(chunk.get("decision") or "")
+            if decision and decision != last_decision:
+                last_decision = decision
+                line = f"决策：{_DECISION_LABELS.get(decision, decision)}"
+                reason = str(chunk.get("decision_reason") or "").strip()
+                if reason:
+                    line += f"（{reason}）"
+                yield stage(line + "\n")
 
     final = _finalize(final_state or {}, question, request_id, record)
 
@@ -296,5 +450,6 @@ def answer_stream(question: str, chat_history: list = None, workers: dict = None
     yield {
         "type": "final",
         "state": final,
+        "thinking": "".join(thinking),
         "elapsed_ms": int((time.perf_counter() - started) * 1000),
     }

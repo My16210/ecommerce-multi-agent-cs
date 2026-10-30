@@ -21,6 +21,7 @@ worker 是"会失败的外部世界"：知识库的 embedding 服务可能挂，
   当前规模下不值得。这一条别在简历里说成"所有 worker 都能超时中断"。
 """
 import inspect
+import queue
 import threading
 import time
 from collections.abc import Callable
@@ -118,21 +119,38 @@ def worker_names() -> list:
     return list(_registry())
 
 
-def _invoke(fn: Callable, question: str, chat_history: list, customer_id: str):
-    """
-    按 worker 的签名决定传不传 `customer_id`。
+def _accepts(fn: Callable, name: str) -> bool:
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
-    只有订单 worker 需要它；测试里的替身大多是 `lambda q, h:` 两参数，硬塞第三个
-    参数会把一大批测试打成 TypeError。**用签名判断，而不是 try/except TypeError**
-    ——后者会把 worker 内部真正的 TypeError 也吞掉，变成"少传一个参数"的假故障。
+
+def _invoke(
+    fn: Callable,
+    question: str,
+    chat_history: list,
+    customer_id: str,
+    on_token: Callable[[str], None] | None = None,
+):
+    """
+    按 worker 的签名决定传不传 `customer_id` / `on_token`。
+
+    只有订单 worker 需要 `customer_id`，只有知识库 worker 支持 `on_token`；
+    测试里的替身大多是 `lambda q, h:` 两参数，硬塞多余参数会把一大批测试打成
+    TypeError。**用签名判断，而不是 try/except TypeError**——后者会把 worker
+    内部真正的 TypeError 也吞掉，变成"少传一个参数"的假故障。
     """
     try:
         parameters = inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return fn(question, chat_history)
+    kwargs = {}
     if "customer_id" in parameters:
-        return fn(question, chat_history, customer_id=customer_id)
-    return fn(question, chat_history)
+        kwargs["customer_id"] = customer_id
+    if on_token is not None and "on_token" in parameters:
+        kwargs["on_token"] = on_token
+    return fn(question, chat_history, **kwargs)
 
 
 def run(
@@ -142,11 +160,16 @@ def run(
     timeout: int = None,
     fn: Callable = None,
     customer_id: str = "",
+    emit: Callable[[str], None] | None = None,
 ) -> dict:
     """
     调用一个 worker，把任何失败（异常/超时/不存在）翻成 ok=False 的结果。
 
     fn：可注入替身（测试用）。不传就按 name 查注册表。
+    emit：逐 token 转发（只有流式路径会传）。worker 跑在子线程里，
+    `ContextVar` 不会跟过去，所以这里用线程安全队列把 token 运回来，
+    由**调用线程**交给 LangGraph 的 writer——writer 依赖图运行时的 context，
+    在子线程里直接调会拿不到配置。
     """
     fn = fn or _registry().get(name)
     if fn is None:
@@ -154,17 +177,56 @@ def run(
 
     limit = timeout if timeout is not None else WORKER_TIMEOUT.get(name, WORKER_TIMEOUT_DEFAULT)
     box: dict = {}
+    tokens: queue.Queue[str] = queue.Queue()
+    relay = emit is not None and _accepts(fn, "on_token")
 
     def target():
         try:
-            box["result"] = _invoke(fn, question, chat_history or [], customer_id)
+            box["result"] = _invoke(
+                fn,
+                question,
+                chat_history or [],
+                customer_id,
+                tokens.put if relay else None,
+            )
         except BaseException as exc:  # noqa: BLE001 —— worker 抛什么都得接住，见模块开头
             box["error"] = exc
 
     thread = threading.Thread(target=target, daemon=True, name=f"worker-{name}")
     started = time.perf_counter()
     thread.start()
-    thread.join(limit)
+    if relay:
+        relay_broken = False
+
+        def forward(text: str) -> None:
+            nonlocal relay_broken
+            if not text or relay_broken:
+                return
+            try:
+                emit(text)
+            except Exception as exc:  # noqa: BLE001 —— 转发失败不该让作答失败
+                logger.warning("worker %s 的流式转发失败，继续取结果：%s", name, exc)
+                relay_broken = True
+
+        deadline = started + limit
+        while thread.is_alive():
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                break
+            try:
+                text = tokens.get(timeout=min(0.05, remaining))
+            except queue.Empty:
+                continue
+            forward(text)
+        # 线程刚结束时，队列里可能还有最后几块；超时放弃的线程不再往外发。
+        if not thread.is_alive():
+            while True:
+                try:
+                    forward(tokens.get_nowait())
+                except queue.Empty:
+                    break
+    else:
+        thread.join(limit)
     elapsed = int((time.perf_counter() - started) * 1000)
 
     if thread.is_alive():

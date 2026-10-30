@@ -322,6 +322,33 @@ def test_the_model_gets_history_from_the_store_not_from_the_screen(app):
     assert len(app.session.history(sid)) == 4
 
 
+def test_a_reroute_does_not_concatenate_the_old_streamed_text(app):
+    """单 worker 的 token 是真流之后，重路由必须清掉已经画出的那一轮正文。
+
+    否则屏幕上会出现「第一轮中间答复 + 第二轮最终答复」拼成的一段，
+    而服务端的 final 只认第二轮——用户看到的东西和落盘的不是一回事。
+    """
+    sid = app.session.ensure_session("")
+    app.st.session_state["agent_session_id"] = sid
+    app.st.session_state["agent_turns"] = []
+
+    def _fake_stream(question, history):  # noqa: ANN001
+        yield {"type": "start", "request_id": "req-test"}
+        yield {"type": "delta", "text": "第一轮的中间答复"}
+        yield {"type": "reset"}
+        yield {"type": "delta", "text": "第二轮的最终答复"}
+        yield {"type": "final", "state": {"answer": "第二轮的最终答复"}, "elapsed_ms": 1}
+
+    app.answer_stream = _fake_stream
+    app.st.chat_input = lambda *a, **k: "这一轮的问题"
+
+    app.render_agent_view()
+
+    rendered = [str(c[1][0]) for c in CALLS if c[0] == "markdown" and c[1]]
+    assert "第二轮的最终答复" in rendered
+    assert not any("第一轮的中间答复" in text and "第二轮的最终答复" in text for text in rendered)
+
+
 def test_a_new_session_starts_blank_but_does_not_delete_the_old_one(app):
     """「新建会话」是"换一个"，不是"销毁上一个"。
 

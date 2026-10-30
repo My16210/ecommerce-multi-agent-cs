@@ -102,7 +102,7 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 │   ├── orchestrator/seed/       订单库种子 orders.csv / logistics.csv（派生物，**进仓库**）
 │   │                            router_eval.jsonl（路由评测题集，50 题）
 │   └── orders.sqlite            订单库运行时文件（不进仓库，由 seed 重建）
-│                                会话库在 data/orchestrator/sessions.db（同样不进仓库）
+│                                会话库在 data/orchestrator/sessions.db（含转人工工单，不进仓库）
 │                                身份库在 data/orchestrator/auth.db（token 哈希 + 审计）
 ├── logs/                        日志 + requests.jsonl（trace）
 ├── frontend/                    React + Vite + TypeScript（可选界面）
@@ -141,7 +141,7 @@ uv sync                   # 界面：--extra ui ｜ HTTP：--extra api ｜ MCP�
 uv run python main.py --init-db                                  # 灌 65752 笔订单 + 62897 条物流
 uv run python -m ecom.knowledge.cli.ingest                       # 建向量库
 uv run python main.py "订单 52644 到哪了"
-uv run python main.py "订单 52644 到哪了" --stream       # 边生成边打印（只有汇总那步是真流）
+uv run python main.py "订单 52644 到哪了" --stream       # 边生成边打印（汇总模型或单 worker 的真流）
 ```
 
 **不再需要另外两个仓库**——`.env` 里那三个 `RAG_KB_ROOT` / `SALES_AGENT_ROOT` / `SALES_AGENT_PYTHON` 已经删掉了，它们的存在本身就是"没合干净"的标记。
@@ -300,6 +300,10 @@ $ uv run python main.py "订单 52644 到哪了，顺便问下你们的退货政
                        └──► worker_analytics ──┘               │
                                                                └──► END（human / 转人工）
 ```
+
+`human` 出口在 API 层落一张工单（`ecom/orchestrator/tickets.py`），
+客服在工作台认领、回复；回复写回同一个会话。图本身不碰工单——它只负责给出
+"这件事该由人接"的判断。
 
 ### 一、Agent 还是 Tool？判据只有一条
 
@@ -590,7 +594,7 @@ uv sync --extra ui
 uv run streamlit run app.py
 ```
 
-**主区只有对话**，另外三块收在侧边栏的「直连视图」里 —— 之所以是这个形状，是因为这四个东西里只有一个是"来回说话"：**对话**（答复 + 决策链，就是 `main.py -v` 那份内容的可视化；汇总那一步逐 token 流出来）、**订单**（订单详情 + 物流 + 退货申请）、**数据看板**（报告 + 生成的图）、**知识库**（答复 + 引用到的段落，逐 token 流出来）。对话只有"多个结论要汇总"时是真流；只有一个结论时整段到达——不把已完成的字符串切块假装在流。把它们并排成四个 Tab，等于说这四件事是同一层级的；收起来之后，页面本身就在说"提问是主线，另外三个是随时可以拐进去看一眼的地方"。
+**主区只有对话**，另外三块收在侧边栏的「直连视图」里 —— 之所以是这个形状，是因为这四个东西里只有一个是"来回说话"：**对话**（答复 + 决策链，就是 `main.py -v` 那份内容的可视化；汇总那一步逐 token 流出来）、**订单**（订单详情 + 物流 + 退货申请）、**数据看板**（报告 + 生成的图）、**知识库**（答复 + 引用到的段落，逐 token 流出来）。对话的真流有两条：多个结论要汇总时走汇总模型；单 worker 时如果它支持 token（知识库），worker 自己的输出就直接流。没有可流的东西才整段到达——不把已完成的字符串切块假装在流。把它们并排成四个 Tab，等于说这四件事是同一层级的；收起来之后，页面本身就在说"提问是主线，另外三个是随时可以拐进去看一眼的地方"。
 
 四个视图仍然是**一件事的四个面**，共用一份进程、一份配置：点进订单视图看到的就是提示词里那个 `query_order`，不是另一个项目。换个视图只是换一个渲染函数，**不重启、不换进程**。
 
@@ -600,9 +604,13 @@ uv run streamlit run app.py
 
 ### React 前端（可选）
 
-`frontend/` 是第二个浏览器界面：**一个干净的流式对话页**，显示路由结果、来源、
-token 用量和健康状态。它不重复 Streamlit 版的图片输入、订单视图和数据分析看板
-——那些留在 `app.py`；这一版只把「提问 → 流式回答」这条主线做利落。
+`frontend/` 是第二个浏览器界面，形状参考 DeepSeek Harness 的三栏工作台：
+**左侧会话列表 / 中间对话 / 右侧可折叠的会话轨迹**，底部是随输入增高的圆角
+输入框，浅色 / 深色 / 跟随系统三档主题。右侧轨迹显示每一轮的路由、决策、来源
+和 token 用量；正文上方是一块自动展开、收尾后折叠的「思考过程」（真实的路由/
+worker/决策阶段，以及模型返回的思维链，如果有）。它不重复 Streamlit 版的图片
+输入、订单视图和数据分析看板——那些留在 `app.py`；这一版只把「提问 → 流式回答」
+这条主线做利落。
 
 ```bash
 # 开发：Vite 5173 代理到 8000（不给 FastAPI 开 CORS）
@@ -614,9 +622,14 @@ uv run uvicorn api:app --port 8000            # → http://127.0.0.1:8000/ui/
 ```
 
 `vite.config.ts` 的 `base: "/ui/"` 必须和 `mount_frontend()` 的挂载路径一致——
-不一致的症状是页面能打开但白屏。会话号和 API Key 只放 `sessionStorage`，不进
-URL；回答按纯文本渲染，不走 `innerHTML`。细节和限制见
-[frontend/README.md](frontend/README.md)。
+不一致的症状是页面能打开但白屏。会话号、API Key、登录 token 和邀请码只放
+`sessionStorage`，不进 URL；匿名模式下列表按标签页各存一份，登录后从
+`GET /sessions` 恢复该账号的历史。`agent` / `admin` 登录后顶栏多一个
+「客服台」（队列 → 认领 → 回复 → 关闭），普通用户看到的是「转人工」按钮和
+排队状态条。回答走一个自写的
+**安全 Markdown 渲染器**（标题、列表、引用、围栏代码、行内代码、加粗、
+http/https 链接），只生成 React 元素，不拼 DOM 字符串、不走 `innerHTML`。
+细节和限制见 [frontend/README.md](frontend/README.md)。
 
 **但 CLI 才是第一入口，这个顺序不能反**：界面会把"哪一层慢、哪一层挂了"藏起来——超时变成一个转圈动画、异常变成一个红色弹框。调试期用 `main.py -v`，演示时才上界面。
 
@@ -632,7 +645,7 @@ URL；回答按纯文本渲染，不走 `innerHTML`。细节和限制见
 | 角色 | 能做什么 |
 |---|---|
 | `customer` | 只能用自己的 `session_id` 问答；拿别人的会话号一律 404 |
-| `agent` | 客服人员（当前与 customer 同权，预留给工单/客户查询） |
+| `agent` | 客服人员：看转人工队列、认领工单、读该会话上下文、回复、关闭；不能看 `/trace`、不能审核退货 |
 | `admin` | 额外可看 `/trace`、在后台审核退货 |
 
 ```bash
@@ -682,10 +695,20 @@ curl -H "Authorization: Bearer $TOKEN" \
   而不是隐藏资源存在性）。
 - `/auth/login`：`AUTH_ENABLED=1` 时才存在；密码存 scrypt 哈希，按 IP 限流
   （10 次/分钟），失败不区分"用户不存在"和"密码错"。
+- `/sessions`、`/sessions/{id}`：登录后回看自己的历史；只按 `owner_id` 过滤，
+  别人的会话和不存在的会话都返回 404。`DELETE /sessions/{id}` 删自己的会话，
+  演示环境不提供。没开身份层时三个接口都是 404。
+- 转人工：用户在对话里说「转人工」，或前端点「转人工」按钮，会落一张工单
+  （`POST /sessions/{id}/handoff`，幂等，同一会话同时只有一张未关闭工单）。
+  用户在 `POST /tickets/...` 上看不到任何东西；`agent` / `admin` 用
+  `GET /tickets?status=open|claimed|closed` 看队列，`claim` / `reply` / `close`
+  走同一套状态机。人工回复写进同一个会话（`role='agent'`），用户刷新就能看到。
+  没开身份层或演示模式下这些接口都是 404——不假装有人接待。
 - 客户绑定：principal 上的 `customer_id` 会一路传到订单 worker（`answer(...,
   customer_id=...)`）；查询/写别人的订单会被拒绝，`list_orders` 直接按绑定客户查。
 - 会话：`sessions.owner_id` 记录 principal；别人的 `session_id` 一律 404。
-  老库里 `owner_id=''` 的会话会被第一个拿它的 principal 认领（迁移用）。
+  老库里 `owner_id=''` 的会话会被第一个拿它的 principal 认领（迁移用）；
+  **历史读接口不认领**，只读严格属于当前账号的会话。
 - 后台：`admin.py` 改成输入 admin token（登录会话 token 也可以），审核人自动取
   `principal.name`；退货审核写一条 `return.review` 审计。
 - 审计表 `audit_log` 在 `data/orchestrator/auth.db`，和 `sessions.db` 分开：
@@ -698,7 +721,11 @@ curl -H "Authorization: Bearer $TOKEN" \
 - **客户身份是"可选绑定"**：`--customer` / `set-customer` 把 principal 锁到一个
   客户号，订单 worker 只查这个客户名下的单，查/写别人的单一律拒绝；**没绑定**
   （匿名、本地演示）时仍会退回 `_guess_customer` 猜客户号；
-- 没有组织 / 多租户；`agent` 目前和 `customer` 同权；
+- 没有组织 / 多租户；工单队列是演示级：没有实时推送（用户端 5 秒轮询）、
+  没有转接/升级、没有 SLA 和排队超时、没有客服在线/下班状态，也没有
+  "工单里的客户身份自动绑定到 agent"；
+- 历史回看只有列表 / 读 / 删，没有搜索、导出、跨设备同步和多标签页实时刷新；
+  思考过程不落盘，重新登录后只恢复问答原文；
 - MCP 仍只走 stdio，信任模型是"能拉起本进程的人"，不走这套 HTTP 身份。
 
 ---
@@ -818,11 +845,59 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 
 > `_guess_customer`（`workers/order.py`）意味着**未绑定客户号时"客户"是从话里猜的、未认证的**；绑定 principal 之后订单层只查该客户名下的单。`session_id` 仍是会话凭证：拿到它就能读到这个会话的全部历史，**别把它当账号**。
 
-推论有三条，全是有意的：
+两种模式分开说：
+
+- **匿名（`AUTH_ENABLED=0`，默认）**：会话列表放在 `sessionStorage`，每个标签页一份，关掉就没。这不是偷懒——`session_id` 是 bearer token，写进 `localStorage` 等于把凭证留在磁盘上。
+- **登录（`AUTH_ENABLED=1`）**：会话创建时写入 `owner_id`，`/chat` 和 `/sessions` 都按 principal 做归属检查。登录后侧边栏从 `GET /sessions` 恢复历史，**关掉浏览器再登录，记录还在**。正文按需加载，思考过程不落盘。
+
+两种模式都保留的边界：
 
 - **默认 30 天过期**（`SESSION_TTL_DAYS`）。无主数据不该无限期留着。
-- **界面刻意不把会话号放进 URL**（不做 `st.query_params`）。它是 bearer token，进了 URL 就会进浏览器历史、代理日志、Referer 头。**代价**：新开一个标签页 = 新的一段对话。这条由 `test_a_new_browser_session_starts_a_new_conversation` 钉着——写成测试是因为"没做的能力"最容易被下一个人当成 bug 顺手补上，而补法正好是那个不该做的。
-- **侧边栏只显示前 12 位**。侧边栏是最容易被截图发出去的地方。
+- **界面刻意不把会话号放进 URL**（不做 `st.query_params`）。它是 bearer token，进了 URL 就会进浏览器历史、代理日志、Referer 头。匿名模式下新开标签页 = 新的一段对话，这条由 `test_a_new_browser_session_starts_a_new_conversation` 钉着——写成测试是因为"没做的能力"最容易被下一个人当成 bug 顺手补上，而补法正好是那个不该做的。
+- **侧边栏只显示会话标题，不显示完整会话号**。侧边栏是最容易被截图发出去的地方。
+
+### 登录后回看历史
+
+| 接口 | 需要 | 说明 |
+|---|---|---|
+| `GET /sessions` | `AUTH_ENABLED=1` + bearer | 自己的会话：标题、时间、条数，**不含正文** |
+| `GET /sessions/{id}` | 会话属于自己 | 最近 200 条消息，按时间正序 |
+| `DELETE /sessions/{id}` | 会话属于自己；演示环境不提供 | 消息和记忆摘要一起删 |
+
+没开身份层时三个接口都返回 404，**不放行**：匿名会话的 `owner_id` 是空串，列出来会把所有人的对话混在一起。读历史不做"无主会话认领"——认领只属于写入路径。React 登录后自动拉列表；本地缓存和服务端列表合并时以本地的 `thinking` / `meta` 为准，服务端时间更新则标记未加载、切过去重拉。
+
+### 转人工工单（P1）
+
+"转人工"以前是一句模型自己编的话术：说完了没有人接。现在它是一条能走完的路：
+
+```
+用户说「转人工」/ 点按钮
+      → supervisor 短路（不调模型，省一次调用，也不会"模型决定继续答"）
+      → POST /sessions/{id}/handoff 落工单（open）
+      → 客服 GET /tickets 排队 → claim（claimed）→ reply → close（closed）
+      → 人工回复写进同一个会话（role='agent'），用户 5 秒轮询取回
+```
+
+五条刻意的设计：
+
+1. **一个会话同时只有一张未关闭工单**，由 SQLite 部分唯一索引
+   （`UNIQUE(session_id) WHERE status != 'closed'`）保证，不是"先查再插"——
+   并发时后者会插出两张。关闭之后可以再转一次，这是"这一单处理完了"，
+   不是"这个用户以后不能再找人工"。
+2. **排队位按自增 `id` 算，不按时间戳。** SQLite 的 `CURRENT_TIMESTAMP` 只到秒，
+   同一秒进来的两个人会拿到同一个位置。
+3. **人工回复和机器人答复同一张 `messages` 表**（`role='agent'` + `author`），
+   只是 `history()` 喂给模型前把它映射成 `assistant`。否则会出现"客服在工单里
+   能看到回复、用户重新进会话却看不到"的两份真相。
+4. **没有人工可转时如实说，不假装。** 演示模式或 `AUTH_ENABLED=0` 时工单接口
+   一律 404，`_attach_handoff` 把答复换成"当前环境没有开通人工客服（需要登录
+   账号）……"，而不是"已转接，请耐心等待"。
+5. **`reply` 要求先认领，`close` 只能是认领人**（admin 也没有强制关闭的旁路：
+   认领后"谁在服务这个用户"只认一个答案；客服失联时由运维删会话/改库处理）。
+   认领后其他人再 `claim` 返回 409，不是悄悄覆盖。
+
+删除与过期一起级联：`DELETE /sessions/{id}` 和 `purge()` 都会删掉该会话的工单，
+返回值里多一个 `tickets` 计数。
 
 ### 三个旋钮不要合并
 
@@ -859,7 +934,7 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 - **日志**（`logs/<date>.log`）：给人扫的。
 - **trace**（`logs/requests.jsonl`）：一行一条请求，机器可读。记录的是**事实**（路由来源、每个 worker 的 ok / 耗时 / token、最终决策），不是结论——"这次成功了吗"由查询方判断，口径变一次不用重跑历史数据。
 - **`GET /trace`**：把最近若干条请求的决策链摊出来。这是给别人看"系统怎么想的"那扇窗。
-- **`POST /chat/stream`**：同一次问答的 SSE 版本，事件 `start` / `delta` / `final` / `error`。**`final.answer` 是权威版本**：汇总流到一半失败会退回拼接，前面的 delta 可能和它不一致。见 [技术文档 §12](docs/技术文档.md#十二流式输出)。
+- **`POST /chat/stream`**：同一次问答的 SSE 版本，事件 `start` / `thinking` / `delta` / `reset` / `final` / `error`。**`final.answer` 是权威版本**：汇总流到一半失败会退回拼接，前面的 delta 可能和它不一致。`thinking` 是路由/worker/决策的真实阶段（外加模型思维链，如果有），`reset` 表示重路由、上一轮正文作废。见 [技术文档 §12](docs/技术文档.md#十二流式输出)。
 
 `main.py -v` 就是 trace 的人类可读版。
 
@@ -900,7 +975,7 @@ exact   46/50（92.0%）　covered 46/50（92.0%）
 ## 测试
 
 ```bash
-uv run pytest        # 763 条（--all-extras 实测：761 passed / 2 skipped；条数以当次输出为准）
+uv run pytest        # 818 条（--all-extras 实测：816 passed / 2 skipped；条数以当次输出为准）
 uv run ruff check .
 ```
 
@@ -971,7 +1046,7 @@ CI 现在有两个 job：`lint-and-test`（ruff + pytest）和 `frontend`（`npm
 | ✅ | **真实 Streamlit 运行时** | 真跑：`streamlit.testing.v1.AppTest` 把两个入口跑完，6 条全绿。**这补上了原来那一栏 ❌** |
 | ✅ | **合并后的 `API`（FastAPI）真起服务** | 容器内真起 uvicorn：`/health` 200（含 workers + order_db）、`/openapi.json` 元数据齐、空问题 422、`/trace/不存在` 404、真提问 200（257+29 token / 1.2s）。**这一条走了网络、花了 token**，不属于"测试不联网"那一栏 |
 | ✅ | **Milvus 那条代码路径** | 真跑：连宿主常驻的 v2.5.5，`ecom_verify_<随机>` 临时集合走完 add / count / search / delete / drop，**零残留**（另有一条专门查残留）。⚠️ 见下面的版本错位 |
-| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 10 条**，现在宿主 `.venv`（`--all-extras`）上是 **763 条 / 761 passed / 2 skipped**，`ruff` 干净（这批的 GitHub CI 还没跑过；workflow 里已经加了前端构建 job） |
+| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 13 条、登录历史又加了 9 条、**转人工工单又加了 39 条**，现在宿主 `.venv`（`--all-extras`）上是 **818 条 / 816 passed / 2 skipped**，`ruff` 干净（这批的 GitHub CI 还没跑过；workflow 里已经加了前端构建 job） |
 | ✅ | **L1 只读 / 邀请码 / 预算闸门** | 真跑：32 条测试覆盖 fail closed 的邀请码、每客户端限流、跨重连的 token 账本、损坏账本拒绝花钱、路由不选 analytics、退货在落库前被挡、API 429 与 trace 404、界面门禁与建议语。**只验证了代码层**；下面那栏是部署文件 |
 | ✅ | **公网演示编排能解析** | 真跑：`docker compose --env-file .env.prod -f docker-compose.prod.yml config --quiet` 退出 0（临时 `.env.prod` 校验后已删）；Caddyfile 用 `caddy:2.10-alpine caddy validate` 通过（健康检查那条 `context canceled` 是校验时没有 app 容器，属预期）。**没有真部署**：没有域名和公网服务器，HTTPS 证书签发、Caddy→app 转发、公网可达都**没验过** |
 | ✅ | **CI 本身真跑绿了** | 真跑：[run #38132662970](https://github.com/My16210/ecommerce-multi-agent-cs/actions/runs/38132662970)（2026-10-11）——`ruff: All checks passed!`，`pytest: 517 passed, 3 skipped, 15.06s`，和本机干净 checkout 预演的数字一致。**这一栏原来是 ❌**：工作流写过、命令本地验过，但没推上去就一次都没真跑过。<br>真跑还多抓到两处**本地永远看不出来**的东西：① `python-version-file` 这个输入名**不存在**，setup-uv 只打一条 warning 就忽略它，workflow 照样绿、看着像钉住了版本；② `astral-sh/setup-uv` **没有 `v10` 这个大版本 tag**（它的可移动大版本 tag 只发到 v7），钉 `@v10` 会让 job 在 "Set up job" 阶段就红，得钉精确的 `@v10.3.0`。两处都改成实测过的写法 |

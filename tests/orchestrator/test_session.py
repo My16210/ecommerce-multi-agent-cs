@@ -158,7 +158,7 @@ def test_purge_removes_only_stale_sessions(store):
 
     result = store.purge(older_than_days=30)
 
-    assert result == {"sessions": 1, "messages": 2, "memories": 0}
+    assert result == {"sessions": 1, "messages": 2, "memories": 0, "tickets": 0}
     assert store.get_session(old) is None
     assert store.get_session(fresh) is not None
 
@@ -176,7 +176,12 @@ def test_purge_measures_idle_time_not_age(store):
 
 
 def test_purge_on_an_empty_store_is_a_no_op(store):
-    assert store.purge(older_than_days=30) == {"sessions": 0, "messages": 0, "memories": 0}
+    assert store.purge(older_than_days=30) == {
+        "sessions": 0,
+        "messages": 0,
+        "memories": 0,
+        "tickets": 0,
+    }
 
 
 # ——— 记忆（存储这一半；蒸馏/召回在 test_memory.py）———
@@ -281,7 +286,7 @@ def test_purge_takes_the_memories_with_it(store):
 
     result = store.purge(older_than_days=30)
 
-    assert result == {"sessions": 1, "messages": 20, "memories": 1}
+    assert result == {"sessions": 1, "messages": 20, "memories": 1, "tickets": 0}
     assert store.memories_for(sid) == []
 
 
@@ -342,3 +347,48 @@ def test_legacy_session_can_be_claimed_once(store):
     assert store.get_session(sid)["owner_id"] == "principal-a"
     with pytest.raises(store.SessionAccessError):
         store.ensure_session(sid, owner_id="principal-b")
+
+
+# ——— 按身份回看历史 ———
+
+def test_list_sessions_can_be_filtered_by_owner(store):
+    """过滤和标题都要对。
+
+    过滤漏了会把别人的对话列出来；标题取错不会报错，只会让侧边栏显示成
+    最后一个问题——两种都是"看代码看不出来"的错。
+    """
+    a = store.ensure_session("", owner_id="principal-a")
+    b = store.ensure_session("", owner_id="principal-b")
+    store.append_turn(a, "A 的第一问", "A 的答")
+    store.append_turn(b, "B 的第一问", "B 的答")
+
+    rows = store.list_sessions(owner_id="principal-a")
+    assert [r["session_id"] for r in rows] == [a]
+    assert rows[0]["title"] == "A 的第一问"
+    assert rows[0]["messages"] == 2
+
+    # 空字符串是匿名 owner，不是"不过滤"。
+    assert store.list_sessions(owner_id="") == []
+
+
+def test_transcript_keeps_timestamps_and_order(store):
+    sid = store.ensure_session("chat")
+    store.append_turn(sid, "问1", "答1")
+    store.append_turn(sid, "问2", "答2")
+
+    rows = store.transcript(sid)
+    assert [r["role"] for r in rows] == ["user", "assistant", "user", "assistant"]
+    assert [r["content"] for r in rows] == ["问1", "答1", "问2", "答2"]
+    assert all(r["created_at"] for r in rows)
+    assert rows[0]["id"] < rows[-1]["id"]
+
+
+def test_delete_session_owned_refuses_someone_elses_session(store):
+    sid = store.ensure_session("", owner_id="principal-a")
+    store.append_turn(sid, "问", "答")
+
+    assert store.delete_session_owned(sid, "principal-b") is None
+    assert store.get_session(sid) is not None
+
+    assert store.delete_session_owned(sid, "principal-a") == 2
+    assert store.get_session(sid) is None

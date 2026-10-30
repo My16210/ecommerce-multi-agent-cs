@@ -186,6 +186,38 @@ def test_stream_emits_start_delta_final_in_order(client):
     assert events[-1]["elapsed_ms"] == 5
 
 
+def test_stream_forwards_thinking_and_final_carries_the_full_copy(client, monkeypatch):
+    def fake_stream(question, history):  # noqa: ANN001
+        yield {"type": "start", "request_id": "req-think"}
+        yield {"type": "thinking", "kind": "stage", "text": "正在路由\n"}
+        yield {"type": "thinking", "kind": "reasoning", "text": "先看订单"}
+        yield {"type": "delta", "text": "答复"}
+        yield {"type": "reset"}
+        yield {"type": "delta", "text": "答复"}
+        yield {
+            "type": "final",
+            "state": {
+                "request_id": "req-think",
+                "answer": "答复",
+                "sources": [],
+                "decision": "answer",
+                "plan": ["order"],
+                "tokens": {"in": 1, "out": 1},
+            },
+            "elapsed_ms": 3,
+        }
+
+    monkeypatch.setattr(api, "answer_stream", fake_stream)
+    events = _sse_events(_stream_body(client, "问"))
+
+    assert [e["type"] for e in events] == [
+        "start", "thinking", "thinking", "delta", "reset", "delta", "final",
+    ]
+    assert [e["kind"] for e in events[1:3]] == ["stage", "reasoning"]
+    assert events[-1]["thinking"] == "正在路由\n先看订单"
+    assert events[-1]["answer"] == "答复"
+
+
 def test_stream_writes_the_turn_to_the_store_after_final(client):
     events = _sse_events(_stream_body(client, "问"))
 
@@ -373,7 +405,9 @@ def test_the_openapi_document_carries_the_hand_written_metadata(client):
 
     assert spec["info"]["title"]
     assert spec["info"]["description"], "顶层说明没了，/docs 首页会是一片空白"
-    assert {t["name"] for t in spec["tags"]} == {"health", "auth", "chat", "trace"}
+    assert {t["name"] for t in spec["tags"]} == {
+        "health", "auth", "chat", "sessions", "tickets", "trace"
+    }
     for path in ("/health", "/auth/login", "/chat", "/trace"):
         assert spec["paths"][path]
     assert spec["paths"]["/chat"]["post"]["summary"]
@@ -477,3 +511,14 @@ def test_the_stream_also_records_its_tokens(demo_client):
         "".join(r.iter_text())
 
     assert api.demo.tokens_used_today() == 3
+
+
+def test_history_endpoints_do_not_exist_without_the_identity_layer(client):
+    """没开 AUTH_ENABLED 时，历史接口返回 404 而不是放行。
+
+    放行是错的：匿名会话的 owner_id 都是空串，列出来会把所有人的对话混在
+    一起。这条和 `/auth/login` 的 404 是同一个口径。
+    """
+    assert client.get("/sessions").status_code == 404
+    assert client.get("/sessions/whatever").status_code == 404
+    assert client.delete("/sessions/whatever").status_code == 404
