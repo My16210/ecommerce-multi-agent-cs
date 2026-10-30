@@ -4,7 +4,9 @@
     uv sync --extra ui
     uv run streamlit run admin.py
 
-三个页面：退货审核 / 订单与物流浏览 / 知识库审核队列。
+口令模式下三个页面：退货审核 / 订单与物流浏览 / 知识库审核队列。
+身份层打开后多一个**客服工作台**（转人工工单的队列、认领、回复、关单），
+并且退货审核 / 知识库队列只对 admin 显示——agent 进得来，但只能做工单和查订单。
 
 【为什么是独立的 admin.py，而不是给 app.py 加一个"管理"Tab】
 `app.py` 的 docstring 里写着「不做登录 / 权限：这是离线演示，加一套假登录只会
@@ -24,20 +26,25 @@
 默认值的方向不是风格问题：一个"以为配了其实没配"的后台，比一个明知裸奔的
 后台危险得多。
 
-【它是演示级的鉴权，这句话要留在使用的人看得见的地方】
-明文口令，没有用户、没有角色、没有审计（"审核人"是人手填的一个字符串）。
-它挡住的是"随手扫到这个端口的人"。别把它说成"做了权限系统"。
+【两种门禁，别混着说】
+口令模式（AUTH_ENABLED=0）：明文口令，没有用户、没有角色、没有审计
+（"审核人"是人手填的一个字符串）。挡住的是"随手扫到这个端口的人"。
+身份层模式（AUTH_ENABLED=1）：agent / admin 的 bearer token，每次 rerun 现验，
+动作写 `audit_log`；agent 只得到客服工作台和订单浏览，退货 / 知识库仍是 admin。
+**口令模式不要对外说成"做了权限系统"**——它的定位没变。
 
 **第二层是端口绑定**：`docker-compose.yml` 里那个服务绑的是
 `127.0.0.1:8502`，不是 `0.0.0.0`。两层挡的不是同一件事——口令挡"能连到端口
 的人"，绑定挡"根本连不到这个端口的人"。两层都要有。
 
-【三个页面里只有一个能写】
-只有「退货审核」页有写操作。另外两页是**只读的浏览**：
-  · 订单与物流：直接查库（复用 order_tools 的查询函数，不重写 SQL）
+【哪些页面能写】
+  · 客服工作台：认领 / 回复 / 关单，admin 还能强制关闭和转派。写的是会话
+    消息和工单状态，和 API 走**同一个** `tickets` 模块，不另写一套规则。
+  · 退货审核：批准 / 拒绝（登记人的决定）。
   · 知识库审核队列：这不是新功能——`ecom/knowledge/cli/review.py` 的
     `approve_item()` 本来就是"为了给界面复用"才从 cmd_approve 里拆出来的，
     这个接缝一直留着没人用，现在接上。
+  · 订单与物流：**只读**，直接查库（复用 order_tools 的查询函数，不重写 SQL）。
 """
 import secrets
 
@@ -47,6 +54,7 @@ from ecom.auth import settings as auth_settings
 from ecom.auth import store as auth_store
 from ecom.knowledge.cli import review as kb_review
 from ecom.knowledge.review import queue as kb_queue
+from ecom.orchestrator import session, tickets
 from ecom.orchestrator.admin import returns
 from ecom.orchestrator.tools.order_tools import (
     RETURN_STATUSES,
@@ -88,33 +96,41 @@ def check_password(entered: str, expected: str) -> bool:
 
 
 def _require_token_login() -> None:
-    """身份层打开时的后台门禁：要一枚 admin 角色的 token，而不是共享口令。"""
+    """
+    身份层打开时的后台门禁：要一枚 **agent 或 admin** 角色的 token。
+
+    客服需要进后台做工单（认领、回复、关单），所以 agent 也能进；能写退货 /
+    知识库的那些页面由 `main()` 按角色决定画不画，**不是靠这里放行**。
+    """
     principal = st.session_state.get("admin_principal")
     if principal:
         # **每次 rerun 都重新验一遍**：token 可能已经被 revoke / 轮换 / 过期，
         # 而 Streamlit 的 session_state 不会自动知道。只信"当前这枚 token"。
         fresh = auth_store.authenticate(st.session_state.get("admin_token", ""))
-        if fresh and fresh["id"] == principal["id"] and auth_store.has_role(fresh, "admin"):
+        if fresh and fresh["id"] == principal["id"] and auth_store.has_role(fresh, "agent"):
+            # 角色或名字可能已经改过，用最新那份渲染。
+            st.session_state["admin_principal"] = fresh
             return
         st.session_state.pop("admin_principal", None)
         st.session_state.pop("admin_token", None)
 
     st.title("电商客服后台", icon=":material/lock:")
     st.caption(
-        "这个后台能对花钱的操作下结论。用 admin 角色的 bearer token 进入；"
-        "token 由 `python -m ecom.auth.cli create --name 你 --role admin` 生成。"
+        "用 agent / admin 角色的 bearer token 进入。agent 只能看客服工作台和订单；"
+        "退货审核、知识库队列只有 admin 能写。token 由 "
+        "`python -m ecom.auth.cli create --name 你 --role agent` 生成。"
     )
-    token = st.text_input("管理员 token", type="password", key="admin_token")
+    token = st.text_input("客服 / 管理员 token", type="password", key="admin_token")
     if st.button("进入", key="admin_login_token", icon=":material/login:"):
         candidate = auth_store.authenticate(token)
-        if candidate and auth_store.has_role(candidate, "admin"):
+        if candidate and auth_store.has_role(candidate, "agent"):
             st.session_state["admin_principal"] = candidate
             auth_store.audit(candidate["name"], "admin.login", "admin.py", "")
             st.rerun()
         else:
             # 不区分"token 错"和"角色不够"：区分了等于告诉试 token 的人
             # "这枚 token 有效，只是权限不够"。
-            st.error("token 无效，或这个 principal 不是 admin。")
+            st.error("token 无效，或这个 principal 不是客服 / 管理员。")
     st.stop()
 
 
@@ -333,16 +349,234 @@ def render_kb_queue_page() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 页面四：客服工作台（agent / admin）——转人工之后人真正干活的地方
+# ═══════════════════════════════════════════════════════════════════════════
+TICKET_STATUS_LABELS = {"open": "排队中", "claimed": "进行中", "closed": "已结束"}
+
+
+def _ticket_principal() -> dict:
+    """当前后台登录的 principal。口令模式下是空 dict——那种模式没有工单。"""
+    return st.session_state.get("admin_principal") or {}
+
+
+def _ticket_transcript(session_id: str) -> list:
+    """工单上下文。读失败返回空列表，别让一行坏数据把整个页面打红。"""
+    try:
+        return session.transcript(session_id, 200)
+    except Exception as exc:  # noqa: BLE001 —— 界面要能继续画
+        st.warning(f"读取会话失败：{exc}")
+        return []
+
+
+def _ticket_act(done: str, ticket_id: str, action, *, detail: str = "") -> None:
+    """执行一个工单动作 + 写审计 + 刷新。异常翻成人话，不冒整段 traceback。"""
+    principal = _ticket_principal()
+    name = str(principal.get("name") or "")
+    try:
+        action()
+    except tickets.TicketError as exc:
+        st.error(str(exc))
+        return
+    auth_store.audit(name, f"ticket.{done}", ticket_id, detail)
+    st.success("已更新。")
+    st.rerun()
+
+
+def render_tickets_page() -> None:
+    st.subheader("客服工作台")
+    if not auth_settings.AUTH_ENABLED:
+        st.info(
+            "身份层未启用（AUTH_ENABLED=0）：没有账号就没有「谁在排队」，"
+            "人工工单这套能力不存在。"
+        )
+        return
+
+    principal = _ticket_principal()
+    if not principal:
+        st.info("请用 agent / admin 角色的 token 进入。")
+        return
+
+    pid = str(principal.get("id") or "")
+    name = str(principal.get("name") or "")
+    is_admin = auth_store.has_role(principal, "admin")
+    st.caption(
+        "排队中的工单所有客服可见；认领之后只有你（和 admin）能看上下文并回复。"
+        "客服在会话里回复后，用户界面的轮询会把这句话拉回去。"
+    )
+
+    try:
+        counts = {
+            status: len(
+                tickets.list_tickets(
+                    status=status, limit=200, viewer_id=pid, is_admin=is_admin
+                )
+            )
+            for status in tickets.STATUSES
+        }
+    except Exception as exc:  # noqa: BLE001 —— 界面要能继续画
+        st.error(f"读取工单队列失败：{exc}")
+        return
+
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("排队中", counts.get("open", 0), border=True)
+    col_b.metric("进行中", counts.get("claimed", 0), border=True)
+    col_c.metric("已结束", counts.get("closed", 0), border=True)
+
+    status = st.selectbox(
+        "看哪个状态",
+        list(tickets.STATUSES),
+        format_func=lambda value: TICKET_STATUS_LABELS.get(value, value),
+        key="ticket_status",
+    )
+    try:
+        rows = tickets.list_tickets(
+            status=status, limit=100, viewer_id=pid, is_admin=is_admin
+        )
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"读取工单队列失败：{exc}")
+        return
+    if not rows:
+        st.info(f"没有「{TICKET_STATUS_LABELS.get(status, status)}」的工单。")
+        return
+
+    for row in rows:
+        tid = row["ticket_id"]
+        title = row.get("title") or "（无标题会话）"
+        with st.expander(
+            f"{tid}　{title}　{TICKET_STATUS_LABELS.get(row['status'], row['status'])}"
+        ):
+            who = row.get("claimed_by_name") or "（还没人接）"
+            st.markdown(
+                f"**状态**：{TICKET_STATUS_LABELS.get(row['status'], row['status'])}　"
+                f"**接手人**：{who}　**开单**：{row['created_at']}"
+                + (f"　**排队位置**：{row['queue_position']}" if row["status"] == "open" else "")
+            )
+            if row.get("reason"):
+                st.caption(f"转人工原因：{row['reason']}")
+
+            if tickets.can_view(row, pid, is_admin):
+                messages = _ticket_transcript(row["session_id"])
+                if not messages:
+                    st.info("这个会话还没有消息。")
+                for message in messages[-100:]:
+                    role = message.get("role")
+                    if role == "user":
+                        head = "用户"
+                    elif role == "agent":
+                        head = f"人工 {(message.get('author') or '').strip()}".strip()
+                    else:
+                        head = "机器人"
+                    st.markdown(f"**{head}**：{message.get('content') or ''}")
+            else:
+                st.warning("这张工单不在你的可见范围内。")
+
+            st.divider()
+
+            if row["status"] == "open":
+                if st.button("认领", key=f"ticket_claim_{tid}", icon=":material/front_hand:"):
+                    _ticket_act(
+                        "claim", tid,
+                        lambda tid=tid: tickets.claim_ticket(tid, pid, name),
+                    )
+
+            if row["status"] == "claimed" and row.get("claimed_by") == pid:
+                text = st.text_area("回复用户", key=f"ticket_reply_{tid}", height=100)
+                if st.button(
+                    "发送回复", key=f"ticket_send_{tid}", icon=":material/send:"
+                ):
+                    if not text.strip():
+                        st.warning("回复内容不能为空。")
+                    else:
+                        _ticket_act(
+                            "reply", tid,
+                            lambda tid=tid, text=text: tickets.reply_ticket(
+                                tid, pid, name, text
+                            ),
+                            detail=text[:120],
+                        )
+                if st.button(
+                    "结束工单", key=f"ticket_close_{tid}", icon=":material/task_alt:"
+                ):
+                    _ticket_act(
+                        "close", tid,
+                        lambda tid=tid: tickets.close_ticket(tid, pid),
+                    )
+
+            if is_admin:
+                if row["status"] == "open" and st.button(
+                    "强制关闭", key=f"ticket_admin_close_{tid}",
+                    icon=":material/cancel:",
+                ):
+                    _ticket_act(
+                        "close", tid,
+                        lambda tid=tid: tickets.close_ticket(
+                            tid, pid, allow_override=True
+                        ),
+                        detail="admin-override",
+                    )
+                if row["status"] != "closed":
+                    target = st.text_input(
+                        "转派给（客服用户名）", key=f"ticket_target_{tid}"
+                    )
+                    col_transfer, col_release, _ = st.columns([1, 1, 3])
+                    with col_transfer:
+                        if st.button(
+                            "转派", key=f"ticket_transfer_{tid}",
+                            icon=":material/swap_horiz:",
+                        ):
+                            account = auth_store.get_principal(target.strip())
+                            if (
+                                account is None
+                                or account.get("revoked_at")
+                                or not auth_store.has_role(account, "agent")
+                            ):
+                                st.error("目标账号不存在、已吊销或不是客服。")
+                            else:
+                                _ticket_act(
+                                    "transfer", tid,
+                                    lambda tid=tid, account=account: tickets.transfer_ticket(
+                                        tid, account
+                                    ),
+                                    detail=str(account.get("name") or ""),
+                                )
+                    with col_release:
+                        if row["status"] == "claimed" and st.button(
+                            "放回队列", key=f"ticket_release_{tid}",
+                            icon=":material/undo:",
+                        ):
+                            _ticket_act(
+                                "transfer", tid,
+                                lambda tid=tid: tickets.transfer_ticket(tid, None),
+                                detail="queue",
+                            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 def main() -> None:
     require_login()
+
+    principal = st.session_state.get("admin_principal") or {}
+    token_mode = bool(auth_settings.AUTH_ENABLED)
+    is_admin = (not token_mode) or auth_store.has_role(principal, "admin")
 
     with st.sidebar:
         st.header("后台", icon=":material/admin_panel_settings:")
         # 徽章而不是又一句说明：这句话是给人看的"别把它当成权限系统"，
         # 用 caption 写会被当成普通说明读过去，做成徽章反而显眼。
-        st.badge("演示级鉴权：明文口令", icon=":material/lock_open:", color="orange")
+        if token_mode:
+            st.badge(
+                f"身份层：{principal.get('name') or '?'}（{principal.get('role') or '?'}）",
+                icon=":material/badge:",
+                color="green" if is_admin else "blue",
+            )
+        else:
+            st.badge("演示级鉴权：明文口令", icon=":material/lock_open:", color="orange")
         if st.button("退出", key="admin_logout", icon=":material/logout:"):
+            # 口令模式和 token 模式都要退干净：只清 admin_ok 会让下一次 rerun
+            # 拿着 session_state 里那枚 token 又自动登回来。
             st.session_state["admin_ok"] = False
+            st.session_state.pop("admin_principal", None)
+            st.session_state.pop("admin_token", None)
             st.rerun()
         st.space("medium")
         st.caption(
@@ -352,19 +586,29 @@ def main() -> None:
 
     st.title("电商客服后台", icon=":material/lock:")
 
-    # Tab 标签里可以加图标，但**三个中文子串不能动**——真运行时那条测试是拿
-    # 「退货审核」「订单与物流」「知识库队列」当子串去匹配的。
-    tab_returns, tab_orders, tab_kb = st.tabs([
-        ":material/assignment_return: 退货审核",
-        ":material/search: 订单与物流",
-        ":material/menu_book: 知识库队列",
-    ])
-    with tab_returns:
-        render_returns_page()
-    with tab_orders:
-        render_orders_page()
-    with tab_kb:
-        render_kb_queue_page()
+    # 口令模式保留原来的三个页面；身份层打开后多出「客服工作台」，且
+    # 退货审核 / 知识库队列只对 admin 画——agent 能进后台，但不该能批准退货。
+    # Tab 标签可以带图标，但中文子串不能动：真运行时那条测试拿它们做子串匹配。
+    if token_mode:
+        labels = [":material/support_agent: 客服工作台", ":material/search: 订单与物流"]
+        pages = [render_tickets_page, render_orders_page]
+        if is_admin:
+            labels += [
+                ":material/assignment_return: 退货审核",
+                ":material/menu_book: 知识库队列",
+            ]
+            pages += [render_returns_page, render_kb_queue_page]
+    else:
+        labels = [
+            ":material/assignment_return: 退货审核",
+            ":material/search: 订单与物流",
+            ":material/menu_book: 知识库队列",
+        ]
+        pages = [render_returns_page, render_orders_page, render_kb_queue_page]
+
+    for tab, page in zip(st.tabs(labels), pages):
+        with tab:
+            page()
 
 
 if __name__ == "__main__":

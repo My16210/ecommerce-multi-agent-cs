@@ -84,6 +84,19 @@ def test_session_and_credentials_stay_in_session_storage():
     assert "pushState" not in app_source
 
 
+def test_agent_console_polls_the_queue_and_the_open_ticket():
+    """客服台不能只靠"切 Tab"刷新：新工单和用户新消息都会自己出现。
+
+    这不是 WebSocket，代价是最多晚 5 秒；但没有长连接、没有重连状态机。
+    """
+    source = _read("src/components/AgentConsole.tsx")
+    assert "setInterval" in source
+    assert "fetchTickets(token, tab)" in source
+    assert "fetchTicketDetail(selectedId, token)" in source
+    # 轮询只更新列表/详情，不能在刷新时把客服正在打的草稿清掉。
+    assert "setDraft(\"\")" not in source.split("async function tick()")[1].split("}, [open")[0]
+
+
 def test_model_output_is_not_rendered_as_html():
     # Markdown 渲染器是模型输出进 DOM 的唯一位置；它只生成 React 元素，
     # 不许有任何「拼 HTML 字符串再塞进节点」的路径。

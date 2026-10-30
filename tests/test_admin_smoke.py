@@ -164,6 +164,52 @@ def _build(monkeypatch, *, password="s3cret", logged_in=False, pressed=(), input
     return module, st
 
 
+def _build_token(monkeypatch, *, role="agent", pressed=(), inputs=None):
+    """身份层模式：已经用 token 登录，principal 是 agent / admin。"""
+    st = _install_fake_streamlit(pressed_keys=pressed, inputs=inputs)
+    CALLS.clear()
+    module = _import_admin(st)
+
+    principal = {"id": "p1", "name": "carol", "role": role}
+    st.session_state["admin_principal"] = principal
+    st.session_state["admin_token"] = "tok"
+
+    monkeypatch.setattr(module.auth_settings, "AUTH_ENABLED", True)
+    monkeypatch.setattr(
+        module.auth_store, "authenticate",
+        lambda token: principal if token == "tok" else None,
+    )
+    monkeypatch.setattr(module.auth_store, "audit", lambda *a, **kw: None)
+    monkeypatch.setattr(module.returns, "stats", lambda db=None: {})
+    monkeypatch.setattr(module.returns, "list_returns", lambda status=None, limit=50, db=None: [])
+    monkeypatch.setattr(module.kb_queue, "stats", lambda: {})
+    monkeypatch.setattr(module.kb_queue, "list_items", lambda **kw: [])
+    monkeypatch.setattr(module.tickets, "list_tickets", lambda **kw: [])
+    monkeypatch.setattr(module.session, "transcript", lambda sid, n=200: [])
+    return module, st, principal
+
+
+def _ticket_row(**overrides):
+    row = {
+        "ticket_id": "T1",
+        "session_id": "s1",
+        "owner_id": "c1",
+        "status": "open",
+        "reason": "没有任何可转达的信息",
+        "title": "订单 52644 能退吗",
+        "created_at": "2026-10-30 10:00:00",
+        "updated_at": "2026-10-30 10:00:00",
+        "claimed_by": None,
+        "claimed_by_name": None,
+        "claimed_at": None,
+        "closed_by": None,
+        "closed_at": None,
+        "queue_position": 0,
+    }
+    row.update(overrides)
+    return row
+
+
 def _fake_order(order_id="52644"):
     """一笔订单快照。字段要**给全**——`_render_order_snapshot` 直接下标取值，
     少一个键就是一个 KeyError，而那不是这个测试想验的东西。"""
@@ -466,3 +512,82 @@ def test_logging_out_locks_the_console_again(monkeypatch):
         module.main()
 
     assert st.session_state["admin_ok"] is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 四、身份层模式：客服进得来，但只能看到自己能用的页面
+# ═══════════════════════════════════════════════════════════════════════════
+def test_an_agent_token_gets_the_ticket_console_but_not_returns(monkeypatch):
+    """agent 进后台是为了做工单，不是为了批准退货 / 改知识库。"""
+    module, _, _ = _build_token(monkeypatch, role="agent")
+
+    module.main()
+
+    labels = " ".join(str(c[1]) for c in _calls_named("tabs"))
+    assert "客服工作台" in labels
+    assert "订单与物流" in labels
+    assert "退货审核" not in labels
+    assert "知识库队列" not in labels
+
+
+def test_an_admin_token_still_gets_every_page(monkeypatch):
+    module, _, _ = _build_token(monkeypatch, role="admin")
+
+    module.main()
+
+    labels = " ".join(str(c[1]) for c in _calls_named("tabs"))
+    for name in ("客服工作台", "订单与物流", "退货审核", "知识库队列"):
+        assert name in labels
+
+
+def test_the_ticket_console_shows_context_and_offers_claim(monkeypatch):
+    module, _, _ = _build_token(monkeypatch)
+    row = _ticket_row()
+    monkeypatch.setattr(
+        module.tickets, "list_tickets",
+        lambda **kw: [row] if kw.get("status") == "open" else [],
+    )
+    monkeypatch.setattr(
+        module.session, "transcript",
+        lambda sid, n=200: [{"role": "user", "content": "订单 52644 能退吗", "author": ""}],
+    )
+
+    module.main()
+
+    shown = _shown()
+    assert "订单 52644 能退吗" in shown, "客服看不到用户说过什么"
+    assert "没有任何可转达的信息" in shown, "转人工原因没画出来"
+    assert ("认领",) in [c[1] for c in _calls_named("button")]
+
+
+def test_claiming_from_the_backend_calls_the_same_ticket_module_and_audits(monkeypatch):
+    """后台和 API 必须走同一个 `tickets` 模块；**不另写一套状态规则**。"""
+    module, _, _ = _build_token(monkeypatch, pressed=("ticket_claim_T1",))
+    row = _ticket_row()
+    monkeypatch.setattr(module.tickets, "list_tickets", lambda **kw: [row])
+
+    calls = []
+    audits = []
+    monkeypatch.setattr(
+        module.tickets, "claim_ticket",
+        lambda tid, pid, name: calls.append((tid, pid, name)),
+    )
+    monkeypatch.setattr(module.auth_store, "audit", lambda *a, **kw: audits.append(a))
+
+    with pytest.raises(_ScriptAbort):   # _ticket_act 成功后 st.rerun()
+        module.main()
+
+    assert calls == [("T1", "p1", "carol")]
+    assert any(a[1] == "ticket.claim" for a in audits)
+
+
+def test_logging_out_of_token_mode_forgets_the_token(monkeypatch):
+    """只清 admin_ok 不够：下一次 rerun 会拿 session_state 里那枚 token 又登回来。"""
+    module, st, _ = _build_token(monkeypatch, pressed=("admin_logout",))
+
+    with pytest.raises(_ScriptAbort):
+        module.main()
+
+    assert st.session_state["admin_ok"] is False
+    assert "admin_principal" not in st.session_state
+    assert "admin_token" not in st.session_state

@@ -486,6 +486,116 @@ def test_agent_claims_replies_and_closes_and_the_customer_sees_it(client, monkey
     assert closed["ticket"]["status"] == "closed"
 
 
+def test_a_claimed_ticket_silences_the_bot_but_not_the_transcript(client, monkeypatch):
+    """人工接手之后，机器人不能再抢答。
+
+    否则用户会同时收到客服和模型两套说法；客服看到的上下文里还会夹着模型
+    自说自话的答复。用户这句话本身仍然要落盘，客服刷新时得看得到。
+    """
+    _human_answer(monkeypatch)
+    body = client.post(
+        "/chat", json={"question": "这件事你能处理吗"}, headers=_auth(client.bob["token"])
+    ).json()
+    sid, tid = body["session_id"], body["handoff"]["ticket_id"]
+    client.post(f"/tickets/{tid}/claim", headers=_auth(client.carol["token"]))
+
+    def must_not_run(*args, **kwargs):  # noqa: ARG001
+        raise AssertionError("人工接手后不应该再调模型")
+
+    monkeypatch.setattr(api, "answer", must_not_run)
+
+    r = client.post(
+        "/chat",
+        json={"question": "那我再补充一句", "session_id": sid},
+        headers=_auth(client.bob["token"]),
+    )
+    assert r.status_code == 200
+    answer = r.json()
+    assert answer["decision"] == "human"
+    assert answer["tokens"] == {}
+    assert answer["handoff"]["status"] == "claimed"
+    assert tid in answer["answer"]
+    assert "carol" in answer["answer"]
+
+    detail = client.get(f"/tickets/{tid}", headers=_auth(client.carol["token"])).json()
+    assert any(
+        message["role"] == "user" and message["content"] == "那我再补充一句"
+        for message in detail["transcript"]
+    )
+
+    # 关单之后机器人恢复回答。
+    client.post(f"/tickets/{tid}/close", headers=_auth(client.carol["token"]))
+    monkeypatch.setattr(
+        api,
+        "answer",
+        lambda question, history: {
+            "request_id": "req-back",
+            "answer": f"机器人回来了：{question}",
+            "sources": [],
+            "decision": "answer",
+            "plan": ["knowledge"],
+            "tokens": {"in": 1, "out": 1},
+        },
+    )
+    back = client.post(
+        "/chat",
+        json={"question": "还在吗", "session_id": sid},
+        headers=_auth(client.bob["token"]),
+    ).json()
+    assert back["decision"] == "answer"
+    assert back["answer"].startswith("机器人回来了")
+
+
+def test_a_queued_ticket_does_not_silence_the_bot(client, monkeypatch):
+    """排队中（还没人认领）仍然让模型答：客服没接，用户至少能拿到点什么。"""
+    _human_answer(monkeypatch)
+    sid = client.post(
+        "/chat", json={"question": "转人工"}, headers=_auth(client.bob["token"])
+    ).json()["session_id"]
+    monkeypatch.setattr(
+        api,
+        "answer",
+        lambda question, history: {
+            "request_id": "req-queue",
+            "answer": "排队时机器人先答",
+            "sources": [],
+            "decision": "answer",
+            "plan": ["knowledge"],
+            "tokens": {"in": 1, "out": 1},
+        },
+    )
+    body = client.post(
+        "/chat",
+        json={"question": "那我先问问别的", "session_id": sid},
+        headers=_auth(client.bob["token"]),
+    ).json()
+    assert body["decision"] == "answer"
+
+
+def test_stream_also_goes_silent_while_a_human_has_the_ticket(client, monkeypatch):
+    _human_answer(monkeypatch)
+    body = client.post(
+        "/chat", json={"question": "转人工"}, headers=_auth(client.bob["token"])
+    ).json()
+    sid, tid = body["session_id"], body["handoff"]["ticket_id"]
+    client.post(f"/tickets/{tid}/claim", headers=_auth(client.carol["token"]))
+
+    def must_not_run(*args, **kwargs):  # noqa: ARG001
+        raise AssertionError("人工接手后不应该再调流式模型")
+
+    monkeypatch.setattr(api, "answer_stream", must_not_run)
+
+    r = client.post(
+        "/chat/stream",
+        json={"question": "补充一句", "session_id": sid},
+        headers=_auth(client.bob["token"]),
+    )
+    assert r.status_code == 200
+    assert '"decision": "human"' in r.text
+    assert '"ticket_id"' in r.text
+    assert "carol" in r.text
+
+
 def test_agent_cannot_read_another_agents_claimed_ticket_but_admin_can(client, monkeypatch):
     _human_answer(monkeypatch)
     body = client.post(

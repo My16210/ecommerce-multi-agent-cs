@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   ApiError,
@@ -54,6 +54,14 @@ export function AgentConsole({ open, token, role, onClose, onUnauthorized }: Age
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const isAdmin = role === "admin";
+  const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const selectedId = selected?.ticket_id ?? "";
+  // App 每次渲染都会传一个新的回调进来；放进轮询的依赖里会让定时器被反复
+  // 重建。用 ref 拿最新那份，effect 只依赖真正会变的东西。
+  const onUnauthorizedRef = useRef(onUnauthorized);
+  useEffect(() => {
+    onUnauthorizedRef.current = onUnauthorized;
+  }, [onUnauthorized]);
 
   function fail(caught: unknown): void {
     if (caught instanceof ApiError && caught.status === 401) {
@@ -78,6 +86,59 @@ export function AgentConsole({ open, token, role, onClose, onUnauthorized }: Age
       });
     return () => controller.abort();
   }, [open, tab, token]);
+
+  /**
+   * 队列和当前工单每 5 秒自动刷新一次。
+   *
+   * 没有 WebSocket：代价是最多晚 5 秒，好处是没有长连接和重连状态机。
+   * 新工单、用户新消息、别人抢先认领、admin 关单，都靠这一条。
+   * **只更新列表和详情，不动输入框里的草稿**——客服正在打字时不能被刷新清空。
+   */
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    async function tick(): Promise<void> {
+      try {
+        const items = await fetchTickets(token, tab);
+        if (!alive) return;
+        setTickets(items);
+        if (!selectedId) return;
+        try {
+          const detail = await fetchTicketDetail(selectedId, token);
+          if (alive) setSelected(detail);
+        } catch (caught) {
+          if (!alive) return;
+          if (caught instanceof ApiError && caught.status === 401) {
+            onUnauthorizedRef.current();
+            return;
+          }
+          // 工单被转走或关掉后可能不在可见范围里：收起详情，列表已经更新。
+          if (
+            caught instanceof ApiError &&
+            (caught.status === 403 || caught.status === 404)
+          ) {
+            setSelected(null);
+          }
+        }
+      } catch (caught) {
+        if (!alive) return;
+        if (caught instanceof ApiError && caught.status === 401) {
+          onUnauthorizedRef.current();
+        }
+      }
+    }
+    const timer = window.setInterval(() => void tick(), 5000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [open, tab, token, selectedId]);
+
+  // 有人回复、或者用户又发了一句：把上下文滚到最新一条。
+  useEffect(() => {
+    const list = transcriptRef.current;
+    if (list) list.scrollTop = list.scrollHeight;
+  }, [selectedId, selected?.transcript.length]);
 
   useEffect(() => {
     if (!open) return;
@@ -146,7 +207,7 @@ export function AgentConsole({ open, token, role, onClose, onUnauthorized }: Age
         <header className="dialog-head">
           <div>
             <h2 id="console-title">客服工作台</h2>
-            <p>转人工的会话在这里排队；认领后可以看上下文并回复。</p>
+            <p>转人工的会话在这里排队；认领后可以看上下文并回复。队列每 5 秒自动刷新。</p>
           </div>
           <button className="icon-btn" type="button" onClick={onClose} aria-label="关闭客服台">
             <Icon name="close" size={17} />
@@ -283,7 +344,11 @@ export function AgentConsole({ open, token, role, onClose, onUnauthorized }: Age
                   </div>
                 )}
 
-                <div className="ticket-transcript">
+                {selected.reason && (
+                  <p className="console-reason">转人工原因：{selected.reason}</p>
+                )}
+
+                <div className="ticket-transcript" ref={transcriptRef}>
                   {selected.transcript.map((message) => (
                     <div key={message.id} className={`transcript-line ${message.role}`}>
                       <span className="transcript-who">

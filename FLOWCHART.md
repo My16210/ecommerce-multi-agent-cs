@@ -213,14 +213,14 @@ worker_analytics ──► subprocess        python -m ecom.analytics.cli.analyz
 |---|---|---|
 | [main.py](main.py) | **排查问题** | 决策链摊在眼前；界面会把它藏起来 |
 | [app.py](app.py) | 演示 | 主区是对话，另外三个面收在侧边栏；四个视图共用一份进程 |
-| [admin.py](admin.py) | **下结论** | 三个页面里只有一个能写；口令不配就拒绝启动 |
+| [admin.py](admin.py) | **下结论 + 接人工** | 口令模式三个页面；身份层模式多一个客服工作台，按角色渲染；口令不配就拒绝启动 |
 | [api.py](api.py) | 被别的程序调 | `def` 不是 `async def`——图里全是阻塞调用 |
 | `python -m ecom.analytics.cli.analyze` | **给编排层当子进程** | stdout 只吐一行 JSON；契约写在名字里 |
 | `python -m ecom.orchestrator.cli.returns` | 容器里排障 / 写脚本 | 和 `admin.py` 调**同一份** `admin.returns`，不是两套逻辑 |
 | `python -m ecom.orchestrator.cli.session` | 会话的 list / show / delete / purge | 长驻进程不自清，清理由这条命令承担 |
 | `python -m ecom.orchestrator.cli.memory` | 记忆的 distill / list / recall | 蒸馏要调模型，**刻意不放在问答路径上**（见第八节后半） |
 
-`admin.py` 和 `app.py` **并列而不是合成一个**：`app.py` 是"面向客户、clone 下来点开就能用"，加一个密码框会毁掉这个定位。
+`admin.py` 和 `app.py` **并列而不是合成一个**：`app.py` 是"面向客户、clone 下来点开就能用"，加一个密码框会毁掉这个定位。客服工作台同时存在于 React 弹窗和 `admin.py`，两边调的是**同一个** `orchestrator/tickets.py`。
 
 ---
 

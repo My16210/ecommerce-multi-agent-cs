@@ -957,6 +957,41 @@ def _attach_handoff(final: dict, session_id: str, principal: dict) -> dict | Non
     }
 
 
+def _human_takeover_ticket(session_id: str, principal: dict) -> dict | None:
+    """
+    这个会话是不是已经由人工接手了（`status='claimed'`）。
+
+    排队中（`open`）仍然让机器人答：客服还没接，用户至少能拿到点什么。
+    **一旦有人认领，机器人就闭嘴**——否则用户会同时收到机器人和客服两套说法，
+    而客服看到的上下文里还夹着机器人自说自话的答复。
+
+    读工单失败时返回 None（继续让机器人答）：这不是成本闸，数据库抖一下
+    不该把用户晾在那里；真正的成本闸在配额那两层。
+    """
+    if demo.enabled() or not auth_settings.AUTH_ENABLED:
+        return None
+    if not str(principal.get("id") or "").strip():
+        return None
+    try:
+        ticket = tickets.ticket_for_session(session_id)
+    except Exception:  # noqa: BLE001 —— 见 docstring
+        logger.exception("读取会话工单失败 session=%s", session_id)
+        return None
+    if ticket is not None and ticket.get("status") == "claimed":
+        return ticket
+    return None
+
+
+def _human_mode_answer(ticket: dict) -> str:
+    """人工接手后代替模型的那句话。说清三件事：谁在接、单号、消息去哪了。"""
+    who = str(ticket.get("claimed_by_name") or "").strip()
+    head = f"人工客服 {who} 已经接手" if who else "人工客服已经接手"
+    return (
+        f"{head}（工单 {ticket['ticket_id']}）。你的这条消息已经记下并转给客服，"
+        "回复会出现在这个对话里；客服结束工单之前，机器人不会代为回答。"
+    )
+
+
 @app.post(
     "/sessions/{session_id}/handoff",
     response_model=TicketStatusResponse,
@@ -1225,6 +1260,26 @@ def chat(
     # 先确保会话存在再读历史——顺序反过来的话，新会话的第一问会因为
     # "查不到这个 session_id"而拿不到空历史（这一版不会报错，只是白查一次）。
     session_id = _session_for(req.session_id, principal)
+
+    # 人工已经接手：这一轮不进模型。用户的话仍然落盘，客服下一次刷新能看到；
+    # 返回的 `decision=human` 和工单信息让界面维持在"人工服务中"。
+    claimed = _human_takeover_ticket(session_id, principal)
+    if claimed is not None:
+        answer = _human_mode_answer(claimed)
+        session.append_turn(
+            session_id, req.question, answer, owner_id=principal.get("id", "")
+        )
+        return {
+            "handoff": _ticket_info(claimed),
+            "request_id": trace.new_request_id(),
+            "session_id": session_id,
+            "answer": answer,
+            "sources": [],
+            "decision": "human",
+            "plan": [],
+            "tokens": {},
+        }
+
     history = session.history(session_id)
 
     # 记忆拼在真实历史**前面**，而且**每轮现拼、不落盘**——把 `augmented_history`
@@ -1336,6 +1391,47 @@ def chat_stream(
     _chat_quota_precheck(principal)
 
     session_id = _session_for(req.session_id, principal)
+
+    # 和 /chat 同一条规矩：人工接手后不再进模型，只把用户这句话记下来。
+    # 流式接口仍然按同一套事件发出去，客户端不需要多一个分支。
+    claimed = _human_takeover_ticket(session_id, principal)
+    if claimed is not None:
+        answer = _human_mode_answer(claimed)
+        handoff_info = _ticket_info(claimed)
+        request_id = trace.new_request_id()
+
+        def human_events():
+            yield _sse(
+                {
+                    "type": "start",
+                    "request_id": request_id,
+                    "session_id": session_id,
+                }
+            )
+            yield _sse({"type": "delta", "text": answer})
+            session.append_turn(
+                session_id, req.question, answer, owner_id=principal.get("id", "")
+            )
+            yield _sse(
+                {
+                    "type": "final",
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "answer": answer,
+                    "sources": [],
+                    "decision": "human",
+                    "plan": [],
+                    "tokens": {},
+                    "handoff": handoff_info,
+                    "thinking": "",
+                    "elapsed_ms": 0,
+                }
+            )
+
+        return StreamingResponse(
+            human_events(), media_type="text/event-stream", headers=SSE_HEADERS
+        )
+
     history = session.history(session_id)
     # 和 /chat 一样：记忆每轮现拼，不落盘。
     augmented = memory.augmented_history(session_id, req.question, history)

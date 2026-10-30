@@ -157,7 +157,8 @@ services:
 
     volumes:
       # 和 app 是同一份数据。两个容器同时连一个 sqlite 文件是安全的——
-      # 退货审核动的是订单库，会话库只有 app 那条路在写（见 session.py 的连接复用）。
+      # 会话库开了 WAL + busy_timeout（见 session.py），退货审核动订单库，
+      # 客服工作台回复 / 认领工单会和 app 同时写会话库，靠的是同一套设置。
       - ./data:/app/data
       - ./logs:/app/logs
 

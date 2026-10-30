@@ -1813,6 +1813,15 @@ button:disabled {
   gap: 8px;
 }
 
+/* 机器给的转人工理由：客服判断"该不该接"的一部分，不跟正文抢视觉。 */
+.console-reason {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0 14px 10px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
 /* 转派 / 放回队列只对 admin 出现；它是一排恢复动作，不跟认领/关闭抢位置。 */
 .transfer-row {
   display: flex;
