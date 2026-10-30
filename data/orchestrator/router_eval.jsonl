@@ -1,0 +1,50 @@
+{"id": "R001", "category": "order", "question": "订单 52644 到哪了", "expected": ["order"]}
+{"id": "R002", "category": "order", "question": "我的包裹到哪了", "expected": ["order"]}
+{"id": "R003", "category": "order", "question": "帮我查一下物流", "expected": ["order"]}
+{"id": "R004", "category": "order", "question": "发货了吗", "expected": ["order"]}
+{"id": "R005", "category": "order", "question": "这笔订单签收了吗", "expected": ["order"]}
+{"id": "R006", "category": "order", "question": "查一下 C20755 的所有订单", "expected": ["order"]}
+{"id": "R007", "category": "order", "question": "客户 C20755 买了什么", "expected": ["order"], "note": "按客户号查单，规则路由没有对应关键词"}
+{"id": "R008", "category": "order", "question": "我要退货", "expected": ["order"], "note": "写意图；规则层只认退货申请"}
+{"id": "R009", "category": "order", "question": "我要申请退货，订单 52644", "expected": ["order"]}
+{"id": "R010", "category": "order", "question": "订单 52644 为什么还没发货", "expected": ["order"]}
+{"id": "R011", "category": "knowledge", "question": "退货政策是什么", "expected": ["knowledge"]}
+{"id": "R012", "category": "knowledge", "question": "保修怎么算", "expected": ["knowledge"]}
+{"id": "R013", "category": "knowledge", "question": "发票怎么开", "expected": ["knowledge"]}
+{"id": "R014", "category": "knowledge", "question": "七天无理由退货的规则", "expected": ["knowledge"]}
+{"id": "R015", "category": "knowledge", "question": "退款一般多久到账", "expected": ["knowledge"]}
+{"id": "R016", "category": "knowledge", "question": "怎么申请退货", "expected": ["knowledge"], "note": "问流程，不是要立刻办"}
+{"id": "R017", "category": "knowledge", "question": "你们几点上班", "expected": ["knowledge"]}
+{"id": "R018", "category": "knowledge", "question": "你好", "expected": ["knowledge"]}
+{"id": "R019", "category": "knowledge", "question": "优惠券怎么用", "expected": ["knowledge"]}
+{"id": "R020", "category": "analytics", "question": "哪个大区卖得最好", "expected": ["analytics"]}
+{"id": "R021", "category": "analytics", "question": "帮我统计一下华东的销售额", "expected": ["analytics"]}
+{"id": "R022", "category": "analytics", "question": "最近哪个商品卖得最好", "expected": ["analytics"]}
+{"id": "R023", "category": "analytics", "question": "同比去年增长多少", "expected": ["analytics"]}
+{"id": "R024", "category": "analytics", "question": "哪个地区退货率最高", "expected": ["analytics"]}
+{"id": "R025", "category": "analytics", "question": "总销售额是多少", "expected": ["analytics"]}
+{"id": "R026", "category": "analytics", "question": "帮我做个销售报表", "expected": ["analytics"], "note": "报表没有命中关键词"}
+{"id": "R027", "category": "analytics", "question": "退货率", "expected": ["analytics"]}
+{"id": "R028", "category": "analytics", "question": "哪种发货方式最容易延迟", "expected": ["analytics"], "note": "发货是订单词，但问的是统计"}
+{"id": "R029", "category": "analytics", "question": "发货方式延迟风险最高的是哪种", "expected": ["analytics"], "note": "同上"}
+{"id": "R030", "category": "multi", "question": "订单 52644 到哪了，顺便问下退货政策", "expected": ["order", "knowledge"]}
+{"id": "R031", "category": "multi", "question": "订单 52644 到哪了，另外哪个地区卖得最好", "expected": ["order", "analytics"]}
+{"id": "R032", "category": "multi", "question": "退货政策是什么，顺便查下订单 52644", "expected": ["order", "knowledge"]}
+{"id": "R033", "category": "multi", "question": "订单 52644 的发票怎么开", "expected": ["order", "knowledge"]}
+{"id": "R034", "category": "multi", "question": "52644 能退吗", "expected": ["order", "knowledge"], "note": "既要查单也要政策"}
+{"id": "R035", "category": "multi", "question": "订单 52644 退款多久到账", "expected": ["order", "knowledge"]}
+{"id": "R036", "category": "multi", "question": "帮我查订单 52644，再看下这个月销售额", "expected": ["order", "analytics"]}
+{"id": "R037", "category": "followup", "question": "那能退吗", "expected": ["order", "knowledge"], "history": [{"role": "user", "content": "订单 52644 到哪了"}, {"role": "assistant", "content": "已签收。"}]}
+{"id": "R038", "category": "followup", "question": "它的金额是多少", "expected": ["order"], "history": [{"role": "user", "content": "订单 52644 到哪了"}, {"role": "assistant", "content": "已签收。"}]}
+{"id": "R039", "category": "followup", "question": "刚才那笔订单到哪了", "expected": ["order"], "history": [{"role": "user", "content": "订单 52644 到哪了"}, {"role": "assistant", "content": "已签收。"}]}
+{"id": "R040", "category": "followup", "question": "那帮我退了吧", "expected": ["order"], "history": [{"role": "user", "content": "订单 52644 到哪了"}, {"role": "assistant", "content": "已签收。"}]}
+{"id": "R041", "category": "trap", "question": "发票号 20250901 对应的订单", "expected": ["knowledge"], "note": "8 位数字不是订单号，别把发票号当订单"}
+{"id": "R042", "category": "trap", "question": "2025 年的销售趋势", "expected": ["analytics"]}
+{"id": "R043", "category": "trap", "question": "订单 1234 到哪了", "expected": ["order"], "note": "4 位订单号路由认得出，抽取层认不出"}
+{"id": "R044", "category": "trap", "question": "发货延迟是谁的责任", "expected": ["knowledge"], "note": "问规则，不是查某一单"}
+{"id": "R045", "category": "multi", "question": "退货政策，还有我的订单 52644 到哪了", "expected": ["order", "knowledge"]}
+{"id": "R046", "category": "knowledge", "question": "售后说明", "expected": ["knowledge"]}
+{"id": "R047", "category": "order", "question": "谁买的订单 52644", "expected": ["order"]}
+{"id": "R048", "category": "analytics", "question": "各地区的销售额占比", "expected": ["analytics"]}
+{"id": "R049", "category": "knowledge", "question": "如何开发票", "expected": ["knowledge"]}
+{"id": "R050", "category": "multi", "question": "订单 52644 到哪了，顺便看下退货率", "expected": ["order", "analytics"]}
