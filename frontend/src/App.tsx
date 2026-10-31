@@ -25,6 +25,7 @@ import type {
   Conversation,
   Health,
   Message,
+  SessionMessage,
   SessionSummary,
   Theme,
   TicketInfo,
@@ -95,6 +96,21 @@ function makeConversation(
 function parseServerTime(value: string): number {
   const parsed = Date.parse(String(value || "").replace(" ", "T"));
   return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
+/** 用「角色 + 正文」把服务端消息和本地消息对起来。本地消息没有服务端 id。 */
+function messageKey(role: Message["role"], content: string): string {
+  return `${role}\u0000${content}`;
+}
+
+function agentMessageFromServer(message: SessionMessage): Message {
+  return {
+    id: `srv-${message.id}`,
+    role: "agent",
+    content: message.content,
+    author: message.author || "",
+    createdAt: parseServerTime(message.created_at),
+  };
 }
 
 /** 轮询每 5 秒跑一次；状态没变就不更新 store，避免白写 sessionStorage。 */
@@ -542,34 +558,55 @@ export default function App() {
   }
 
   /**
-   * 轮询人工回复。**只追加新出现的 `agent` 消息**，不整体替换：
+   * 轮询人工回复。**只合并新出现的 `agent` 消息**，不整体替换：
    * 本地消息带着 thinking / meta，服务端只存了问答原文，整份替换会把
    * 用户正在看的思考过程抹掉。
+   *
+   * 但"插到末尾"是错的：用户可能在两次轮询之间又发了一句，而客服的回复
+   * 其实在那之前就已经到了服务端。所以按**服务端顺序**找位置——每条新
+   * 客服消息插在"它后面第一条本地也有的消息"前面；后面没有本地消息
+   * （也就是它是最新一条）才追加。
    */
   async function pullAgentReplies(conversationId: string, sessionId: string): Promise<void> {
     if (!apiKey) return;
     const detail = await fetchSession(sessionId, apiKey);
-    const agentMessages = detail.messages.filter((message) => message.role === "agent");
-    if (!agentMessages.length) return;
+    const server = detail.messages;
+    if (!server.some((message) => message.role === "agent")) return;
     setStore((current) => {
       const conversation = current.conversations.find((item) => item.id === conversationId);
       if (!conversation) return current;
       const known = new Set(conversation.messages.map((message) => message.id));
-      const added = agentMessages
-        .filter((message) => !known.has(`srv-${message.id}`))
-        .map((message) => ({
-          id: `srv-${message.id}`,
-          role: "agent" as const,
-          content: message.content,
-          author: message.author || "",
-          createdAt: parseServerTime(message.created_at),
-        }));
-      if (!added.length) return current;
+      const pending = server
+        .map((message, index) => ({ message, index }))
+        .filter(
+          ({ message }) =>
+            message.role === "agent" && !known.has(`srv-${message.id}`),
+        );
+      if (!pending.length) return current;
+
+      const messages = [...conversation.messages];
+      for (const { message, index } of pending) {
+        // 从这条客服回复往后找：第一条在本地出现过的消息，就是它的下界。
+        // 找不到说明它是目前最新的一句，追加到最后。
+        let at = messages.length;
+        for (let i = index + 1; i < server.length && at === messages.length; i += 1) {
+          const later = server[i];
+          if (later.role === "agent") continue;
+          const key = messageKey(later.role, later.content);
+          for (let j = messages.length - 1; j >= 0; j -= 1) {
+            if (messageKey(messages[j].role, messages[j].content) === key) {
+              at = j;
+              break;
+            }
+          }
+        }
+        messages.splice(at, 0, agentMessageFromServer(message));
+      }
       return {
         ...current,
         conversations: current.conversations.map((item) =>
           item.id === conversationId
-            ? { ...item, messages: [...item.messages, ...added], updatedAt: Date.now() }
+            ? { ...item, messages, updatedAt: Date.now() }
             : item,
         ),
       };

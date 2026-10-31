@@ -359,8 +359,34 @@ def _ticket_principal() -> dict:
     return st.session_state.get("admin_principal") or {}
 
 
-def _ticket_transcript(session_id: str) -> list:
-    """工单上下文。读失败返回空列表，别让一行坏数据把整个页面打红。"""
+def _safe_markdown(text: str) -> str:
+    """把用户 / 模型写的正文转义成"不会去拉外部资源"的 Markdown。
+
+    `st.markdown` 即使不开 `unsafe_allow_html`，也会把 `![](http://…)` 真的
+    渲染成图片：客服一展开工单，**客服的浏览器**就去访问发消息的人指定的
+    地址（泄露 IP，也能用来确认"这个客服在线"）。链接同理，是可点的钓鱼
+    入口。方括号转义之后图片和链接都退化成文字，加粗 / 列表不受影响。
+    """
+    return str(text or "").replace("[", r"\[").replace("]", r"\]")
+
+
+def _ticket_transcript(ticket_id: str, session_id: str) -> list:
+    """工单上下文。读失败返回空列表，别让一行坏数据把整个页面打红。
+
+    **第一次看某张单时写一条 `ticket.view` 审计**——和 API 的
+    `GET /tickets/{id}` 同一个口径：读用户说过的话要留痕。Streamlit 每次
+    交互都会重跑整个脚本，expander 里的内容也会执行，所以按工单去重，
+    否则客服点一下页面就多一条审计。
+    """
+    seen = st.session_state.setdefault("ticket_viewed", set())
+    if ticket_id not in seen:
+        seen.add(ticket_id)
+        auth_store.audit(
+            str(_ticket_principal().get("name") or ""),
+            "ticket.view",
+            ticket_id,
+            f"session={session_id} via admin.py",
+        )
     try:
         return session.transcript(session_id, 200)
     except Exception as exc:  # noqa: BLE001 —— 界面要能继续画
@@ -448,14 +474,14 @@ def render_tickets_page() -> None:
             who = row.get("claimed_by_name") or "（还没人接）"
             st.markdown(
                 f"**状态**：{TICKET_STATUS_LABELS.get(row['status'], row['status'])}　"
-                f"**接手人**：{who}　**开单**：{row['created_at']}"
+                f"**接手人**：{_safe_markdown(who)}　**开单**：{row['created_at']}"
                 + (f"　**排队位置**：{row['queue_position']}" if row["status"] == "open" else "")
             )
             if row.get("reason"):
-                st.caption(f"转人工原因：{row['reason']}")
+                st.caption(f"转人工原因：{_safe_markdown(row['reason'])}")
 
             if tickets.can_view(row, pid, is_admin):
-                messages = _ticket_transcript(row["session_id"])
+                messages = _ticket_transcript(tid, row["session_id"])
                 if not messages:
                     st.info("这个会话还没有消息。")
                 for message in messages[-100:]:
@@ -466,7 +492,11 @@ def render_tickets_page() -> None:
                         head = f"人工 {(message.get('author') or '').strip()}".strip()
                     else:
                         head = "机器人"
-                    st.markdown(f"**{head}**：{message.get('content') or ''}")
+                    # 用户/客服正文一律转义后再交给 Markdown：图片和链接不能
+                    # 让客服的浏览器去访问第三方地址（见 _safe_markdown）。
+                    st.markdown(
+                        f"**{_safe_markdown(head)}**：{_safe_markdown(message.get('content'))}"
+                    )
             else:
                 st.warning("这张工单不在你的可见范围内。")
 

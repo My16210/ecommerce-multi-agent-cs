@@ -596,6 +596,91 @@ def test_stream_also_goes_silent_while_a_human_has_the_ticket(client, monkeypatc
     assert "carol" in r.text
 
 
+def test_a_claimed_ticket_is_not_blocked_by_the_token_budget(client, monkeypatch):
+    """人工接手后，预算闸不能再把用户挡在门外——这一轮根本不花 token。
+
+    反过来，没有工单的普通提问仍然要 429：不能因为人工这条支路，把预算闸
+    悄悄关掉。
+    """
+    _human_answer(monkeypatch)
+    body = client.post(
+        "/chat", json={"question": "转人工"}, headers=_auth(client.bob["token"])
+    ).json()
+    sid, tid = body["session_id"], body["handoff"]["ticket_id"]
+    client.post(f"/tickets/{tid}/claim", headers=_auth(client.carol["token"]))
+
+    def must_not_run(*args, **kwargs):  # noqa: ARG001
+        raise AssertionError("人工接手后不应该再调模型")
+
+    monkeypatch.setattr(api, "answer", must_not_run)
+    monkeypatch.setattr(chat_quota, "budget_exhausted", lambda pid: True)
+    monkeypatch.setattr(chat_quota, "global_budget_exhausted", lambda: True)
+
+    r = client.post(
+        "/chat",
+        json={"question": "客服还在吗", "session_id": sid},
+        headers=_auth(client.bob["token"]),
+    )
+    assert r.status_code == 200, "人工接手时不该被 token 预算拦截"
+    assert r.json()["decision"] == "human"
+
+    # 没有人工接手的会话照旧被预算闸挡住。
+    blocked = client.post(
+        "/chat", json={"question": "再问一句"}, headers=_auth(client.bob["token"])
+    )
+    assert blocked.status_code == 429
+
+
+def test_stream_also_skips_the_token_budget_while_a_human_has_the_ticket(client, monkeypatch):
+    _human_answer(monkeypatch)
+    body = client.post(
+        "/chat", json={"question": "转人工"}, headers=_auth(client.bob["token"])
+    ).json()
+    sid, tid = body["session_id"], body["handoff"]["ticket_id"]
+    client.post(f"/tickets/{tid}/claim", headers=_auth(client.carol["token"]))
+
+    def must_not_run(*args, **kwargs):  # noqa: ARG001
+        raise AssertionError("人工接手后不应该再调流式模型")
+
+    monkeypatch.setattr(api, "answer_stream", must_not_run)
+    monkeypatch.setattr(chat_quota, "budget_exhausted", lambda pid: True)
+    monkeypatch.setattr(chat_quota, "global_budget_exhausted", lambda: True)
+
+    r = client.post(
+        "/chat/stream",
+        json={"question": "补充一句", "session_id": sid},
+        headers=_auth(client.bob["token"]),
+    )
+    assert r.status_code == 200
+    assert '"decision": "human"' in r.text
+
+
+def test_human_mode_still_rate_limits_the_customer(client, monkeypatch):
+    """预算可以跳过，限流不能：人工模式仍然会把消息灌进客服台。"""
+    _human_answer(monkeypatch)
+    body = client.post(
+        "/chat", json={"question": "转人工"}, headers=_auth(client.bob["token"])
+    ).json()
+    sid, tid = body["session_id"], body["handoff"]["ticket_id"]
+    client.post(f"/tickets/{tid}/claim", headers=_auth(client.carol["token"]))
+
+    chat_quota.reset_rate_limits()
+    monkeypatch.setattr(chat_quota, "CHAT_RATE_LIMIT_PER_MINUTE", 1)
+
+    first = client.post(
+        "/chat",
+        json={"question": "第一句", "session_id": sid},
+        headers=_auth(client.bob["token"]),
+    )
+    second = client.post(
+        "/chat",
+        json={"question": "第二句", "session_id": sid},
+        headers=_auth(client.bob["token"]),
+    )
+    assert first.status_code == 200
+    assert second.status_code == 429
+
+
 def test_agent_cannot_read_another_agents_claimed_ticket_but_admin_can(client, monkeypatch):
     _human_answer(monkeypatch)
     body = client.post(

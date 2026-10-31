@@ -97,6 +97,19 @@ def test_agent_console_polls_the_queue_and_the_open_ticket():
     assert "setDraft(\"\")" not in source.split("async function tick()")[1].split("}, [open")[0]
 
 
+def test_agent_replies_are_merged_in_server_order():
+    """客服回复不能一律追加到末尾。
+
+    用户可能在两次轮询之间又发了一句，而那条回复其实更早。这里钉住的是
+    "按服务端顺序插回去"这段接线；真正的顺序逻辑没有浏览器测试，靠代码
+    审阅和 typecheck 保证。
+    """
+    source = _read("src/App.tsx")
+    assert "agentMessageFromServer" in source
+    assert "messages.splice(at, 0, agentMessageFromServer(message))" in source
+    assert "messages: [...item.messages, ...added]" not in source
+
+
 def test_model_output_is_not_rendered_as_html():
     # Markdown 渲染器是模型输出进 DOM 的唯一位置；它只生成 React 元素，
     # 不许有任何「拼 HTML 字符串再塞进节点」的路径。

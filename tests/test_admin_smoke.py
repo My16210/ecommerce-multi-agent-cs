@@ -560,6 +560,40 @@ def test_the_ticket_console_shows_context_and_offers_claim(monkeypatch):
     assert ("认领",) in [c[1] for c in _calls_named("button")]
 
 
+def test_viewing_a_ticket_in_the_backend_writes_one_view_audit(monkeypatch):
+    """读用户聊天记录要留痕——和 API 的 `GET /tickets/{id}` 同一个口径。
+
+    Streamlit 每次交互都会重跑脚本，expander 里的内容也会执行；同一个
+    后台会话里同一张单只记一次，否则页面动一下就多一条审计。
+    """
+    module, _, _ = _build_token(monkeypatch)
+    row = _ticket_row()
+    monkeypatch.setattr(
+        module.tickets, "list_tickets",
+        lambda **kw: [row] if kw.get("status") == "open" else [],
+    )
+    audits = []
+    monkeypatch.setattr(module.auth_store, "audit", lambda *a, **kw: audits.append(a))
+
+    module.main()
+    module.main()   # 同一张单的第二次 rerun
+
+    assert [a[1] for a in audits].count("ticket.view") == 1
+
+
+def test_user_content_is_escaped_before_markdown(monkeypatch):
+    """客服台的正文不能把图片 / 链接原样交给 Markdown。
+
+    否则用户发一句 `![](http://…)`，客服一展开工单，客服的浏览器就会去
+    访问那个地址。
+    """
+    module, _, _ = _build_token(monkeypatch)
+    assert module._safe_markdown("![x](http://example.com/a.png)") == (
+        r"!\[x\](http://example.com/a.png)"
+    )
+    assert module._safe_markdown(None) == ""
+
+
 def test_claiming_from_the_backend_calls_the_same_ticket_module_and_audits(monkeypatch):
     """后台和 API 必须走同一个 `tickets` 模块；**不另写一套状态规则**。"""
     module, _, _ = _build_token(monkeypatch, pressed=("ticket_claim_T1",))

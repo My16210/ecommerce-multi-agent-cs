@@ -551,12 +551,11 @@ def _demo_precheck(request: Request) -> None:
         raise HTTPException(status_code=429, detail="今天的演示额度已经用完")
 
 
-def _chat_quota_precheck(principal: dict) -> None:
+def _chat_rate_limit(principal: dict) -> None:
     """
-    已登录账号的第三道闸：每人限流 + 每人每日 token 预算 + 全站每日总预算。
-
-    匿名请求（`id` 为空）直接放行——它们由上面的 demo 闸按 IP 管。这道闸
-    必须在调模型之前，理由和 demo 一样：拦在调用之后等于钱已经花了。
+    已登录账号的每人限流。**人工接手的轮次也保留**：那一轮虽然不花 token，
+    但一封封往客服台里灌消息同样是一种滥用。匿名请求（`id` 为空）由 demo
+    闸按 IP 管，这里直接放行。
     """
     principal_id = str(principal.get("id") or "").strip()
     if not principal_id:
@@ -567,6 +566,21 @@ def _chat_quota_precheck(principal: dict) -> None:
             detail="请求过于频繁，请稍后再试",
             headers={"Retry-After": "60"},
         )
+
+
+def _chat_budget_check(principal: dict) -> None:
+    """
+    已登录账号的每日 token 预算 + 全站每日总预算。
+
+    **只在真的会调模型之前调用**。人工已经接手的会话不进模型，这一轮没有
+    成本，不能因为"今日额度用完"把用户挡在人工客服门外——那样用户明明有
+    人接待，却连一句话都发不出去。顺序上的细节见 `chat()`。
+
+    匿名请求（`id` 为空）直接放行——它们由 demo 闸按 IP 管。
+    """
+    principal_id = str(principal.get("id") or "").strip()
+    if not principal_id:
+        return
     try:
         personal_exhausted = chat_quota.budget_exhausted(principal_id)
         global_exhausted = chat_quota.global_budget_exhausted()
@@ -1255,7 +1269,7 @@ def chat(
     req: ChatRequest, request: Request, principal: Annotated[dict, Depends(require_access)]
 ) -> dict:
     _demo_precheck(request)
-    _chat_quota_precheck(principal)
+    _chat_rate_limit(principal)
 
     # 先确保会话存在再读历史——顺序反过来的话，新会话的第一问会因为
     # "查不到这个 session_id"而拿不到空历史（这一版不会报错，只是白查一次）。
@@ -1279,6 +1293,11 @@ def chat(
             "plan": [],
             "tokens": {},
         }
+
+    # 预算闸放在认领判断之后：人工接手的那一轮没有模型调用，也就没有成本。
+    # 如果它在前面，"今日额度用完"会连人工客服一起挡掉——用户明明有人接待，
+    # 却一个字都发不出去。限流已经在上面单独做过，刷屏的成本仍然兜住。
+    _chat_budget_check(principal)
 
     history = session.history(session_id)
 
@@ -1388,7 +1407,7 @@ def chat_stream(
     # 闸必须在**开始发 SSE 之前**：一旦返回了 StreamingResponse，HTTP 状态码
     # 就已经是 200 了，再把 429 塞进流里，客户端会以为"答到一半失败了"。
     _demo_precheck(request)
-    _chat_quota_precheck(principal)
+    _chat_rate_limit(principal)
 
     session_id = _session_for(req.session_id, principal)
 
@@ -1400,6 +1419,13 @@ def chat_stream(
         handoff_info = _ticket_info(claimed)
         request_id = trace.new_request_id()
 
+        # **先落盘再开始流。** 这句话是给客服看的，用户看到"已经记下"之后
+        # 立刻关掉页面也不能丢；放进生成器里的话，客户端断开会让生成器
+        # 被取消，append_turn 可能根本跑不到。人工模式不调模型，先写没有成本。
+        session.append_turn(
+            session_id, req.question, answer, owner_id=principal.get("id", "")
+        )
+
         def human_events():
             yield _sse(
                 {
@@ -1409,9 +1435,6 @@ def chat_stream(
                 }
             )
             yield _sse({"type": "delta", "text": answer})
-            session.append_turn(
-                session_id, req.question, answer, owner_id=principal.get("id", "")
-            )
             yield _sse(
                 {
                     "type": "final",
@@ -1431,6 +1454,9 @@ def chat_stream(
         return StreamingResponse(
             human_events(), media_type="text/event-stream", headers=SSE_HEADERS
         )
+
+    # 和 /chat 一样：预算闸在认领判断之后（人工接管不花 token）。
+    _chat_budget_check(principal)
 
     history = session.history(session_id)
     # 和 /chat 一样：记忆每轮现拼，不落盘。
