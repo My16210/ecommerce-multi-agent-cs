@@ -17,6 +17,7 @@ from datetime import datetime
 
 from ecom.auth import settings as auth_settings
 from ecom.orchestrator import memory
+from ecom.orchestrator.core.supervisor import degrade_handoff
 from ecom.orchestrator.tools.image_understander import understand_image
 from ecom.orchestrator.utils.image_intent import augment_question_with_image
 from ecom.settings import VISION_MAX_IMAGE_MB
@@ -357,6 +358,11 @@ def _run_turn(
             status.update(label="答复失败", state="error")
             st.error("这次请求没有正常结束，请重试。")
             return
+
+        # Streamlit 直连 supervisor，没有身份层也没有工单：转人工只会得到一句
+        # "好的，需要人工客服。"。换成"当前环境未开通人工客服"，不假装已经转接。
+        # 必须在落盘之前改，否则历史里存的是那句占位话术。
+        final = degrade_handoff(final)
 
         # 真实 supervisor 在收尾（含生成器被提前关闭）通过 on_usage 报过账；
         # 只有两参数替身不会回调，才用 final 里的汇总兜底。

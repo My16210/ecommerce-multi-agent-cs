@@ -19,7 +19,12 @@ import json
 import time
 
 from ecom.orchestrator.core.aggregate import WORKER_LABELS
-from ecom.orchestrator.core.supervisor import answer, answer_stream
+from ecom.orchestrator.core.supervisor import (
+    HANDOFF_REQUESTED,
+    answer,
+    answer_stream,
+    degrade_handoff,
+)
 from ecom.orchestrator.db.engine import get_db
 from ecom.orchestrator.db.seed import seed
 from ecom.orchestrator.settings import MAX_ROUNDS, WORKER_TIMEOUT
@@ -96,11 +101,20 @@ def _run_streaming(question: str, chat_history: list, verbose: bool, started: fl
     print(_safe(LINE))
     pieces: list[str] = []
     final: dict = {}
+    # 转人工时 supervisor 先吐一句占位话术，**有没有真工单要等 final 才知道**。
+    # 终端打出去的字收不回来，所以只要已收的字还是这句的前缀就先扣住。
+    held = ""
     for event in answer_stream(question, chat_history):
         kind = event.get("type")
         if kind == "delta":
             piece = event.get("text") or ""
             pieces.append(piece)
+            if HANDOFF_REQUESTED.startswith(held + piece):
+                held += piece
+                continue
+            if held:
+                print(_safe(held), end="", flush=True)
+                held = ""
             print(_safe(piece), end="", flush=True)
         elif kind == "reset":
             # 重路由：上一轮已经打出去的字收不回来，但至少不能把它当成新一轮
@@ -108,14 +122,25 @@ def _run_streaming(question: str, chat_history: list, verbose: bool, started: fl
             pieces.clear()
             print(_safe("\n（重新规划，以下是新一轮答复）"))
         elif kind == "final":
-            final = event.get("state") or {}
+            # CLI 没有身份层，开不出工单：这里把"好的，需要人工客服。"换成
+            # "当前环境未开通人工客服"。真带了 handoff 的话原样保留。
+            final = degrade_handoff(event.get("state") or {})
+            if held and final.get("decision") == "human":
+                # 占位话术作废，而且它确实没打出去——当作从没收到过。
+                held = ""
+                pieces.clear()
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     print()
 
+    if held:
+        # 没有 final 就断流了：扣下的就是屏幕上的全部内容，补打出来。
+        print(_safe(held), end="", flush=True)
+        pieces.append(held)
     streamed = "".join(pieces).strip()
     answer = str(final.get("answer") or "").strip()
     if answer and answer != streamed:
-        print(_safe("（上面是生成过程中的片段，以完整答复为准）"))
+        if streamed:
+            print(_safe("（上面是生成过程中的片段，以完整答复为准）"))
         print(_safe(answer))
 
     _show_meta(question, final, verbose, elapsed_ms)
@@ -129,7 +154,9 @@ def run_question(question: str, chat_history: list, verbose: bool, as_json: bool
     if stream and not as_json:
         return _run_streaming(question, chat_history, verbose, started)
 
-    final = answer(question, chat_history)
+    # CLI 不经过 API，没有身份和会话库：转人工只会得到一句占位话术。这里换成
+    # "当前环境未开通人工客服"，不假装已经转接；有工单时（将来接入）保持原样。
+    final = degrade_handoff(answer(question, chat_history))
     elapsed_ms = int((time.perf_counter() - started) * 1000)
 
     if as_json:

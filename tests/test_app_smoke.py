@@ -322,6 +322,42 @@ def test_the_model_gets_history_from_the_store_not_from_the_screen(app):
     assert len(app.session.history(sid)) == 4
 
 
+def test_agent_view_says_human_support_is_unavailable(app):
+    """Streamlit 直连 supervisor，没有身份层也就没有工单。
+
+    「好的，需要人工客服。」在界面上等于"已经有人在处理了"，但后台什么都不会
+    发生。这条同时钉住两件事：屏幕上最后一版答复是降级提示，**落盘的也是它**
+    ——否则重新打开历史，用户又会看到那句占位话术。
+    """
+    from ecom.orchestrator.core.supervisor import (
+        HANDOFF_REQUESTED,
+        HANDOFF_UNAVAILABLE,
+    )
+
+    sid = app.session.ensure_session("")
+    app.st.session_state["agent_session_id"] = sid
+    app.st.session_state["agent_turns"] = []
+
+    def _fake_stream(question, history):  # noqa: ANN001
+        yield {"type": "start", "request_id": "req-test"}
+        yield {"type": "delta", "text": HANDOFF_REQUESTED}
+        yield {
+            "type": "final",
+            "state": {"decision": "human", "answer": HANDOFF_REQUESTED},
+            "elapsed_ms": 1,
+        }
+
+    app.answer_stream = _fake_stream
+    app.st.chat_input = lambda *a, **k: "转人工"
+
+    app.render_agent_view()
+
+    shown = [str(c[1][0]) for c in CALLS if c[0] == "markdown" and c[1]]
+    human_texts = [text for text in shown if "人工客服" in text]
+    assert human_texts and human_texts[-1] == HANDOFF_UNAVAILABLE
+    assert app.session.history(sid)[-1]["content"] == HANDOFF_UNAVAILABLE
+
+
 def test_a_reroute_does_not_concatenate_the_old_streamed_text(app):
     """单 worker 的 token 是真流之后，重路由必须清掉已经画出的那一轮正文。
 

@@ -256,6 +256,24 @@ def _finalize(final: dict, question: str, request_id: str, record: bool) -> dict
 # 也不知道队列，它只负责把"该转人工"这件事判出来。
 HANDOFF_REQUESTED = "好的，需要人工客服。"
 
+# 没有身份层、也拿不到会话库的消费方（CLI、Streamlit 直连）开不出工单。
+# 这时不能把上面那句直接给用户看——它像"已经转过去了"，其实什么都不会发生。
+# 换成一句明说"这里没有人工"的话：不假装、不排队、不留假工单。
+HANDOFF_UNAVAILABLE = "当前环境未开通人工客服（需要登录 Web 端后转人工）。"
+
+
+def degrade_handoff(final: dict) -> dict:
+    """
+    转人工但**没有工单**时，把占位话术换成"这里没开通"。
+
+    只认 `decision` 和 `handoff` 两个字段：真带了工单（走 API 的那条路）就
+    原样保留，消费方不必知道自己跑在哪个环境里。就地改同一个 dict——调用方
+    马上要拿它的 `answer` 去显示或落盘，返回新对象反而容易漏掉一处。
+    """
+    if final.get("decision") == "human" and not final.get("handoff"):
+        final["answer"] = HANDOFF_UNAVAILABLE
+    return final
+
 
 def _handoff_state(request_id: str) -> dict:
     """
