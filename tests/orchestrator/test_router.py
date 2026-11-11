@@ -2,7 +2,14 @@
 import pytest
 
 from ecom import demo
-from ecom.orchestrator.core.router import CONFIDENCE_FLOOR, _rule_route, parse_route, route
+from ecom.orchestrator.core.router import (
+    CONFIDENCE_FLOOR,
+    _cold_plan,
+    _rule_route,
+    parse_route,
+    route,
+)
+from ecom.orchestrator.utils.ids import ORDER_ID_RE
 from tests.orchestrator.conftest import ExplodingLLM, FakeLLM
 
 
@@ -79,13 +86,44 @@ def test_the_order_id_rule_matches_the_five_digit_ids_we_actually_have():
     assert _rule_route("52644") == ["order"]
     # 4 位不行：那多半是年份。"2025 年买的还能退吗"里没有订单号。
     assert _rule_route("2025") == []
-    # 客户号是 C 开头，不该被当成订单号（路由和抽取两层的 `(?<!\\w)` 是同一个理由）
-    assert _rule_route("客户C20755") == []
+    # 客户号是 C 开头，里面的 20755 **不能**被当成订单号（`(?<!\\w)` 挡的就是这个）。
+    # 但"客户 C20755 买了什么"确实是订单问题，由单独的客户号规则选 order——
+    # 这两件事分开断言，免得以后有人把订单号正则放宽到能吃下客户号。
+    assert ORDER_ID_RE.search("客户C20755") is None
+    assert _rule_route("客户C20755") == ["order"]
 
 
 def test_rules_stay_silent_on_small_talk():
     # 没命中就是没命中。**别硬塞一个 worker**——那是 fallback 层的事。
     assert _rule_route("你好呀") == []
+
+
+@pytest.mark.parametrize(
+    "question, expected",
+    [
+        # 客户号：没有订单号、也没有订单词，但问的就是某个客户的订单。
+        ("客户 C20755 买了什么", ["order"]),
+        # 「我要退货」是**要办**；「退货政策」是**问规定**。
+        ("我要退货", ["order"]),
+        ("退货政策是什么", ["knowledge"]),
+        # 报表 = 把数据汇总出来，不特指某一单。
+        ("帮我做个销售报表", ["analytics"]),
+        # 「发货方式」是统计维度；「发货延迟是谁的责任」问规则；
+        # 只有"这一单发没发"才是订单问题。
+        ("哪种发货方式最容易延迟", ["analytics"]),
+        ("发货延迟是谁的责任", ["knowledge"]),
+        ("发货了吗", ["order"]),
+        # 「能退吗」是「能不能退」的口语变体：既要查单也要政策。
+        ("52644 能退吗", ["order", "knowledge"]),
+    ],
+)
+def test_rules_cover_the_phrasings_that_used_to_fall_through(question, expected):
+    """规则层的**词宽窄**，不是"关键词越多越好"。
+
+    这些句子原来要么掉进 fallback、要么被别的 worker 的宽词抢走。判定方式
+    和评测一致：什么都没命中时走 `_cold_plan()`，所以这里也照它算。
+    """
+    assert set(_rule_route(question) or _cold_plan()) == set(expected)
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +209,10 @@ def test_the_rule_layer_carries_the_entity_for_a_followup():
       上文不够，`_rule_route` 也得携带实体。）
     """
     result = route("那能退吗", llm=FakeLLM("不是 JSON"), chat_history=_history_with_52644())
-    assert result["plan"] == ["order"]
+    # 「能退吗」本身也是政策问题（knowledge），所以这一轮是 order + knowledge；
+    # 断集合而不是断顺序：两个 worker 谁先跑不影响结果，规则表里谁先命中却
+    # 会随加词变化，钉死顺序只会让这条测试变成"词表快照"。
+    assert set(result["plan"]) == {"order", "knowledge"}
     assert result["source"] == "rule"
 
 

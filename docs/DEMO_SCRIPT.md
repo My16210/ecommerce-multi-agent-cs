@@ -90,8 +90,8 @@ cd D:\worksoftspace\ecom_cs
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-预期：规则 `exact 41/50（82.0%）` / `covered 42/50（84.0%）`；测试
-`872 passed, 2 skipped`，约 21 秒。
+预期：规则 `exact 49/50（98.0%）` / `covered 50/50（100.0%）`；测试
+`880 passed, 2 skipped`，约 23 秒。
 
 再补一句：真模型（qwen-plus，50 次调用）是 `46/50 = 92%`，multi 66.7%、trap 75%。
 
