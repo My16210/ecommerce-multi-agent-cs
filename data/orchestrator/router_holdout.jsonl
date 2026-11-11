@@ -1,0 +1,20 @@
+{"id": "H01", "category": "order", "question": "我那单咋还没到", "expected": ["order"], "note": "口语把订单说成「单」，规则表里只有「订单」二字"}
+{"id": "H02", "category": "order", "question": "催一下发货", "expected": ["order"], "note": "催单。发货已收窄成状态问法，催发货不在其中"}
+{"id": "H03", "category": "order", "question": "昨儿买的东西一直没动静", "expected": ["order"], "note": "「买的东西」「没动静」都不在词表，靠语义才认得出是查物流"}
+{"id": "H04", "category": "order", "question": "包裹卡在路上了", "expected": ["order"], "note": "「包裹」在词表，这条应该过"}
+{"id": "H05", "category": "order", "question": "帮我看看三号那单", "expected": ["order"], "note": "「那单」是订单的口语，词表无「单」"}
+{"id": "H06", "category": "knowledge", "question": "东西拆了还能退不", "expected": ["knowledge"], "note": "问拆封后退货政策。「还能退不」不等于「能退吗」"}
+{"id": "H07", "category": "knowledge", "question": "发票咋整", "expected": ["knowledge"], "note": "「发票」在词表，应该过"}
+{"id": "H08", "category": "knowledge", "question": "坏了找谁修", "expected": ["knowledge"], "note": "问保修，句里没有「保修」二字"}
+{"id": "H09", "category": "knowledge", "question": "你们包邮吗", "expected": ["knowledge"], "note": "运费政策，一个词都不命中，靠兜底给对"}
+{"id": "H10", "category": "knowledge", "question": "满减咋算的", "expected": ["knowledge"], "note": "优惠规则，「咋算」不等于「如何/怎么算」"}
+{"id": "H11", "category": "analytics", "question": "哪个省买的人多", "expected": ["analytics"], "note": "问地区销量，「省」不等于词表里的「地区」"}
+{"id": "H12", "category": "analytics", "question": "这个月比上个月卖得好吗", "expected": ["analytics"], "note": "问环比，「卖得好吗」不等于「卖得最好」"}
+{"id": "H13", "category": "analytics", "question": "给我出个销量榜", "expected": ["analytics"], "note": "「销量」在词表，应该过"}
+{"id": "H14", "category": "analytics", "question": "退货的人多不多", "expected": ["analytics"], "note": "问退货率，句里没有「退货率」三字"}
+{"id": "H15", "category": "multi", "question": "我那单到哪了，顺便说说拆封了还能不能退", "expected": ["order", "knowledge"], "note": "「到哪」给 order，「能不能退」给 knowledge，两处都该过"}
+{"id": "H16", "category": "multi", "question": "查下订单 52644，再给我看看这月卖了多少", "expected": ["order", "analytics"], "note": "「订单」给 order，「卖了多少」不等于「销售额」"}
+{"id": "H17", "category": "multi", "question": "发票咋开，还有我那个件儿到哪了", "expected": ["order", "knowledge"], "note": "「发票」给 knowledge，「到哪」给 order"}
+{"id": "H18", "category": "followup", "question": "那这单还能退不", "expected": ["order", "knowledge"], "history": [{"role": "user", "content": "订单 52644 到哪了"}, {"role": "assistant", "content": "已签收。"}], "note": "指代上一轮的订单；「还能退不」不命中政策词"}
+{"id": "H19", "category": "followup", "question": "这单的钱啥时候能回来", "expected": ["order"], "history": [{"role": "user", "content": "订单 52644 到哪了"}, {"role": "assistant", "content": "已签收。"}], "note": "问退款进度，靠 carried_order_id 补 order"}
+{"id": "H20", "category": "trap", "question": "发票号 20250901 查不到，怎么回事", "expected": ["knowledge"], "note": "发票号不是订单号，与 R041 同类"}

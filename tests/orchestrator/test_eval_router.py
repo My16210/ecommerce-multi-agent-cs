@@ -1,7 +1,10 @@
 """路由评测的测试：指标算得对、题集完整、CLI 能跑。"""
 import json
+from pathlib import Path
 
 from ecom.orchestrator.cli import eval_router
+
+HOLDOUT = Path(eval_router.DEFAULT_DATASET).with_name("router_holdout.jsonl")
 
 
 def _case(case_id, question, expected, category="order"):
@@ -21,6 +24,24 @@ def test_dataset_has_unique_ids_and_known_workers():
     assert len({case["id"] for case in cases}) == len(cases)
     assert all(case["expected"] for case in cases)
     assert all(case["category"] for case in cases)
+
+
+def test_holdout_dataset_is_frozen_and_not_scored():
+    """holdout 只验格式，**不在这里断言分数**。
+
+    holdout 的用途是"改完规则之后看有没有掉"，不是"照着它调词"。一旦把
+    50% 写成断言，下一个人就会为了让它变绿而加关键词，护栏就没了。
+    要看分数时手动跑：
+        python -m ecom.orchestrator.cli.eval_router \\
+            --dataset data/orchestrator/router_holdout.jsonl
+    """
+    assert HOLDOUT.exists(), f"holdout 集不在：{HOLDOUT}"
+    cases = eval_router.load_cases(HOLDOUT)
+    assert len(cases) == 20
+    assert len({case["id"] for case in cases}) == len(cases)
+    # 两套题不重题：重了就等于把 holdout 掺进训练集。
+    train_ids = {case["id"] for case in eval_router.load_cases()}
+    assert {case["id"] for case in cases}.isdisjoint(train_ids)
 
 
 def test_metrics_count_exact_covered_and_per_worker():

@@ -87,15 +87,19 @@ cd D:\worksoftspace\ecom_cs
 
 ```powershell
 .\.venv\Scripts\python.exe -m ecom.orchestrator.cli.eval_router --show-errors
+.\.venv\Scripts\python.exe -m ecom.orchestrator.cli.eval_router --dataset data/orchestrator/router_holdout.jsonl
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-预期：规则 `exact 49/50（98.0%）` / `covered 50/50（100.0%）`；测试
-`880 passed, 2 skipped`，约 23 秒。
+预期：训练集规则 `exact 49/50（98.0%）` / `covered 50/50（100.0%）`；**holdout
+`10/20（50.0%）` / `11/20（55.0%）`**；测试 `881 passed, 2 skipped`，约 23 秒。
 
-再补一句：真模型（qwen-plus，50 次调用）是 `46/50 = 92%`，multi 66.7%、trap 75%。
+再补一句：真模型（qwen-plus）训练集 `46/50 = 92%`；**holdout 上 `19/20 = 95%`，
+唯一错题是发票号被当订单号**。
 
-说：路由有分数、有错题分类；测试不联网，2 条 skip 只差真 Milvus。
+说：**98% 是 in-sample，不能当泛化准确率讲。** holdout 不参与调词，只用来验收；
+改规则后两个集都要跑，任何一个掉了都算回归。规则层的定位是"LLM 挂了不至于全瘫"，
+所以 50% 不算翻车；真正的主力是模型层。测试不联网，2 条 skip 只差真 Milvus。
 
 ### ⑥ 可选：API / React（被问到再开）
 

@@ -100,7 +100,8 @@ ecom_cs/                         仓库根 = 唯一的 import 根，也是唯一
 │   │   ├── source/              下载来的原始数据（96MB，**不进仓库**，见 .gitignore）
 │   │   └── output/              跑出来的图（不进仓库）
 │   ├── orchestrator/seed/       订单库种子 orders.csv / logistics.csv（派生物，**进仓库**）
-│   │                            router_eval.jsonl（路由评测题集，50 题）
+│   │                            router_eval.jsonl（路由训练集，50 题）
+│   │                            router_holdout.jsonl（路由 holdout，20 题，只验收不调词）
 │   └── orders.sqlite            订单库运行时文件（不进仓库，由 seed 重建）
 │                                会话库在 data/orchestrator/sessions.db（含转人工工单，不进仓库）
 │                                身份库在 data/orchestrator/auth.db（token 哈希 + 审计）
@@ -1006,43 +1007,66 @@ uv run python -m ecom.orchestrator.cli.session purge --days 30
 
 ## 路由评测
 
-路由以前只有"真跑那次看起来对"，没有可复跑的分数。现在有一份 50 题的人工标注集
-（`data/orchestrator/router_eval.jsonl`）和一个离线评测 CLI：
+路由以前只有"真跑那次看起来对"，没有可复跑的分数。现在有两份人工标注集
+（训练集 `data/orchestrator/router_eval.jsonl` 50 题、holdout
+`data/orchestrator/router_holdout.jsonl` 20 题）和一个离线评测 CLI：
 
 ```bash
-uv run python -m ecom.orchestrator.cli.eval_router                 # 规则基线，不联网
+uv run python -m ecom.orchestrator.cli.eval_router                 # 训练集规则基线，不联网
 uv run python -m ecom.orchestrator.cli.eval_router --show-errors   # 列出错题
 uv run python -m ecom.orchestrator.cli.eval_router --llm --limit 20  # 真模型（花钱）
+uv run python -m ecom.orchestrator.cli.eval_router \
+    --dataset data/orchestrator/router_holdout.jsonl               # holdout 验收
 ```
 
-规则基线（2026-11-11，50 题，离线）：
+规则基线 —— 训练集（2026-11-11，50 题，离线）：
 
 ```
 exact   49/50（98.0%）　covered 50/50（100.0%）
 多带 1 次　漏调 0 次
 ```
 
-真模型基线（2026-10-30，qwen-plus，50 题 = 50 次路由调用，会花钱）：
+holdout 基线（2026-11-11，20 题，规则冻结后只跑验收）：
+
+```
+exact   10/20（50.0%）　covered 11/20（55.0%）
+多带 8 次　漏调 9 次
+```
+
+**98% 是 in-sample 数字，不是泛化准确率。** 那 50 题就是调规则时逐题看过的；
+「改题让分数变好是自欺」只挡住了改题，没挡住照着错题加词。20 题 holdout 是另一批
+口语化问法（「我那单咋还没到」「哪个省买的人多」），规则层只覆盖一半——这是它
+真实的水平，也符合它的定位：**"LLM 挂了也不至于全瘫"，不是替代 LLM。**
+规矩：**holdout 集不参与调词，只用于验收。改规则后两个集都要跑，任何一个掉了
+都算回归。**
+
+真模型基线（2026-10-30，qwen-plus，训练集 50 题 = 50 次路由调用，会花钱）：
 
 ```
 exact   46/50（92.0%）　covered 46/50（92.0%）
 按类别：multi 66.7%（6/9）、trap 75.0%（3/4），其余 100%
 ```
 
+同一模型在 20 题 holdout 上（2026-11-11，20 次调用）：**exact 19/20（95.0%）**，
+唯一错题是 H20「发票号 20250901 查不到，怎么回事」——和规则层栽在同一个坑里。
+这条比 50 题上的 92% 更接近"模型没见过这批题"的数字；92% 同样是 in-sample。
+
 `exact` 是计划集合完全相等；`covered` 是"期望的 worker 全被调到了"（多带不算错）。
-规则层现在只剩 1 条错题：8 位发票号被当成订单号（「发票号 20250901 对应的订单」
-会多带一个 `order`）。口径是"宁可多问一次"——order worker 查不到会说"查不到
+规则层在训练集上只剩 1 条错题：8 位发票号被当成订单号（「发票号 20250901 对应的
+订单」会多带一个 `order`）。口径是"宁可多问一次"——order worker 查不到会说"查不到
 订单号 XXX"，而不是编一个答案；要做上下文否定就得同时压掉句尾的「订单」，
-代价是真实订单查询也可能被误伤，权衡后没做。模型的 4 条错题是另一种：3 条
+代价是真实订单查询也可能被误伤，权衡后没做。模型在训练集的 4 条错题是另一种：3 条
 多意图只返回了 `order`（漏了知识库），1 条把发票号当订单号。**这些是两层的
-边界，不是 bug 清单**——改题让分数变好不算修好。
+边界，不是 bug 清单**——改题让分数变好不算修好。holdout 的错题则多半是规则层
+没命中任何关键词、落到 `_cold_plan()` 的 `knowledge` 默认值——不是词表"准"，
+是第三层在兜底；发票号那条两层都错，见上面的 H20。
 
 ---
 
 ## 测试
 
 ```bash
-uv run pytest        # 882 条（--all-extras 实测：880 passed / 2 skipped；条数以当次输出为准）
+uv run pytest        # 883 条（--all-extras 实测：881 passed / 2 skipped；条数以当次输出为准）
 uv run ruff check .
 ```
 
@@ -1113,7 +1137,7 @@ CI 现在有两个 job：`lint-and-test`（ruff + pytest）和 `frontend`（`npm
 | ✅ | **真实 Streamlit 运行时** | 真跑：`streamlit.testing.v1.AppTest` 把两个入口跑完，6 条全绿。**这补上了原来那一栏 ❌** |
 | ✅ | **合并后的 `API`（FastAPI）真起服务** | 容器内真起 uvicorn：`/health` 200（含 workers + order_db）、`/openapi.json` 元数据齐、空问题 422、`/trace/不存在` 404、真提问 200（257+29 token / 1.2s）。**这一条走了网络、花了 token**，不属于"测试不联网"那一栏 |
 | ✅ | **Milvus 那条代码路径** | 真跑：连宿主常驻的 v2.5.5，`ecom_verify_<随机>` 临时集合走完 add / count / search / delete / drop，**零残留**（另有一条专门查残留）。⚠️ 见下面的版本错位 |
-| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 13 条、登录历史又加了 9 条、**转人工工单又加了 39 条**、**生产 fail-closed / 工单权限 / 登出与代理限流又加了 14 条**、**账号配额与登出本地清理又加了 5 条**、**全站日预算 / 断流记账 / CSP 与登出提示又加了 5 条**、**演示闸前置 / 断流记账接线 / 用户名枚举与旧会话 / 工单认领竞态 / 账本 WAL / 审计保留 / Caddy 体积上限又加了 13 条**、**人工接手后机器人静默 / 客服台轮询 / 后台客服工作台又加了 9 条**、**人工静默绕过 token 预算 / 客服回复顺序 / 后台查看审计与转义又加了 6 条**、**CLI / Streamlit 转人工降级提示又加了 4 条**、**规则层路由补词宽窄又加了 8 条**，现在宿主 `.venv`（`--all-extras`）上是 **882 条 / 880 passed / 2 skipped**，`ruff` 干净（这批的 GitHub CI 还没跑过；workflow 里已经加了前端构建 job） |
+| ✅ | 测试与静态检查 | 那一轮是 520 条，容器里 **518 passed / 0 failed / 2 skipped**（原来那 2 条红灯都是真缺陷，已修，见「测试」一节），CI 上是 517 passed / 3 skipped。**后来会话内长期记忆又加了 35 条、图片输入又加了 40 条、流式输出又加了 12 条、L1 演示防线又加了 32 条、沙箱文件 I/O 加固又加了 15 条、MCP 工具层又加了 51 条、React 前端又加了 13 条、登录历史又加了 9 条、**转人工工单又加了 39 条**、**生产 fail-closed / 工单权限 / 登出与代理限流又加了 14 条**、**账号配额与登出本地清理又加了 5 条**、**全站日预算 / 断流记账 / CSP 与登出提示又加了 5 条**、**演示闸前置 / 断流记账接线 / 用户名枚举与旧会话 / 工单认领竞态 / 账本 WAL / 审计保留 / Caddy 体积上限又加了 13 条**、**人工接手后机器人静默 / 客服台轮询 / 后台客服工作台又加了 9 条**、**人工静默绕过 token 预算 / 客服回复顺序 / 后台查看审计与转义又加了 6 条**、**CLI / Streamlit 转人工降级提示又加了 4 条**、**规则层路由补词宽窄与 holdout 格式测试又加了 9 条**，现在宿主 `.venv`（`--all-extras`）上是 **883 条 / 881 passed / 2 skipped**，`ruff` 干净（这批的 GitHub CI 还没跑过；workflow 里已经加了前端构建 job） |
 | ✅ | **L1 只读 / 邀请码 / 预算闸门** | 真跑：32 条测试覆盖 fail closed 的邀请码、每客户端限流、跨重连的 token 账本、损坏账本拒绝花钱、路由不选 analytics、退货在落库前被挡、API 429 与 trace 404、界面门禁与建议语。**只验证了代码层**；下面那栏是部署文件 |
 | ✅ | **公网演示编排能解析** | 真跑：`docker compose --env-file .env.prod -f docker-compose.prod.yml config --quiet` 退出 0（临时 `.env.prod` 校验后已删）；Caddyfile 用 `caddy:2.10-alpine caddy validate` 通过（健康检查那条 `context canceled` 是校验时没有 app 容器，属预期）。**没有真部署**：没有域名和公网服务器，HTTPS 证书签发、Caddy→app 转发、公网可达都**没验过** |
 | ✅ | **CI 本身真跑绿了** | 真跑：[run #38132662970](https://github.com/My16210/ecommerce-multi-agent-cs/actions/runs/38132662970)（2026-10-11）——`ruff: All checks passed!`，`pytest: 517 passed, 3 skipped, 15.06s`，和本机干净 checkout 预演的数字一致。**这一栏原来是 ❌**：工作流写过、命令本地验过，但没推上去就一次都没真跑过。<br>真跑还多抓到两处**本地永远看不出来**的东西：① `python-version-file` 这个输入名**不存在**，setup-uv 只打一条 warning 就忽略它，workflow 照样绿、看着像钉住了版本；② `astral-sh/setup-uv` **没有 `v10` 这个大版本 tag**（它的可移动大版本 tag 只发到 v7），钉 `@v10` 会让 job 在 "Set up job" 阶段就红，得钉精确的 `@v10.3.0`。两处都改成实测过的写法 |
