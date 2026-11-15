@@ -50,7 +50,7 @@ WEB_SEARCH_TIMEOUT = float(os.getenv("WEB_SEARCH_TIMEOUT", "8"))
 CHUNK_SIZE = 512
 CHUNK_OVERLAP = 50
 TOP_K = 5
-RERANK_TOP_K = 3
+RERANK_TOP_K = 2   # Day 2 实测：3 -> 2，policy 5 题成本 -19.5%、输入 token -29.3%，准确率 5/5 不掉
 WEB_SEARCH_MAX_RESULTS = 5
 EMBED_BATCH_SIZE = 32          # 硅基流动单次 embedding 的批大小
 
