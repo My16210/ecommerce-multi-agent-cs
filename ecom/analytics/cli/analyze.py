@@ -72,6 +72,7 @@ def main() -> int:
         # 延迟 import：让上面的参数校验能在依赖缺失时也给出可读的 JSON 错误
         from ecom.analytics.core.graph import build_graph
         from ecom.analytics.core.state import make_initial_state
+        from ecom.analytics.settings import settings as analytics_settings
 
         with contextlib.redirect_stdout(sys.stderr):
             app = build_graph()
@@ -94,6 +95,25 @@ def main() -> int:
                 + int(result.get("qwen_prompt_tokens", 0)),
                 "out": int(result.get("deepseek_completion_tokens", 0))
                 + int(result.get("qwen_completion_tokens", 0)),
+            },
+            # **按 provider 拆开**，不要只给合计：analyst / report_writer /
+            # self_corrector 走 DeepSeek，reviewer 走 Qwen，两家单价差 2.4–4 倍。
+            # 合计在这里一丢，上层就只能填一个"大概"的模型名，成本会错得看不出来。
+            "token_detail": {
+                "deepseek": {
+                    "in": int(result.get("deepseek_prompt_tokens", 0) or 0),
+                    "out": int(result.get("deepseek_completion_tokens", 0) or 0),
+                },
+                "qwen": {
+                    "in": int(result.get("qwen_prompt_tokens", 0) or 0),
+                    "out": int(result.get("qwen_completion_tokens", 0) or 0),
+                },
+            },
+            # 实际配置给这两个客户端的模型名。读配置而不是写死：
+            # 换 DEEPSEEK_MODEL / QWEN_MODEL 时，记录要跟着变。
+            "models": {
+                "deepseek": (analytics_settings.LLM_CONFIGS.get("deepseek") or {}).get("model"),
+                "qwen": (analytics_settings.LLM_CONFIGS.get("qwen") or {}).get("model"),
             },
         }
     except Exception as exc:  # noqa: BLE001 —— 子进程边界上，任何异常都要变成一行 JSON

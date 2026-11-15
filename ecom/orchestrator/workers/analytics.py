@@ -50,6 +50,57 @@ def _command(question: str) -> list:
     return [sys.executable, "-m", ENTRY_MODULE, question]
 
 
+def _calls_from_payload(payload: dict) -> list:
+    """把子进程的用量拆成**按 provider** 的 call 记录。
+
+    子进程里 analyst / report_writer / self_corrector 走 DeepSeek，reviewer
+    走 Qwen，两家单价差 2.4–4 倍。只给合计再填一个模型名，成本会错得看不出来。
+    所以优先用 payload["token_detail"] 拆开记；只有旧的 payload / 测试替身
+    没有这个字段时，才退回单条、model 留 None（不拿配置猜一个名字）。
+    """
+    detail = payload.get("token_detail")
+    models = payload.get("models") or {}
+    calls = []
+    if isinstance(detail, dict) and detail:
+        elapsed = int(payload.get("elapsed_ms") or 0)
+        for provider in ("deepseek", "qwen"):
+            part = detail.get(provider) or {}
+            tokens_in = int(part.get("in", 0) or 0)
+            tokens_out = int(part.get("out", 0) or 0)
+            if not (tokens_in or tokens_out):
+                # 这次没发生该 provider 的调用。造一条 0 token 的 call 只会
+                # 多一条"未知"，把真正的缺口稀释掉。
+                continue
+            calls.append({
+                "node": "analytics",
+                "kind": "generate",
+                "model": models.get(provider),
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                # 子进程只报总耗时。记在第一条上，避免两条相加时翻倍。
+                "latency_ms": elapsed if not calls else 0,
+                "source": "llm",
+                "usage_given": True,
+            })
+        if calls:
+            return calls
+
+    tokens = payload.get("tokens") or {"in": 0, "out": 0}
+    tokens_in = int(tokens.get("in", 0) or 0)
+    tokens_out = int(tokens.get("out", 0) or 0)
+    used = bool(tokens_in or tokens_out)
+    return [{
+        "node": "analytics",
+        "kind": "generate",
+        "model": None,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "latency_ms": int(payload.get("elapsed_ms") or 0),
+        "source": "llm" if used else "unknown",
+        "usage_given": used,
+    }]
+
+
 def run_analytics(question: str, chat_history: list = None) -> dict:
     root = ROOT
     # 子进程自己的超时设得比 supervisor 那层**略短**：让它先触发，
@@ -99,22 +150,9 @@ def run_analytics(question: str, chat_history: list = None) -> dict:
     tokens = payload.get("tokens") or {"in": 0, "out": 0}
     tokens_in = int(tokens.get("in", 0) or 0)
     tokens_out = int(tokens.get("out", 0) or 0)
-    # 子进程内部可能调了多次模型（生成 → 报错 → 改 → 再执行），但它的协议只把
-    # **汇总用量**交出来。这一层只记一条 call，不假装知道内部每一步。
-    # model 留 None 是**真的拿不到**：payload 里没有模型名，不从配置硬编一个顶上，
-    # 否则成本表会拿一个可能不对的名字去查单价。source 由用量是否非零推断——
-    # 零用量分不清"没调模型"和"没记上"，所以记 unknown。
-    used = bool(tokens_in or tokens_out)
-    calls = [{
-        "node": "analytics",
-        "kind": "generate",
-        "model": None,
-        "tokens_in": tokens_in,
-        "tokens_out": tokens_out,
-        "latency_ms": int(payload.get("elapsed_ms") or 0),
-        "source": "llm" if used else "unknown",
-        "usage_given": used,
-    }]
+    # 子进程内部调了多次模型，但只把汇总用量和**按 provider 的明细**交出来。
+    # 按明细记成两条 call（deepseek / qwen），不假装知道内部每一步的顺序。
+    calls = _calls_from_payload(payload)
 
     return {
         "answer": report,
