@@ -46,6 +46,10 @@ data/knowledge/source/
 
 logs/
 
+# 答案评测的运行结果（每跑一次一个 JSONL，含答案全文）。是产物不是资产：
+# 需要复现就重跑 `eval_answers.py`；随机时间戳的文件不该进仓库。
+data/orchestrator/answer_eval_runs/
+
 # Milvus 的 Docker 数据卷（docker-compose.milvus.yml 会建 volumes/{etcd,minio,milvus}）
 volumes/
 

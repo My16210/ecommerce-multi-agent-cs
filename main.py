@@ -196,6 +196,7 @@ def run_question(question: str, chat_history: list, verbose: bool, as_json: bool
                     "decision": final.get("decision"),
                     "plan": final.get("plan"),
                     "tokens": final.get("tokens"),
+                    "cost": final.get("cost"),
                     "elapsed_ms": elapsed_ms,
                 },
                 ensure_ascii=False,
