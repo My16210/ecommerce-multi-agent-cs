@@ -50,6 +50,9 @@ logs/
 # 需要复现就重跑 `eval_answers.py`；随机时间戳的文件不该进仓库。
 data/orchestrator/answer_eval_runs/
 
+# open_deep_research 接入实验的运行记录（含报告正文），是产物不是资产。
+data/orchestrator/ods_runs/
+
 # Milvus 的 Docker 数据卷（docker-compose.milvus.yml 会建 volumes/{etcd,minio,milvus}）
 volumes/
 
