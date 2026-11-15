@@ -57,6 +57,13 @@ def summarize_workers(results: list) -> dict:
         slot["ms"] += int(r.get("elapsed_ms", 0) or 0)
         if not r.get("ok") and r.get("error"):
             slot["errors"].append(str(r["error"])[:200])
+        # worker 自报的诊断字段（目前是 analytics 的 retry_count / review_round）。
+        # 只有真的带了这个键才写：区分「0 次」和「这个 worker 没有这个概念」。
+        data = r.get("data")
+        if isinstance(data, dict):
+            for key in ("retry_count", "review_round"):
+                if key in data:
+                    slot[key] = data[key]
         records = r.get("calls") or []
         if records:
             slot.setdefault("call_records", []).extend(records)

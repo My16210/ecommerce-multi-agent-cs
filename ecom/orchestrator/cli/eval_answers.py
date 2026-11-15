@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 from ecom.orchestrator.utils.pricing import fmt_cost
+from ecom.orchestrator.utils.trace import LOGS_DIR
 
 ROOT = Path(__file__).resolve().parents[3]
 DATASET = ROOT / "data" / "orchestrator" / "answer_eval.jsonl"
@@ -94,6 +95,30 @@ def run_one(question: str) -> dict:
     return parsed
 
 
+def trace_diagnostics(request_id: str, path: Path | None = None) -> dict:
+    """按 request_id 从 trace 里取 analytics 的自报诊断字段。
+
+    `main.py --json` 是结果契约，不该为了评测塞 worker 私有字段；trace 本来
+    就是放这种可观测信息的地方。找不到就返回空 dict（评测照常跑，字段记 0）。
+    """
+    if not request_id:
+        return {}
+    log = path or (LOGS_DIR / "requests.jsonl")
+    try:
+        lines = log.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if entry.get("request_id") != request_id:
+            continue
+        return dict((entry.get("workers") or {}).get("analytics") or {})
+    return {}
+
+
 def cost_text(cost) -> str:
     """成本的人类可读格式：已知部分 + 未知条数，未知绝不省略。"""
     if not isinstance(cost, dict):
@@ -138,6 +163,9 @@ def main() -> None:
         answer = str(result.get("answer") or "")
         ok = judge(answer, item)
         passed += 1 if ok else 0
+        diag = trace_diagnostics(result.get("request_id", ""))
+        retry_count = int(diag.get("retry_count", 0) or 0)
+        review_round = int(diag.get("review_round", 0) or 0)
         rows.append({
             "id": item["id"],
             "category": item.get("category", ""),
@@ -148,9 +176,14 @@ def main() -> None:
             "cost": result.get("cost"),
             "request_id": result.get("request_id", ""),
             "elapsed_ms": result.get("elapsed_ms", 0),
+            "retry_count": retry_count,
+            "review_round": review_round,
             "error": result.get("error", ""),
         })
-        print(f"[{'PASS' if ok else 'FAIL'}] {item['id']} {item['q']}  成本 {cost_text(result.get('cost'))}")
+        print(
+            f"[{'PASS' if ok else 'FAIL'}] {item['id']} {item['q']}  "
+            f"成本 {cost_text(result.get('cost'))}  重试 {retry_count}  审查 {review_round} 轮"
+        )
         if not ok:
             need = item.get("must_include") or []
             any_keys = item.get("must_include_any") or []

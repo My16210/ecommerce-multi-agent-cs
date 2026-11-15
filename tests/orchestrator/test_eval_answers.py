@@ -5,6 +5,7 @@ from ecom.orchestrator.cli.eval_answers import (
     cost_text,
     judge,
     parse_result,
+    trace_diagnostics,
     write_run,
 )
 
@@ -51,6 +52,20 @@ def test_write_run_persists_every_answer(tmp_path):
 
     lines = path.read_text(encoding="utf-8").splitlines()
     assert [json.loads(line) for line in lines] == rows
+
+
+def test_trace_diagnostics_picks_the_matching_request(tmp_path):
+    log = tmp_path / "requests.jsonl"
+    log.write_text(
+        '{"request_id": "old", "workers": {"analytics": {"retry_count": 2}}}\n'
+        "not json\n"
+        '{"request_id": "new", "workers": {"analytics": {"retry_count": 1, "review_round": 2}}}\n',
+        encoding="utf-8",
+    )
+
+    assert trace_diagnostics("new", log) == {"retry_count": 1, "review_round": 2}
+    assert trace_diagnostics("missing", log) == {}
+    assert trace_diagnostics("", log) == {}
 
 
 def test_cost_text_never_hides_unknown_calls():

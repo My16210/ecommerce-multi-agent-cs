@@ -86,6 +86,10 @@ def main() -> int:
             # 审查有没有真的通过，要如实带出去——报告里可能已标注了风险。
             # 三态，见 review_outcome：None 表示本次按设计没审查。
             "review_passed": review_outcome(result),
+            # 诊断字段：用来分清"这道题贵"是任务复杂，还是执行报错后重写了一遍。
+            # retry_count 只数执行报错的重写；review_round 是 reviewer 跑过几轮。
+            "retry_count": int(result.get("retry_count", 0) or 0),
+            "review_round": int(result.get("review_round", 0) or 0),
             # 数据来源标签也要带出去：上层 worker 把它写进回答的 sources。
             # 原先 worker 那边写死的是「sales.csv（模拟销售数据）」，换数据集之后
             # 那句话就成了假的，而且不报错——回答底下挂着一个不对的来源。

@@ -400,6 +400,18 @@ def test_summarize_workers_aggregates_per_worker():
     assert summary["knowledge"]["calls"] == 1
 
 
+def test_summarize_workers_carries_analytics_diagnostics():
+    from ecom.orchestrator.workers.base import ok_result
+
+    result = ok_result("analytics")
+    result["data"] = {"retry_count": 1, "review_round": 2}
+
+    summary = summarize_workers([result])
+
+    assert summary["analytics"]["retry_count"] == 1
+    assert summary["analytics"]["review_round"] == 2
+
+
 # ---------------------------------------------------------------------------
 # 明确要求人工：短路，不建图、不调模型
 # ---------------------------------------------------------------------------

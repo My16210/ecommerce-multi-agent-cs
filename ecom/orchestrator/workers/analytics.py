@@ -167,6 +167,9 @@ def run_analytics(question: str, chat_history: list = None) -> dict:
             "chart_path": chart_path,
             "chart_generated": bool(payload.get("chart_generated")),
             "review_passed": payload.get("review_passed"),
+            # 诊断：成本差异到底来自任务复杂度还是重写，靠这两个数分开。
+            "retry_count": int(payload.get("retry_count", 0) or 0),
+            "review_round": int(payload.get("review_round", 0) or 0),
         },
     }
 
