@@ -20,12 +20,11 @@ def test_resolve_model_maps_provider_names_to_price_buckets():
 
 
 def test_cost_of_normalizes_the_model_name_before_lookup():
-    # qwen 单价故意留 None（未核实），两个名字都必须落到「未知」，而不是
-    # 一个未知、一个查不到 key——后者看起来也像未知，但其实是两条不同的错。
+    # 两家现在都有价。不归一时 "qwen-plus"/"deepseek-chat" 会查不到 key，
+    # 看起来也像「未知」，但那是归一 bug，不是「没填价」。
     assert cost_of("qwen-plus", 100, 50) == cost_of("qwen", 100, 50)
-    assert cost_of("qwen-plus", 100, 50) is None
+    assert cost_of("qwen-plus", 100, 50) is not None
 
-    # deepseek 有价，这条才真正证明归一发生过：不归一会查不到 "deepseek-chat"。
     assert cost_of("deepseek-chat", 100, 50) == cost_of("deepseek", 100, 50)
     assert cost_of("deepseek-chat", 100, 50) is not None
 
