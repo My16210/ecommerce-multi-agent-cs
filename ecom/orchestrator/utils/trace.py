@@ -41,7 +41,13 @@ def record(entry: dict) -> str:
 
 
 def summarize_workers(results: list) -> dict:
-    """把 worker 结果列表压成一行能看懂的统计，写进 trace。"""
+    """把 worker 结果列表压成一行能看懂的统计，写进 trace。
+
+    `calls` 仍然是**这个 worker 跑了几次**（多轮 / 重试会累加），语义没变。
+    每次 worker 内部的模型调用记录放在 `call_records` 里；**只有真的产生过
+    记录才加这个键**——没有调用就不出现，不是空数组。这样既不用改旧口径，
+    又能区分「没调用」和「调用了但没记上」。
+    """
     per_worker = {}
     for r in results:
         name = r.get("worker", "?")
@@ -51,4 +57,23 @@ def summarize_workers(results: list) -> dict:
         slot["ms"] += int(r.get("elapsed_ms", 0) or 0)
         if not r.get("ok") and r.get("error"):
             slot["errors"].append(str(r["error"])[:200])
+        records = r.get("calls") or []
+        if records:
+            slot.setdefault("call_records", []).extend(records)
     return per_worker
+
+
+def collect_calls(results: list, state: dict = None) -> list:
+    """把 router / 所有 worker / aggregate 的调用记录摊成一条扁平数组。
+
+    顺序就是实际发生的顺序：先路由（可能多次 attempt / 多轮），再各 worker
+    （results 本身按写入顺序跨轮累积），最后汇总。`results` 里的记录已经
+    包含失败路径的 unknown 记录，所以这张表是完整的——不会因为某个 worker
+    挂了就把那一次调用从成本里抹掉。
+    """
+    state = state or {}
+    calls = list(state.get("router_calls") or [])
+    for result in results or []:
+        calls.extend(result.get("calls") or [])
+    calls.extend(state.get("synth_calls") or [])
+    return calls

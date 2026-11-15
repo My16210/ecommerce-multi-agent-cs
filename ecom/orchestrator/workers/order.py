@@ -42,6 +42,7 @@
 `intent["order_id_source"]` ∈ {"question", "context", "image", ""} 就是为这道闸留的。
 """
 import re
+import time
 
 from ecom import demo
 from ecom.orchestrator.db.seed import seed
@@ -65,7 +66,12 @@ from ecom.orchestrator.utils.image_intent import (
 from ecom.orchestrator.utils.json_utils import loads_or_none
 from ecom.orchestrator.utils.llm import get_llm
 from ecom.orchestrator.utils.logger import setup_logger
-from ecom.orchestrator.utils.tokens import EMPTY, usage_of
+from ecom.orchestrator.utils.tokens import (
+    EMPTY,
+    model_name_of,
+    usage_given,
+    usage_of,
+)
 
 logger = setup_logger(__name__)
 
@@ -150,13 +156,46 @@ def policy_question(question: str) -> bool:
     return bool(POLICY_HINT.search(question)) and not _first_person_demand(question)
 
 
+def _rule_call() -> dict:
+    """规则路径的记录：没调模型，是**真的 0 成本**，不是"没记上"。"""
+    return {
+        "node": "order",
+        "kind": "extract",
+        "model": None,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "latency_ms": 0,
+        "source": "rule",
+        "usage_given": False,
+    }
+
+
+def _llm_call(llm, elapsed_s: float, response) -> dict:
+    tokens = usage_of(response)
+    return {
+        "node": "order",
+        "kind": "extract",
+        "model": model_name_of(llm),
+        "tokens_in": tokens["in"],
+        "tokens_out": tokens["out"],
+        "latency_ms": int(elapsed_s * 1000),
+        "source": "llm",
+        "usage_given": usage_given(response),
+    }
+
+
 def _llm_extract(question: str, llm) -> dict:
     """LLM 兜底提取。解析不出来返回 action=None（调用方据此判定 insufficient）。"""
+    started = time.perf_counter()
     response = llm.invoke([("system", "你是订单意图抽取器，只输出 JSON。"),
                            ("human", _LLM_PROMPT.format(question=question))])
+    calls = [_llm_call(llm, time.perf_counter() - started, response)]
     parsed = loads_or_none(response.content)
     if not isinstance(parsed, dict):
-        return {"action": None, "order_id": "", "reason": "", "tokens": usage_of(response)}
+        return {
+            "action": None, "order_id": "", "reason": "",
+            "tokens": usage_of(response), "calls": calls,
+        }
 
     action = str(parsed.get("action") or "").strip().lower()
     if action not in ACTIONS:
@@ -169,6 +208,7 @@ def _llm_extract(question: str, llm) -> dict:
         "order_id": order_id,
         "reason": str(parsed.get("reason_text") or parsed.get("reason") or "").strip()[:200],
         "tokens": usage_of(response),
+        "calls": calls,
     }
 
 
@@ -216,19 +256,26 @@ def extract_intent(question: str, llm=None, chat_history: list = None) -> dict:
     rule = _apply_carry(_rule_extract(visible_for_extraction), carried, image_id)
     needs_id = rule["action"] in {"tracking", "status", "create_return"}
     if rule["action"] and (not needs_id or rule["order_id"]):
-        return {**rule, "source": "rule", "tokens": dict(EMPTY)}
+        return {**rule, "source": "rule", "tokens": dict(EMPTY), "calls": [_rule_call()]}
 
     try:
         llm = llm or get_llm(0)
         llm_result = _llm_extract(visible_for_extraction, llm)
     except Exception as exc:  # noqa: BLE001 —— LLM 挂了不该拖垮规则能处理的那些
         logger.warning("LLM 意图提取不可用，退回规则结果：%s", exc)
-        return {**rule, "source": "rule", "tokens": dict(EMPTY)}
+        return {**rule, "source": "rule", "tokens": dict(EMPTY), "calls": [_rule_call()]}
 
     # LLM 若给出更完整的结论就用它；否则保留规则结果
     if llm_result["action"]:
         return {**_apply_carry(llm_result, carried, image_id), "source": "llm"}
-    return {**rule, "source": "rule", "tokens": llm_result.get("tokens", dict(EMPTY))}
+    # 结论退回规则，但模型这一次**确实调过**——calls 记的是真实调用，
+    # 不是"最后谁拍的板"。所以这里带 llm 的 calls，而不是一条 rule。
+    return {
+        **rule,
+        "source": "rule",
+        "tokens": llm_result.get("tokens", dict(EMPTY)),
+        "calls": llm_result.get("calls") or [_rule_call()],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +380,7 @@ def _ask_before_writing(order_id: str, intent: dict, tokens: dict) -> dict:
         "insufficient": True,
         "data": {"intent": intent, "needs_confirmation": True},
         "tokens": tokens,
+        "calls": list(intent.get("calls") or []),
     }
 
 
@@ -351,6 +399,7 @@ def _foreign_order(action: str, intent: dict, tokens: dict) -> dict:
         "insufficient": False,
         "data": {"action": action, "intent": intent, "denied": "not_owner"},
         "tokens": tokens,
+        "calls": list(intent.get("calls") or []),
     }
 
 
@@ -366,6 +415,7 @@ def run_order(question: str, chat_history: list = None, customer_id: str = "") -
     intent = extract_intent(question, chat_history=chat_history)
     action, order_id = intent["action"], intent["order_id"]
     tokens = intent.get("tokens") or dict(EMPTY)
+    calls = intent.get("calls") or []
     # 这个号是不是"猜来的"或"从图片里认的"。下面那道闸的开关。
     # 两者都不是用户在当前消息里打的，所以都只能读、不能写。
     guessed = intent.get("order_id_source") in {"context", "image"}
@@ -383,6 +433,7 @@ def run_order(question: str, chat_history: list = None, customer_id: str = "") -
                 "insufficient": True,
                 "data": {"intent": intent, "demo_readonly": True},
                 "tokens": tokens,
+                "calls": calls,
             }
         return {
             "answer": "这是只读演示环境，不能提交退货申请。"
@@ -390,6 +441,7 @@ def run_order(question: str, chat_history: list = None, customer_id: str = "") -
             "insufficient": False,
             "data": {"intent": intent, "demo_readonly": True},
             "tokens": tokens,
+            "calls": calls,
         }
 
     # 写操作的第二道闸（第一道在 _rule_extract）。上面那道只挡规则路径，
@@ -414,6 +466,7 @@ def run_order(question: str, chat_history: list = None, customer_id: str = "") -
             "insufficient": True,
             "data": {"intent": intent},
             "tokens": tokens,
+            "calls": calls,
         }
 
     # 写操作的第三道闸：**"猜来的"和"图片里认的"订单号到此为止**。上面两条
@@ -429,6 +482,7 @@ def run_order(question: str, chat_history: list = None, customer_id: str = "") -
             "insufficient": True,
             "data": {"intent": intent},
             "tokens": tokens,
+            "calls": calls,
         }
 
     try:
@@ -472,6 +526,7 @@ def run_order(question: str, chat_history: list = None, customer_id: str = "") -
             "insufficient": False,
             "data": {"intent": intent},
             "tokens": tokens,
+            "calls": calls,
         }
     except ReturnNotAllowed as exc:
         return {
@@ -487,6 +542,7 @@ def run_order(question: str, chat_history: list = None, customer_id: str = "") -
         "insufficient": False,
         "data": {"action": action, "intent": intent, **data},
         "tokens": tokens,
+        "calls": calls,
     }
 
 

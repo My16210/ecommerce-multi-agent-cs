@@ -42,6 +42,7 @@ from ecom.orchestrator.settings import MAX_QUESTION_CHARS, MAX_ROUNDS
 from ecom.orchestrator.utils import trace
 from ecom.orchestrator.utils.intent import wants_human
 from ecom.orchestrator.utils.logger import setup_logger
+from ecom.orchestrator.utils.pricing import summarize_cost
 from ecom.orchestrator.utils.tokens import EMPTY, add
 from ecom.orchestrator.workers.base import run, stamp_round, worker_names
 
@@ -88,6 +89,9 @@ def _router_node(state: dict, llm=None) -> dict:
         "round": round_no,
         "tried": tried,
         "router_tokens": result["tokens"],
+        # 每次 attempt 一条。写 [] 在 add-型通道上等于没写，所以重路由那几次
+        # 的调用不会丢——见 CSState.router_calls 的说明。
+        "router_calls": result.get("calls") or [],
     }
 
 
@@ -225,6 +229,11 @@ def _finalize(final: dict, question: str, request_id: str, record: bool) -> dict
     total = _total_tokens(final)
     final["tokens"] = total
     results = final.get("results") or []
+    # 和 tokens 一样放进最终 state：CLI / API 的消费方不必再去翻 trace 才知道
+    # 这一次由哪些调用组成。trace 里是同一份（见下面的 collect_calls）。
+    final["calls"] = trace.collect_calls(results, final)
+    # 已知部分求和、未知条数单列。None 不参与加法——否则未知会被静默算成 0。
+    final["cost"] = summarize_cost(final["calls"])
 
     if record:
         trace.record(
@@ -240,6 +249,10 @@ def _finalize(final: dict, question: str, request_id: str, record: bool) -> dict
                 "synth_source": final.get("synth_source"),
                 "sources": final.get("sources"),
                 "workers": trace.summarize_workers(results),
+                # 扁平数组，和 tokens 一样覆盖**所有轮次**。分节点视图仍在
+                # workers.<name>.call_records 里，这里给成本计算一个直接入口。
+                "calls": final["calls"],
+                "cost": final["cost"],
                 "tokens": total,
             }
         )

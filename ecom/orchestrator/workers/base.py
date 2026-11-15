@@ -41,6 +41,7 @@ def ok_result(
     insufficient: bool = False,
     tokens: dict = None,
     elapsed_ms: int = 0,
+    calls: list = None,
 ) -> dict:
     return {
         "worker": worker,
@@ -52,10 +53,17 @@ def ok_result(
         "error": "",
         "elapsed_ms": elapsed_ms,
         "tokens": dict(tokens or EMPTY),
+        "calls": list(calls or []),
     }
 
 
-def error_result(worker: str, error: str, elapsed_ms: int = 0, tokens: dict = None) -> dict:
+def error_result(
+    worker: str,
+    error: str,
+    elapsed_ms: int = 0,
+    tokens: dict = None,
+    calls: list = None,
+) -> dict:
     """注意 insufficient=False——坏了不是"看过了没有"，两者对 aggregate 的意义不同。"""
     return {
         "worker": worker,
@@ -67,6 +75,26 @@ def error_result(worker: str, error: str, elapsed_ms: int = 0, tokens: dict = No
         "error": str(error)[:500],
         "elapsed_ms": elapsed_ms,
         "tokens": dict(tokens or EMPTY),
+        "calls": list(calls or []),
+    }
+
+
+def unknown_call(node: str, elapsed_ms: int = 0) -> dict:
+    """失败调用的兜底记录。
+
+    模型调用**可能已经发出去了**（线程超时、客户端异常），但我们拿不到
+    usage。这里如实记成 source="unknown"、tokens 0、usage_given=False——
+    是"没记上"，不是"没花钱"。少了这条，失败请求的成本会整条消失。
+    """
+    return {
+        "node": node,
+        "kind": "unknown",
+        "model": None,
+        "tokens_in": 0,
+        "tokens_out": 0,
+        "latency_ms": int(elapsed_ms or 0),
+        "source": "unknown",
+        "usage_given": False,
     }
 
 
@@ -231,12 +259,20 @@ def run(
 
     if thread.is_alive():
         logger.warning("worker %s 超过 %ss 仍未返回，放弃等待", name, limit)
-        return error_result(name, f"超时（超过 {limit}s 未返回）", elapsed)
+        return error_result(
+            name, f"超时（超过 {limit}s 未返回）", elapsed,
+            calls=[unknown_call(name, elapsed)],
+        )
 
     if "error" in box:
         exc = box["error"]
         logger.warning("worker %s 失败：%s: %s", name, type(exc).__name__, exc)
-        return error_result(name, f"{type(exc).__name__}: {exc}", elapsed)
+        # worker 可能已经花了钱才失败（例如知识库生成完发现拿到的是兜底文案）。
+        # 它把已发生的调用挂在异常上，这里取回来；取不到才记一条 unknown。
+        calls = list(getattr(exc, "calls", None) or [])
+        if not calls:
+            calls = [unknown_call(name, elapsed)]
+        return error_result(name, f"{type(exc).__name__}: {exc}", elapsed, calls=calls)
 
     payload = box.get("result") or {}
     merged = ok_result(
@@ -247,6 +283,7 @@ def run(
         insufficient=payload.get("insufficient", False),
         tokens=payload.get("tokens"),
         elapsed_ms=elapsed,
+        calls=payload.get("calls"),
     )
     # worker 若能报出更细的自己内部耗时，以其为准；否则用外面的墙钟时间。
     if isinstance(payload.get("elapsed_ms"), int):

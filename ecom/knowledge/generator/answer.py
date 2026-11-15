@@ -4,6 +4,7 @@
 
 知识库结果和联网结果会分栏拼进 prompt，让模型知道每条资料的出处
 """
+import time
 from collections.abc import Callable
 
 from ecom.knowledge.utils import streaming
@@ -29,6 +30,15 @@ TIMEOUT = 60
 def _as_chunk(item) -> dict:
     """兼容 dict 和纯字符串两种输入（reranker 同样做了兼容）"""
     return item if isinstance(item, dict) else {"text": str(item)}
+
+
+def _model_name(llm) -> str | None:
+    """从客户端对象上取实际使用的模型名；取不到返回 None。不读配置。"""
+    for attr in ("model_name", "model"):
+        value = getattr(llm, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _format_contexts(contexts: list, web_contexts: list) -> str:
@@ -141,6 +151,7 @@ def generate_answer(
     web_contexts: list = None,
     chat_history: list = None,
     on_token: Callable[[str], None] | None = None,
+    usage_out: dict | None = None,
 ) -> str:
     """
     基于检索结果生成答案
@@ -152,6 +163,8 @@ def generate_answer(
                  由调用方拼在真实历史前面——这里只负责把它的标签印对（见上面
                  `_ROLE_LABELS`），不判断它该不该来。
     on_token：逐 token 回调（API 的 SSE 用）。不传时沿用 Streamlit 的 ContextVar 汇。
+    usage_out：传一个 dict 进来，函数会把本次用量填进去（见下方 return 前的注释）。
+               不传时不改变任何行为——这个参数只给「需要知道自己花了多少」的调用方用。
     """
     web_contexts = web_contexts or []
     chat_history = chat_history or []
@@ -176,18 +189,33 @@ def generate_answer(
 
     with stage("generate"):
         llm = get_llm(TEMPERATURE, TIMEOUT)
+        started = time.perf_counter()
         # 有汇（界面挂了）或显式给了回调就走流式，没有（命令行、评测、被直接
         # import）就走原来的整段返回。两条路拼出来的文本必须一模一样，有测试钉住。
         if on_token is None and streaming.current() is None:
             content, usage = _invoke(llm, messages)
         else:
             content, usage = _stream(llm, messages, on_token)
+        latency_ms = int((time.perf_counter() - started) * 1000)
 
     # 用量记进计时器（没在采集时是空操作）。**只在这里记一次**：
     # 响应对象一返回就丢了（函数只往外给 content），事后再想补算是拿不到的。
     # 流式那条路靠 llm.py 里打开的 stream_usage，否则这里会读到 0。
     metric("llm_input_tokens", usage.get("input_tokens", 0))
     metric("llm_output_tokens", usage.get("output_tokens", 0))
+    if usage_out is not None:
+        # 往上交一份「这次到底花了多少」。**同时带上 given**：provider 没返回 usage
+        # 时，「0」和「没记上」是两件事，下游必须能分开——否则成本表会静静地少算
+        # （和 utils/tokens.py 开头那条注释是同一个问题）。
+        usage_out.update({
+            "in": int(usage.get("input_tokens", 0) or 0),
+            "out": int(usage.get("output_tokens", 0) or 0),
+            "given": bool(usage),
+            # 模型标识从**实际拿到的客户端**上取，取不到就是 None。
+            # 不读配置：配置里有默认值，写进来的会是"应该用的"，不是"真用的"。
+            "model": _model_name(llm),
+            "latency_ms": latency_ms,
+        })
     return content
 
 

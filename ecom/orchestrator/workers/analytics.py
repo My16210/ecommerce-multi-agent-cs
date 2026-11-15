@@ -96,13 +96,34 @@ def run_analytics(question: str, chat_history: list = None) -> dict:
     if payload.get("review_passed") is False:
         logger.warning("数据分析的报告未通过代码审查，结果可能不可靠")
 
+    tokens = payload.get("tokens") or {"in": 0, "out": 0}
+    tokens_in = int(tokens.get("in", 0) or 0)
+    tokens_out = int(tokens.get("out", 0) or 0)
+    # 子进程内部可能调了多次模型（生成 → 报错 → 改 → 再执行），但它的协议只把
+    # **汇总用量**交出来。这一层只记一条 call，不假装知道内部每一步。
+    # model 留 None 是**真的拿不到**：payload 里没有模型名，不从配置硬编一个顶上，
+    # 否则成本表会拿一个可能不对的名字去查单价。source 由用量是否非零推断——
+    # 零用量分不清"没调模型"和"没记上"，所以记 unknown。
+    used = bool(tokens_in or tokens_out)
+    calls = [{
+        "node": "analytics",
+        "kind": "generate",
+        "model": None,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "latency_ms": int(payload.get("elapsed_ms") or 0),
+        "source": "llm" if used else "unknown",
+        "usage_given": used,
+    }]
+
     return {
         "answer": report,
         "insufficient": not report.strip(),
         # 来源标签由子进程从**当前数据集自己的 NOTES.md** 里带出来，不在这里写死。
         # 写死的话，换数据集时这个回答底下会一直挂着旧数据集的名字，还不报错。
         "sources": [payload.get("source_label") or "数据分析"],
-        "tokens": payload.get("tokens") or {"in": 0, "out": 0},
+        "tokens": {"in": tokens_in, "out": tokens_out},
+        "calls": calls,
         "elapsed_ms": payload.get("elapsed_ms"),
         "data": {
             "chart_path": chart_path,

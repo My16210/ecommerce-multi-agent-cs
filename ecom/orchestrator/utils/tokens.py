@@ -15,6 +15,29 @@ def usage_of(response) -> dict:
     }
 
 
+def usage_given(response) -> bool:
+    """provider 到底有没有返回 usage。
+
+    和 `usage_of` 的 0 必须分开：没返回 usage 时它也是 0，但那是"没记上"，
+    不是"没花钱"。成本表要能区分这两种零。
+    """
+    return bool(getattr(response, "usage_metadata", None))
+
+
+def model_name_of(llm) -> str | None:
+    """从模型对象上取**实际使用的**模型标识；取不到返回 None。
+
+    **不读配置**：配置里有默认值，而这里要记录的是这一次真正拿到的客户端。
+    假模型（测试替身）没有这个属性时返回 None——不要编一个名字，
+    编了会让成本表看起来有数，实际全是假的。
+    """
+    for attr in ("model_name", "model"):
+        value = getattr(llm, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def add(a: dict, b: dict) -> dict:
     """两份用量的合并。路由会重试，重试那次的 token 也得算进去。"""
     return {

@@ -85,12 +85,33 @@ def run_knowledge(
     #    复制的那份只要有一处和生产不一样，评出来的结果就开始骗人。
     #    on_token 只有 API 单 worker 流式那条路会传（见 supervisor._worker_node）；
     #    Streamlit 仍走 ContextVar 汇，命令行/评测走整段返回。
+    usage: dict = {}
     answer = generate_answer(
-        question, top, [], list(chat_history or []), on_token=on_token
+        question, top, [], list(chat_history or []), on_token=on_token, usage_out=usage
     )
+    tokens = {
+        "in": int(usage.get("in", 0) or 0),
+        "out": int(usage.get("out", 0) or 0),
+    }
+    # 这次生成**确实调了模型**，不管 usage 有没有拿到都要留记录。
+    # given=False 时 source 仍是 "llm"：调用发生了，只是钱没记上。
+    calls = [{
+        "node": "knowledge",
+        "kind": "generate",
+        "model": usage.get("model"),
+        "tokens_in": tokens["in"],
+        "tokens_out": tokens["out"],
+        "latency_ms": int(usage.get("latency_ms", 0) or 0),
+        "source": "llm",
+        "usage_given": bool(usage.get("given")),
+    }]
     if answer == ANSWER_FALLBACK:
         # 兜底文案 = 生成服务故障，是"坏了"不是"不知道"。抛出去让 base 记 ok=False。
-        raise RuntimeError("知识库答案生成服务不可用（返回了兜底文案）")
+        # 这一次调用的成本已经发生了，挂在异常上交给 base 取回——否则失败请求
+        # 的账就整条消失（和 utils/tokens.py 开头那条注释同一个问题）。
+        exc = RuntimeError("知识库答案生成服务不可用（返回了兜底文案）")
+        exc.calls = calls
+        raise exc
 
     sources = []
     for hit in top:
@@ -106,6 +127,10 @@ def run_knowledge(
         "answer": answer,
         "sources": sources,
         "insufficient": insufficient,
+        # 以前这里没有 tokens：base 取不到 payload 的 tokens 就退成 {in:0,out:0}，
+        # 于是最贵的一条链路在成本表里恒为 0，而且没人看得出来。现在带出去。
+        "tokens": tokens,
+        "calls": calls,
         "data": {
             "recalled": len(hits),
             "kept": len(top),

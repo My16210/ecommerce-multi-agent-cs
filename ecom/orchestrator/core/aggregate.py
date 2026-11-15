@@ -49,12 +49,19 @@ insufficient=True 才是**有信息量的失败**：它看过了，这个单元�
 上一轮说过什么。所以"历史只在汇总时用一次"那句老话是**说反了**：它一次都没用过，
 真正用的是 router、order worker 和 knowledge worker。
 """
+import time
+
 from ecom import demo
 from ecom.orchestrator.settings import MAX_ROUNDS, SYNTH_TEMPERATURE, SYNTH_TIMEOUT
 from ecom.orchestrator.utils.llm import get_llm
 from ecom.orchestrator.utils.logger import setup_logger
-from ecom.orchestrator.utils.tokens import EMPTY, usage_of
-from ecom.orchestrator.workers.base import round_results, worker_names
+from ecom.orchestrator.utils.tokens import (
+    EMPTY,
+    model_name_of,
+    usage_given,
+    usage_of,
+)
+from ecom.orchestrator.workers.base import round_results, unknown_call, worker_names
 
 logger = setup_logger(__name__)
 
@@ -183,70 +190,100 @@ def _reasoning_text(chunk) -> str:
     return ""
 
 
-def _stream_call(llm, messages: list, emit) -> tuple[str, dict]:
+def _stream_call(llm, messages: list, emit) -> tuple[str, dict, bool]:
     """
-    流式调模型：边收边交，最后把正文和用量一起返回。
+    流式调模型：边收边交，最后把正文、用量和「provider 有没有给 usage」一起返回。
 
     正文走 `delta`，思维链走 `thinking`。两条路分开是因为消费方对它们的
     处理完全不同：正文要拼成答案，思维链只用来展示过程，绝不能混进正文。
 
     用量只在**最后一个**带 `usage_metadata` 的块上取（和 provider 的实际形状
     一致：前面的块只有正文，最后一块把整次调用的用量一起报上来）。取不到就
-    按 0 计——`usage_of` 的容错约定，不在这里另立一套。
+    按 0 计——`usage_of` 的容错约定，不在这里另立一套。`given` 单独记：
+    "0 token"和"没拿到 usage"是两种不同的零（见 utils/tokens.py 开头）。
     """
     pieces: list[str] = []
     tokens = dict(EMPTY)
+    given = False
     for chunk in llm.stream(messages):
         piece = str(getattr(chunk, "content", "") or "")
         if piece:
             pieces.append(piece)
             _emit_text(emit, piece)
         _emit_thinking(emit, _reasoning_text(chunk))
+        if usage_given(chunk):
+            given = True
         chunk_tokens = usage_of(chunk)
         if chunk_tokens["in"] or chunk_tokens["out"]:
             tokens = chunk_tokens
-    return "".join(pieces).strip(), tokens
+    return "".join(pieces).strip(), tokens, given
+
+
+def _synth_call(llm, elapsed_s: float, tokens: dict, given: bool) -> dict:
+    return {
+        "node": "aggregate",
+        "kind": "synthesize",
+        "model": model_name_of(llm),
+        "tokens_in": int(tokens.get("in", 0) or 0),
+        "tokens_out": int(tokens.get("out", 0) or 0),
+        "latency_ms": int(elapsed_s * 1000),
+        "source": "llm",
+        "usage_given": bool(given),
+    }
 
 
 def synthesize(question: str, usable: list, llm=None, emit=None) -> dict:
     """
-    合并多个结论。返回 {"answer", "source", "tokens"}，source ∈ {"llm","concat"}。
+    合并多个结论。返回 {"answer", "source", "tokens", "calls"}，
+    source ∈ {"llm","concat"}。
 
     只有一个结论时**直接返回，不调模型**（见模块开头那段）——那种情况下没有
     token 可流，调用方（`answer_stream`）会把最终答复作为**一个**增量交出去。
+    **不调模型就不产 call**：空数组代表"真的没花钱"，不是"没记上"。
 
     emit：可选回调，收 `{"type": "delta", "text": ...}`。只有汇总模型这次
     调用会走它；中途失败退回拼接时，最终答复以返回值里的 `answer` 为准。
     """
     if not usable:
-        return {"answer": "", "source": "concat", "tokens": dict(EMPTY)}
+        return {"answer": "", "source": "concat", "tokens": dict(EMPTY), "calls": []}
     if len(usable) == 1:
         return {
             "answer": str(usable[0].get("answer") or "").strip(),
             "source": "concat",
             "tokens": dict(EMPTY),
+            "calls": [],
         }
 
     prompt = SYNTH_PROMPT.format(question=question, blocks=_blocks(usable))
     messages = [("system", "你是客服答复汇总器，不许引入任何新事实。"), ("human", prompt)]
+    started = time.perf_counter()
     try:
         llm = llm or get_llm(SYNTH_TEMPERATURE, SYNTH_TIMEOUT)
         if emit is not None and hasattr(llm, "stream"):
-            text, tokens = _stream_call(llm, messages, emit)
+            text, tokens, given = _stream_call(llm, messages, emit)
         else:
             response = llm.invoke(messages)
             text = str(response.content or "").strip()
             tokens = usage_of(response)
+            given = usage_given(response)
             # 模型客户端没有 stream（或调用方不要流）时，整段作为**一个**增量。
             # 这样消费方的事件契约保持一致，不需要额外判断"这次到底流没流"。
             _emit_text(emit, text)
+        calls = [_synth_call(llm, time.perf_counter() - started, tokens, given)]
         if text:
-            return {"answer": text, "source": "llm", "tokens": tokens}
+            return {"answer": text, "source": "llm", "tokens": tokens, "calls": calls}
+        # 调过模型但没吐出正文：这一次的成本仍然要记，不能因为退回拼接就抹掉。
         logger.warning("汇总模型返回了空正文，改用直接拼接")
+        return {
+            "answer": _concat(usable), "source": "concat",
+            "tokens": dict(EMPTY), "calls": calls,
+        }
     except Exception as exc:  # noqa: BLE001 —— 汇总失败不该让整次请求失败
         logger.warning("汇总模型不可用，改用直接拼接：%s: %s", type(exc).__name__, exc)
-
-    return {"answer": _concat(usable), "source": "concat", "tokens": dict(EMPTY)}
+        return {
+            "answer": _concat(usable), "source": "concat", "tokens": dict(EMPTY),
+            "calls": [unknown_call("aggregate", int((time.perf_counter() - started) * 1000))],
+        }
 
 
 def _dedupe(values: list) -> list:
@@ -304,6 +341,8 @@ def aggregate(state: dict, llm=None, emit=None) -> dict:
             **no_result,
             "synth_source": synth["source"],
             "synth_tokens": synth["tokens"],
+            # 走 add reducer：重路由时这一轮没调汇总，写 [] 不会抹掉上一轮的记录。
+            "synth_calls": synth.get("calls") or [],
         }
 
     # ② 没有结论，看还能不能再试一轮

@@ -34,6 +34,7 @@ from ecom.orchestrator.settings import MAX_ROUNDS, WORKER_TIMEOUT
 # 终端上才看得见**）。这里保留 `_safe` 这个名字只是为了不动下面那一堆调用点。
 from ecom.orchestrator.utils.console import safe as _safe
 from ecom.orchestrator.utils.logger import setup_logger
+from ecom.orchestrator.utils.pricing import cost_of_call, fmt_cost
 
 logger = setup_logger(__name__)
 
@@ -79,10 +80,36 @@ def _show_meta(question: str, final: dict, verbose: bool, elapsed_ms: int) -> No
                 print(_safe(f"      错误：{r.get('error')}"))
             elif r.get("answer"):
                 print(_safe(f"      结论：{_clip(r['answer'], 120)}"))
+        # call 级明细：一次模型调用一行。模型名拿不到时如实打 None，
+        # 不在这里替它猜一个（编出来的名字会让成本表看起来有数）。
+        calls = final.get("calls") or []
+        if calls:
+            print(_safe("  调用："))
+            for call in calls:
+                print(
+                    _safe(
+                        f"    · {call.get('node')}/{call.get('kind')}"
+                        f"　model={call.get('model')}"
+                        f"　token={call.get('tokens_in')}/{call.get('tokens_out')}"
+                        f"　{call.get('latency_ms')}ms"
+                        f"　source={call.get('source')}"
+                        f"　usage_given={call.get('usage_given')}"
+                        f"　cost={fmt_cost(cost_of_call(call))}"
+                    )
+                )
         # 汇总方式已经写在 decision_reason 里了（aggregate 拼的），这里不再重复。
         print(_safe(f"决策：{final.get('decision')}（{final.get('decision_reason')}）"))
 
-    print(_safe(f"{THIN}\n耗时 {elapsed_ms} ms　token {final.get('tokens')}"))
+    cost = final.get("cost") or {
+        "known_usd": 0.0, "unknown_calls": 0, "complete": True,
+    }
+    cost_text = f"成本 {fmt_cost(cost.get('known_usd'))}"
+    if not cost.get("complete"):
+        # 未知条数必须单列。把 None 当 0 混进总额，是这张表最会骗人的地方。
+        cost_text += f" + {cost.get('unknown_calls', 0)} 条未知"
+    print(_safe(
+        f"{THIN}\n耗时 {elapsed_ms} ms　token {final.get('tokens')}　{cost_text}"
+    ))
 
 
 def _clip(text: str, limit: int) -> str:

@@ -37,6 +37,10 @@ class WorkerResult(TypedDict, total=False):
     error          失败原因（ok=False 时才有意义）
     elapsed_ms     这次调用耗时
     tokens         {"in": .., "out": ..}
+    calls          这次 worker 内部**每一次模型调用**一条记录。字段固定：
+                   node / kind / model / tokens_in / tokens_out / latency_ms /
+                   source / usage_given。没有调用就是空 list——不是省略这个键，
+                   否则「没花钱」和「没记上」又会混在一起。
     """
 
     worker: str
@@ -48,6 +52,7 @@ class WorkerResult(TypedDict, total=False):
     error: str
     elapsed_ms: int
     tokens: dict
+    calls: list
 
 
 class CSState(TypedDict, total=False):
@@ -73,6 +78,11 @@ class CSState(TypedDict, total=False):
     router_tokens: dict  # 路由本身花的 token（重试会累加，所以要单独记账）
     tried: list  # 已经调用过的 worker（跨轮累积，防止原地打转）
     round: int  # 第几轮（从 1 起，由 router 节点自增）
+    # router / aggregate 不是 worker，它们的调用记录挂在图状态上。
+    # 用 add reducer 的理由和 results 一样：重路由时路由会再跑一次，
+    # 两轮的调用都是真花掉的钱，不能被后一次覆盖。
+    router_calls: Annotated[list, operator.add]
+    synth_calls: Annotated[list, operator.add]
 
     # ——— 结果 ——
     # Annotated + operator.add：并行 worker 各自 append，最终合起来。
@@ -113,6 +123,8 @@ def make_initial_state(
         "tried": [],
         "round": 0,
         "results": [],
+        "router_calls": [],
+        "synth_calls": [],
         "decision": "",
         "decision_reason": "",
         "answer": "",

@@ -45,7 +45,13 @@ from ecom.orchestrator.utils.ids import ORDER_ID_RE
 from ecom.orchestrator.utils.json_utils import loads_or_none
 from ecom.orchestrator.utils.llm import get_llm
 from ecom.orchestrator.utils.logger import setup_logger
-from ecom.orchestrator.utils.tokens import EMPTY, add, usage_of
+from ecom.orchestrator.utils.tokens import (
+    EMPTY,
+    add,
+    model_name_of,
+    usage_given,
+    usage_of,
+)
 
 logger = setup_logger(__name__)
 
@@ -238,11 +244,26 @@ def parse_route(content: str) -> dict:
     return out
 
 
+def _route_call(llm, elapsed_s: float, response=None) -> dict:
+    """一次路由调用的记录。response=None 表示这次 attempt 没拿到响应（失败）。"""
+    tokens = usage_of(response) if response is not None else {"in": 0, "out": 0}
+    return {
+        "node": "router",
+        "kind": "route",
+        "model": model_name_of(llm),
+        "tokens_in": tokens["in"],
+        "tokens_out": tokens["out"],
+        "latency_ms": int(elapsed_s * 1000),
+        "source": "llm" if response is not None else "unknown",
+        "usage_given": usage_given(response) if response is not None else False,
+    }
+
+
 def route(question: str, tried: list = None, llm=None, chat_history: list = None) -> dict:
     """
     决定这一轮调用哪些 worker。
 
-    返回 {"plan", "reason", "confidence", "source", "tokens"}。
+    返回 {"plan", "reason", "confidence", "source", "tokens", "calls"}。
     source ∈ {"llm", "rule", "fallback"}——一定要记录它是谁给的结论，
     因为"规则兜底的比例"是判断路由健康度的关键指标：它一涨，说明 LLM 那边在坏。
 
@@ -273,10 +294,21 @@ def route(question: str, tried: list = None, llm=None, chat_history: list = None
     # 本来也还好，但之前单次超时取的是默认 60 秒，于是"模型这条路不通"要拖
     # 180 秒才落到规则上——用户已经走了。次数和总时长是两把锁，都要有。
     started = time.perf_counter()
+    calls: list[dict] = []
     try:
         llm = llm or get_llm(ROUTER_TEMPERATURE, ROUTER_TIMEOUT)
         for _ in range(ROUTER_ATTEMPTS):
-            response = llm.invoke([("system", "你是调度中心，只输出 JSON。"), ("human", prompt)])
+            attempt_started = time.perf_counter()
+            try:
+                response = llm.invoke(
+                    [("system", "你是调度中心，只输出 JSON。"), ("human", prompt)]
+                )
+            except Exception:
+                # 这次 attempt 已经发出去了但没拿到响应：记一条 unknown，
+                # 然后走原来那个统一出口（退回规则）。
+                calls.append(_route_call(llm, time.perf_counter() - attempt_started))
+                raise
+            calls.append(_route_call(llm, time.perf_counter() - attempt_started, response))
             total = add(total, usage_of(response))
             parsed = parse_route(response.content)
             if not parsed["parse_error"]:
@@ -286,6 +318,10 @@ def route(question: str, tried: list = None, llm=None, chat_history: list = None
                 break
     except Exception as exc:  # noqa: BLE001 —— 见上：这里是"模型不可用"的统一出口
         logger.warning("路由模型不可用，退回关键词规则：%s: %s", type(exc).__name__, exc)
+        # 连客户端都没建起来（没配 key 等）时，上面那条 attempt 记录不存在。
+        # 仍然要留一条 unknown：这次路由尝试是真发生了的。
+        if not calls:
+            calls.append(_route_call(llm, time.perf_counter() - started))
         parsed = {"plan": [], "confidence": 0.0, "reason": "", "parse_error": True}
 
     source = "llm"
@@ -331,4 +367,5 @@ def route(question: str, tried: list = None, llm=None, chat_history: list = None
         "confidence": confidence,
         "source": source,
         "tokens": total,
+        "calls": calls,
     }
