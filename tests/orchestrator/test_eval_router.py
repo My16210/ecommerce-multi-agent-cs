@@ -1,10 +1,23 @@
 """路由评测的测试：指标算得对、题集完整、CLI 能跑。"""
+import hashlib
 import json
 from pathlib import Path
 
 from ecom.orchestrator.cli import eval_router
 
 HOLDOUT = Path(eval_router.DEFAULT_DATASET).with_name("router_holdout.jsonl")
+HOLDOUT_SHA256 = "9140c43244a9d4e002d1b8f2e1904b519ab23aaae4f1d5f450d07a31ba3e2ec9"
+
+
+def _canonical_digest(path: Path) -> str:
+    """按规范形式算 sha256：去 BOM、CRLF 统一成 LF、去掉末尾空行。
+    这三步是为了让 Windows 本地和 Linux CI 得到同一个值——
+    git 的 autocrlf、不同编辑器保存都可能改动字节但不改动内容。"""
+    raw = path.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    raw = raw.replace(b"\r\n", b"\n").rstrip(b"\n")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _case(case_id, question, expected, category="order"):
@@ -27,7 +40,7 @@ def test_dataset_has_unique_ids_and_known_workers():
 
 
 def test_holdout_dataset_is_frozen_and_not_scored():
-    """holdout 只验格式，**不在这里断言分数**。
+    """holdout 只验格式与内容冻结，**不在这里断言分数**。
 
     holdout 的用途是"改完规则之后看有没有掉"，不是"照着它调词"。一旦把
     50% 写成断言，下一个人就会为了让它变绿而加关键词，护栏就没了。
@@ -42,6 +55,22 @@ def test_holdout_dataset_is_frozen_and_not_scored():
     # 两套题不重题：重了就等于把 holdout 掺进训练集。
     train_ids = {case["id"] for case in eval_router.load_cases()}
     assert {case["id"] for case in cases}.isdisjoint(train_ids)
+    assert _canonical_digest(HOLDOUT) == HOLDOUT_SHA256, (
+        "holdout 内容被改动了。先确认这次改动不是为了把分数改好看——"
+        "holdout 只用于验收，不参与调词。合法扩题请同时更新 HOLDOUT_SHA256，"
+        "让这次改动显式出现在 diff 里。"
+    )
+
+
+def test_frozen_digest_detects_a_single_byte_change(tmp_path):
+    """验证锁本身有效：内容改一个字符，digest 必须变。
+    没有这一条，就可能写出恒真的假锁。"""
+    copy = tmp_path / "holdout.jsonl"
+    copy.write_bytes(HOLDOUT.read_bytes())
+    assert _canonical_digest(copy) == HOLDOUT_SHA256
+
+    copy.write_bytes(HOLDOUT.read_bytes().replace(b"order", b"Order", 1))
+    assert _canonical_digest(copy) != HOLDOUT_SHA256
 
 
 def test_metrics_count_exact_covered_and_per_worker():
