@@ -1,0 +1,11 @@
+{"id": "P01", "category": "policy", "q": "你们的退货政策是什么", "must_include": ["7", "签收"], "must_include_any": [], "must_not_include": []}
+{"id": "P02", "category": "policy", "q": "哪些商品不能七天无理由退货", "must_include": [], "must_include_any": ["鲜活易腐", "定作", "生鲜"], "must_not_include": []}
+{"id": "P03", "category": "policy", "q": "退货运费由谁承担", "must_include": ["消费者", "质量"], "must_include_any": [], "must_not_include": []}
+{"id": "P04", "category": "policy", "q": "标准快递一般几天能到", "must_include": [], "must_include_any": ["3-5", "3~5", "3 到 5", "3至5", "三到五", "3—5"], "must_not_include": []}
+{"id": "P05", "category": "policy", "q": "物流信息多久没更新可以发起查询", "must_include": [], "must_include_any": ["72"], "must_not_include": []}
+{"id": "O01", "category": "order", "q": "订单 52644 到哪了", "must_include": [], "must_include_any": ["延迟", "已完成", "San Salvador"], "must_not_include": []}
+{"id": "A01", "category": "analytics", "q": "哪个大区的销售额最高", "must_include": [], "must_include_any": ["LATAM"], "must_not_include": []}
+{"id": "A02", "category": "analytics", "q": "销量最高的商品是什么", "must_include": [], "must_include_any": ["Perfect Fitness Perfect Rip Deck"], "must_not_include": []}
+{"id": "A03", "category": "analytics", "q": "总销售额是多少", "must_include": [], "must_include_any": ["4113938", "4113939", "4,113,938", "4,113,939"], "must_not_include": []}
+{"id": "A04", "category": "analytics", "q": "ENO Atlas Hammock Straps 在哪个大区卖得最多", "must_include": [], "must_include_any": ["USCA"], "must_not_include": []}
+{"id": "A05", "category": "analytics", "q": "延迟交付风险最高的发货方式是哪个", "must_include": [], "must_include_any": ["First Class"], "must_not_include": []}
