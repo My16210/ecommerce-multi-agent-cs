@@ -183,13 +183,16 @@ class CallRecorder(BaseCallbackHandler):
 
 
 def _base_config(model: str, recorder: CallRecorder) -> dict:
-    """所有角色先用同一个模型；search_api=none 是显式降级模式。"""
+    """所有角色先用同一个模型；有 TAVILY_API_KEY 时走真实检索，否则退回降级模式。"""
     return {
         "callbacks": [recorder],
         "recursion_limit": 100,
         "configurable": {
             "allow_clarification": False,
-            "search_api": "none",
+            # 有 TAVILY_API_KEY 就走真实检索；没有则退回降级模式（只覆盖推理链路）。
+            # 显式设置 ODS_SEARCH_API 可以覆盖这个判断。
+            "search_api": os.getenv("ODS_SEARCH_API")
+            or ("tavily" if os.getenv("TAVILY_API_KEY") else "none"),
             "max_researcher_iterations": 2,
             "max_react_tool_calls": 2,
             "max_concurrent_research_units": 2,
