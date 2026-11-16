@@ -18,6 +18,7 @@ import argparse
 import json
 import time
 
+from ecom.agentcost import cost_of_call, fmt_cost
 from ecom.orchestrator.core.aggregate import WORKER_LABELS
 from ecom.orchestrator.core.supervisor import (
     HANDOFF_REQUESTED,
@@ -34,7 +35,6 @@ from ecom.orchestrator.settings import MAX_ROUNDS, WORKER_TIMEOUT
 # 终端上才看得见**）。这里保留 `_safe` 这个名字只是为了不动下面那一堆调用点。
 from ecom.orchestrator.utils.console import safe as _safe
 from ecom.orchestrator.utils.logger import setup_logger
-from ecom.orchestrator.utils.pricing import cost_of_call, fmt_cost
 
 logger = setup_logger(__name__)
 

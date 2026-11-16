@@ -1,7 +1,7 @@
 """单价表：模型名归一 + 算不出来返回 None + 三种「零」分开。"""
 import pytest
 
-from ecom.orchestrator.utils.pricing import (
+from ecom.agentcost import (
     cost_of,
     cost_of_call,
     resolve_model,

@@ -35,6 +35,7 @@ import time
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 
+from ecom.agentcost import summarize_cost
 from ecom.orchestrator.core import aggregate as aggregate_mod
 from ecom.orchestrator.core.router import route
 from ecom.orchestrator.core.state import CSState, make_initial_state
@@ -42,7 +43,6 @@ from ecom.orchestrator.settings import MAX_QUESTION_CHARS, MAX_ROUNDS
 from ecom.orchestrator.utils import trace
 from ecom.orchestrator.utils.intent import wants_human
 from ecom.orchestrator.utils.logger import setup_logger
-from ecom.orchestrator.utils.pricing import summarize_cost
 from ecom.orchestrator.utils.tokens import EMPTY, add
 from ecom.orchestrator.workers.base import run, stamp_round, worker_names
 

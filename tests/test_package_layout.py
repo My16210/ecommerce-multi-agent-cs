@@ -252,3 +252,28 @@ def test_the_analytics_worker_still_goes_through_a_process_boundary():
     assert not re.search(r"^\s*(from|import)\s+ecom\.analytics\b", source, re.M), (
         f"{worker} 直接 import 了 ecom.analytics——这就把子进程边界绕过去了。"
     )
+
+
+def test_agentcost_stays_under_ecom_and_never_reaches_back():
+    """成本工具 `ecom/agentcost/` 只能被业务子系统引用，不许反向依赖它们。
+
+    这个模块要同时接自己的系统和别人的系统，所以它的**输入只能是调用记录
+    这个纯 dict**，不能借道任何业务模块（路由、知识库、分析子进程、数据库）。
+    一旦它 import 了 `ecom.orchestrator`，接外部项目时就得把半个 ecom 拖过去，
+    "独立工具"这句话也就不成立了。
+
+    这条测试守的是方向，不是位置：`ecom.agentcost` 被 `orchestrator` 引用是
+    允许的（`supervisor` / `main` / 适配器都这么用），反过来不允许。
+    """
+    pkg = PKG_ROOT / "agentcost"
+    assert pkg.is_dir(), "ecom/agentcost 不在了——先确认成本工具还在仓库里"
+    forbidden = re.compile(
+        r"^\s*(from|import)\s+ecom\.(orchestrator|analytics|knowledge|ui|mcp|auth)\b",
+        re.M,
+    )
+    for path in pkg.rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        assert not forbidden.search(source), (
+            f"{path} 反向依赖了业务子系统。成本工具的输入只能是调用记录（dict），"
+            "不能从 orchestrator / analytics / knowledge 里取任何东西。"
+        )

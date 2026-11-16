@@ -47,7 +47,7 @@ sys.path[:] = [
 sys.path.insert(0, str(ECOM_ROOT))
 sys.path.insert(0, str(ODS_ROOT / "src"))
 
-from ecom.orchestrator.utils.pricing import cost_of_call, fmt_cost, summarize_cost  # noqa: E402, I001
+from ecom.agentcost import cost_of_call, fmt_cost, summarize_cost  # noqa: E402, I001
 
 
 QUESTIONS = [

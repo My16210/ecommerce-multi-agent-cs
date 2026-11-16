@@ -22,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-from ecom.orchestrator.utils.pricing import fmt_cost
+from ecom.agentcost import fmt_cost
 from ecom.orchestrator.utils.trace import LOGS_DIR
 
 ROOT = Path(__file__).resolve().parents[3]
