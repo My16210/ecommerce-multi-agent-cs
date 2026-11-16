@@ -51,7 +51,7 @@
 
 | 层 | 做什么 | 落在哪 |
 |---|---|---|
-| 采集 | 每次模型调用记一条：节点、模型、入出 token、延迟、来源 | ecom_cs 走 trace 的 `calls`；外部项目走 LangChain callback |
+| 采集 | 记到"一次调用"的粒度：ecom_cs 的 router / knowledge / order 是一次真实调用一条；analytics 是**按 provider 聚合**（DeepSeek / Qwen 各一条，内部节点不分开）；外部项目走 LangChain callback，一次一条 | ecom_cs 走 trace 的 `calls`；外部项目走 callback |
 | 归因 | 单价表 + 成本三分法 + 按节点 / 模型聚合 | `ecom/agentcost/pricing.py` |
 | 验证 | 改动前后同批任务对比，用样本自带的关键事实判定做护栏（工具本身不定义质量指标） | `ecom/orchestrator/cli/eval_answers.py`（只对第一个样本） |
 
@@ -85,11 +85,13 @@
 | `kind` | 调用类型，实际取值：`route` / `extract` / `generate` / `synthesize` / `unknown`（"规则"是 `source` 的取值，不是 kind） |
 | `model` | provider 报的真实模型名（如 `qwen-plus`） |
 | `tokens_in` / `tokens_out` | 入 / 出 token |
-| `latency_ms` | 单次延迟 |
+| `latency_ms` | 单次延迟；**analytics 的两条 call 里只有第一条记总耗时，第二条为 0** |
 | `source` | `llm` / `rule` / `unknown` |
-| `usage_given` | provider 有没有真的返回 usage |
+| `usage_given` | provider 有没有真的返回 usage；**analytics 的明细路径由 token 是否非零推断，不是 provider 的直接标志** |
 
 模型名必须经 `resolve_model()` 归一到单价档位（`qwen-plus` → `qwen`，`deepseek-chat` → `deepseek`）——不归一的话，价格填了也永远查不到，而且是静默的。
+
+**粒度要如实说**：ecom_cs 的 router / knowledge / order 是一次真实调用一条记录；analytics 的子进程只上报按 provider 的合计（`analytics.py:53` `_calls_from_payload`），所以它的"call"是 **provider 级**，不是"analyst 一次、reviewer 一次"。这决定了结论二的边界：能看到"审查让成本上升"，看不到"钱具体花在 reviewer 还是 self_corrector 上"。
 
 `slot["calls"]` 保持原来的"调用次数"语义，逐次明细放在新增的 `call_records`，**只在非空时出现**，所以 order / knowledge 的旧口径不被污染。
 
@@ -108,12 +110,15 @@
 | 输出 token | 1,144 | 961 | −16.0% |
 | 关键事实命中 | 5/5 | 5/5 | 不掉 |
 
+> 成本 / 输出两列是 2026-11-15 那次测量的值；输入 token 两列经 2026-11-16 复跑完全一致；复跑的成本 / 输出见下方"复跑"一段。
+
 **能推出**：减少塞进提示词的检索块，确实同时降 token 和成本，且关键事实命中不变。
 
-**复跑（2026-11-16）**：把 `RERANK_TOP_K` 依次设为 3 和 2，各跑一遍 policy 5 题，两次都是 **5/5 PASS**。输入 token 复跑得到 **6,771 → 5,347**（与上表完全一致，这一列可复现）；输出 **1,132 → 979**（历史那次 1,144 → 961，单次有波动）；成本 **0.0010667277 → 0.0008660179**，降 **18.8%**（历史那次 −19.5%）。artifact 在 `data/orchestrator/answer_eval_runs/20261116-133055.jsonl`（改前）、`20261116-133153.jsonl`（改后），未入库。
+**复跑（2026-11-16）**：把 `RERANK_TOP_K` 依次设为 3 和 2，各跑一遍 policy 5 题，两次都是 **5/5 PASS**。输入 token 复跑得到 **6,771 → 5,347**（与上表完全一致，这一列可复现）；输出 **1,132 → 979**（历史那次 1,144 → 961，单次有波动）；成本 **0.0010667277 → 0.0008660179**，降 **18.8%**（历史那次 −19.5%）。artifact 在 `data/orchestrator/answer_eval_runs/20261116-133055.jsonl`（改前）、`20261116-133153.jsonl`（改后）。该目录在 `.gitignore` 内，clone 仓库后看不到这两个文件，按第八节命令复跑即可重新生成。
+
 **不能推出**：这是"最优值"。2→1 没测；样本只有 5 题、只覆盖 policy。
 
-**顺带暴露的一件事**：输入降 21.0%，输出降 16.0%，钱降 19.5%——落在两者之间。因为输出单价是输入的 2.5 倍（0.2778 vs 0.1111），砍掉一个输入 token 和一个输出 token，省下的钱不一样。**能推出的是"按单价加权看待 token 变化"，不能推出"输出更值得砍"**——改后输入仍占成本的约七成（6,771×0.1111 占 70.3%，5,347×0.1111 占 69.0%）。
+**顺带暴露的一件事**：输入降 21.0%，输出降 16.0%，钱降约 19%——落在两者之间。因为输出单价是输入的 2.5 倍（0.2778 vs 0.1111），砍掉一个输入 token 和一个输出 token，省下的钱不一样。**能推出的是"按单价加权看待 token 变化"，不能推出"输出更值得砍"**——改后输入仍占成本的约七成（6,771×0.1111 占 70.3%，5,347×0.1111 占 69.0%）。
 
 ### 结论二：analytics 单题成本差 3 倍，在这 5 题里与审查轮次同向
 
